@@ -37,11 +37,11 @@ def bench(fn, warmup=10, repeat=50):
     return times[len(times) // 2]
 
 
-def test_gemm():
-    M = N = K = 8192
-    print(f"\n=== GEMM {M}x{N}x{K} ===")
+def test_gemm(M,N,K):
+    # M = N = K = 8192
+    print(f"\n=== GEMM {M=} {N=} {K=} ===")
     bM, bN, bK, stages, threads = 128, 128, 64, 3, 128
-
+    result_flops = []
     for mode_name, pc in [
         ("Baseline", {}),
         ("Heddle", {
@@ -84,16 +84,28 @@ def test_gemm():
         tflops = 2 * M * N * K / ms / 1e9
 
         print(f"  {mode_name:<12}: {tflops:>6.0f} TFLOPS  {ms:.3f} ms  err={err:.4f}  {'OK' if ok else 'FAIL'}")
+        result_flops.append(tflops)
+    return result_flops
 
+# | Shape | TileLang | Heddle | Heddle / TileLang |
+# |-------|----------|--------|-------------------|
+# | B4 H32 D128 T1024 | 448.4 | 443.9 | 0.99x |
+# | B4 H32 D128 T2048 | 530.7 | 557.6 | 1.05x |
+# | B4 H32 D128 T4096 | 534.2 | 586.6 | 1.10x |
+# | B4 H32 D128 T8192 | 539.6 | 598.6 | 1.11x |
+# | B1 H32 D128 T4096 | 555.9 | 596.9 | 1.07x |
+# | B1 H32 D128 T8192 | 543.2 | 618.6 | 1.14x |
+# | B1 H32 D128 T16384 | 544.2 | 582.0 | 1.07x |
 
-def test_fa_fwd():
-    print("\n=== FlashAttention FWD (B=4 H=32 T=4096 D=128) ===")
-    B, H, Tseq, D = 4, 32, 4096, 128
+def test_fa_fwd(B, H, Tseq, D):
+    # B, H, Tseq, D = 4, 32, 4096, 128
+    print(f"\n=== FlashAttention FWD ({B=}, {H=}, {Tseq=}, {D=}) ===")
     bM, bN, stages, threads = 128, 64, 2, 128
     scale = (1.0 / D) ** 0.5 * 1.44269504
     shape = [B, Tseq, H, D]
     flops = 4.0 * B * H * Tseq * Tseq * D
-
+    
+    result_flops = []
     for mode_name, pc in [
         ("Baseline", {}),
         ("Heddle", {
@@ -157,11 +169,22 @@ def test_fa_fwd():
             ms = bench(lambda: compiled(Q, K, V))
             tflops = flops / ms / 1e9
             print(f"  {mode_name:<12}: {tflops:>6.0f} TFLOPS  {ms:.3f} ms")
+            result_flops.append(tflops)
         except Exception as e:
             print(f"  {mode_name:<12}: FAIL — {str(e)[:80]}")
-
+    return result_flops
 
 if __name__ == "__main__":
-    test_gemm()
-    test_fa_fwd()
-    print("\nDone.")
+    # 摘自 README.md 性能快照
+    shapes_attn = [
+        [4 ,32 ,128 ,1024],
+        [4 ,32 ,128 ,2048],
+        [4 ,32 ,128 ,4096],
+        [4 ,32 ,128 ,8192],
+        [1 ,32 ,128 ,4096],
+        [1 ,32 ,128 ,8192],
+        [1 ,32 ,128 ,16384],
+    ]
+    for [b,h,d,s] in shapes_attn :
+        [baseline_tflops, ours_tflops ] = test_fa_fwd(b,h,s,d)
+        print(f' acc = { ours_tflops / baseline_tflops : .3f}') 
