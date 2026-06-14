@@ -609,20 +609,29 @@ def _phase_b_consumer_ordering(
     use_precise_latency: bool = False,
     reg_limit: int = 960,
     timeout_ms: int = 15000,
+    num_warps: int = 1,
+    barrier_edges: Optional[Set[Tuple[int, int]]] = None,
     debug: bool = False,
-) -> Optional[Tuple[List[int], Dict[str, int]]]:
+) -> Optional[Tuple[List[int], Dict[str, int], Dict[str, int]]]:
     """Use Phase B (CP-SAT solver) to find an optimal consumer ordering.
 
     Unlike Phase A (ASAP heuristic), Phase B jointly optimizes:
     - Statement time-slot assignment (resolves FU resource conflicts)
     - Register liveness tracking (including incoming_live for loop-carried values)
     - Register capacity constraints per warp
+    - Warp assignment (when num_warps > 1)
+    - Blocking sync barrier constraints (when barrier_edges provided)
 
     Uses Google OR-Tools CP-SAT solver which is 100-1000x faster than Z3
     for scheduling problems (38ms vs 103s on FA BWD 21-consumer graphs).
 
-    Returns (consumer_ordering, schedule_times) or None if UNSAT/timeout.
+    Args:
+        barrier_edges: Set of (producer_idx, consumer_idx) pairs that require
+            blocking synchronization (same warp + exclusive execution).
+
+    Returns (consumer_ordering, schedule_times, warp_assigns) or None if UNSAT/timeout.
     schedule_times maps node name (e.g. "s3") to its start time in the schedule.
+    warp_assigns maps node name to its warp assignment (int).
     Falls back to None so caller can use Phase A ordering instead.
     """
     from heddle.scheduler.cp_sat import (
@@ -667,7 +676,8 @@ def _phase_b_consumer_ordering(
         op_deps = []
         for dep_idx in deps.get(ci, []):
             if dep_idx in set(consumer_indices):
-                op_deps.append((f"s{dep_idx}", 0))
+                is_blocking = bool(barrier_edges and (dep_idx, ci) in barrier_edges)
+                op_deps.append((f"s{dep_idx}", 0, is_blocking))
 
         ops.append(OpSpec(
             name=f"s{ci}",
@@ -710,6 +720,7 @@ def _phase_b_consumer_ordering(
             [partition],
             fu_caps=fu_caps,
             reg_limit=attempt_reg_limit if attempt_reg_limit > 0 else 10**7,
+            num_warps=num_warps,
             horizon=horizon,
             timeout_s=timeout_s,
         )
@@ -733,6 +744,7 @@ def _phase_b_consumer_ordering(
         return None
 
     times_b = result.kernel_schedules.get("consumer_loop", {})
+    warp_assigns_b = result.kernel_warp_assigns.get("consumer_loop", {})
     reg_peak = result.kernel_reg_peaks
 
     if debug:
@@ -756,7 +768,7 @@ def _phase_b_consumer_ordering(
         if ci not in ordered_set:
             ordered.append(ci)
 
-    return ordered, times_b
+    return ordered, times_b, warp_assigns_b
 
 
 def _extract_barrier_hints(
@@ -1518,9 +1530,9 @@ def _transform_pipeline_loop(
             )
             _pb_elapsed = (_time.perf_counter() - _pb_t0) * 1000
             if phase_b_result is not None:
-                phase_b_order, phase_b_times = phase_b_result
+                phase_b_order, phase_b_times, phase_b_warps = phase_b_result
             else:
-                phase_b_order, phase_b_times = None, {}
+                phase_b_order, phase_b_times, phase_b_warps = None, {}, {}
 
             if debug:
                 status = "SAT" if phase_b_order is not None else "UNSAT/timeout"
@@ -1605,6 +1617,11 @@ def _transform_pipeline_loop(
                     if offsets_str:
                         _set_ws_annotation(new_annotations, "tl_pcws_stage_offsets", offsets_str)
                         annotations_changed = True
+
+                if phase_b_warps:
+                    warp_str = ",".join(f"{k}:{v}" for k, v in sorted(phase_b_warps.items()))
+                    _set_ws_annotation(new_annotations, "tl_pcws_warp_assigns", warp_str)
+                    annotations_changed = True
 
                 if order_changed or annotations_changed:
                     changed[0] = True

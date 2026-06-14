@@ -19,7 +19,7 @@ from __future__ import annotations
 import enum
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 
 # ====================================================================== #
@@ -53,8 +53,9 @@ class OpSpec:
     resource_type: ResourceType
     latency: int
     outputs: List[OutputSpec] = field(default_factory=list)
-    # Dependencies: list of (parent_op_name, iteration_distance)
-    deps: List[Tuple[str, int]] = field(default_factory=list)
+    # Dependencies: list of (parent_op_name, iteration_distance[, blocking_sync])
+    # 2-tuple (name, dist) is accepted for backward compatibility.
+    deps: List[Union[Tuple[str, int], Tuple[str, int, bool]]] = field(default_factory=list)
     # Warp assignment: how many warps this op requires (1 = any single warp)
     warp_count: int = 1
     # Spill cost (cycles) for cross-warp data transfer
@@ -105,6 +106,13 @@ class SMConfig:
 
 
 H100 = SMConfig()
+
+
+def _unpack_dep(dep_tuple) -> Tuple[str, int, bool]:
+    """Unpack a dependency tuple, handling both 2-tuple and 3-tuple formats."""
+    if len(dep_tuple) == 3:
+        return dep_tuple[0], dep_tuple[1], dep_tuple[2]
+    return dep_tuple[0], dep_tuple[1], False
 
 
 @dataclass
@@ -162,6 +170,7 @@ class UnifiedScheduler:
 
         model = cp_model.CpModel()
         H = self.horizon
+        W = max(self.num_warps, 1)
 
         # ============================================================
         # 1. Partition selection: exactly one partition is active
@@ -172,16 +181,15 @@ class UnifiedScheduler:
         model.add_exactly_one(part_vars.values())
 
         # ============================================================
-        # 2. Per-partition, per-kernel, per-op: optional intervals
+        # 2. Per-partition, per-kernel, per-op: optional intervals + warp
         # ============================================================
-        # Structures to collect for constraints
-        op_present: Dict[Tuple[str, str, str], "cp_model.BoolVarT"] = {}
-        op_start: Dict[Tuple[str, str, str], "cp_model.IntVarT"] = {}
-        op_end: Dict[Tuple[str, str, str], "cp_model.IntVarT"] = {}
-        op_interval: Dict[Tuple[str, str, str], "cp_model.IntervalVarT"] = {}
+        op_present: Dict[Tuple[str, str, str], any] = {}
+        op_start: Dict[Tuple[str, str, str], any] = {}
+        op_end: Dict[Tuple[str, str, str], any] = {}
+        op_interval: Dict[Tuple[str, str, str], any] = {}
+        op_warp: Dict[Tuple[str, str, str], any] = {}
 
-        # Per-kernel makespan variables
-        kernel_makespan: Dict[Tuple[str, str], "cp_model.IntVarT"] = {}
+        kernel_makespan: Dict[Tuple[str, str], any] = {}
 
         for p in self.partitions:
             pv = part_vars[p.name]
@@ -195,7 +203,6 @@ class UnifiedScheduler:
                     pres = model.new_bool_var(f"pres_{p.name}_{k.name}_{op.name}")
                     op_present[key] = pres
 
-                    # present ↔ partition selected
                     model.add(pres == 1).only_enforce_if(pv)
                     model.add(pres == 0).only_enforce_if(pv.negated())
 
@@ -209,71 +216,207 @@ class UnifiedScheduler:
                     op_end[key] = e
                     op_interval[key] = iv
 
-                    # kernel makespan >= end of each op
+                    # Warp assignment
+                    w_var = model.new_int_var(0, W - 1, f"w_{p.name}_{k.name}_{op.name}")
+                    op_warp[key] = w_var
+                    if op.fixed_warp >= 0:
+                        model.add(w_var == op.fixed_warp)
+
                     model.add(km_var >= e).only_enforce_if(pres)
 
         # ============================================================
-        # 3. Dependency constraints (within each kernel)
+        # 3. Dependency constraints + spill cost + blocking_sync
         # ============================================================
+        # Collect barrier intervals for per-warp no-overlap (Section 3b)
+        # barrier_intervals[(p.name, k.name, w)] = list of optional intervals
+        barrier_intervals: Dict[Tuple[str, str, int], list] = {}
+
         for p in self.partitions:
             for k in p.kernels:
                 op_map = {op.name: op for op in k.ops}
                 for op in k.ops:
                     key = (p.name, k.name, op.name)
-                    for dep_name, _dist in op.deps:
+                    pres = op_present[key]
+                    for dep_tuple in op.deps:
+                        dep_name, dist, is_blocking = _unpack_dep(dep_tuple)
                         if dep_name not in op_map:
-                            continue  # external input, skip
+                            continue
                         dep_key = (p.name, k.name, dep_name)
                         dep_op = op_map[dep_name]
-                        # start[consumer] >= start[producer] + latency[producer]
-                        model.add(
-                            op_start[key] >= op_start[dep_key] + dep_op.latency
-                        ).only_enforce_if(op_present[key])
+                        base_lat = dep_op.latency
+
+                        # 3a. Dependency timing with optional spill cost
+                        if W > 1 and dep_op.spill_cost > 0:
+                            same_w = model.new_bool_var(
+                                f"sw_{p.name}_{k.name}_{op.name}_{dep_name}")
+                            model.add(
+                                op_warp[key] == op_warp[dep_key]
+                            ).only_enforce_if(same_w)
+                            model.add(
+                                op_warp[key] != op_warp[dep_key]
+                            ).only_enforce_if(same_w.negated())
+                            model.add(
+                                op_start[key] >= op_start[dep_key] + base_lat
+                            ).only_enforce_if([pres, same_w])
+                            model.add(
+                                op_start[key] >= op_start[dep_key] + base_lat + dep_op.spill_cost
+                            ).only_enforce_if([pres, same_w.negated()])
+                        else:
+                            model.add(
+                                op_start[key] >= op_start[dep_key] + base_lat
+                            ).only_enforce_if(pres)
+
+                        # 3b. Blocking sync constraints
+                        if is_blocking and W > 1:
+                            # Same-warp enforcement: producer and consumer must share a warp
+                            model.add(
+                                op_warp[key] == op_warp[dep_key]
+                            ).only_enforce_if(pres)
+
+                            # Exclusive execution: create a barrier interval covering
+                            # [consumer_start - producer_latency, consumer_start).
+                            # Other ops on the same warp must not overlap this window.
+                            if base_lat > 0:
+                                b_start = model.new_int_var(
+                                    0, H,
+                                    f"bs_{p.name}_{k.name}_{op.name}_{dep_name}")
+                                model.add(
+                                    b_start == op_start[key] - base_lat
+                                ).only_enforce_if(pres)
+                                model.add(b_start == 0).only_enforce_if(pres.negated())
+                                b_iv = model.new_optional_interval_var(
+                                    b_start, base_lat, op_start[key], pres,
+                                    f"biv_{p.name}_{k.name}_{op.name}_{dep_name}")
+                                for w in range(W):
+                                    bk = (p.name, k.name, w)
+                                    barrier_intervals.setdefault(bk, []).append(
+                                        (b_iv, key))
 
         # ============================================================
-        # 4. FU capacity (per kernel, using AddCumulative)
+        # 3c. Per-warp no-overlap for barrier exclusion zones
+        # ============================================================
+        if barrier_intervals:
+            for p in self.partitions:
+                for k in p.kernels:
+                    for w in range(W):
+                        bk = (p.name, k.name, w)
+                        barriers = barrier_intervals.get(bk, [])
+                        if not barriers:
+                            continue
+                        # Collect all op intervals on this warp (conditional)
+                        # plus barrier intervals (also conditional on same warp)
+                        warp_no_overlap = []
+                        for op in k.ops:
+                            okey = (p.name, k.name, op.name)
+                            # Skip ops that are endpoints of a barrier on this warp
+                            on_w = model.new_bool_var(
+                                f"noo_{p.name}_{k.name}_{op.name}_w{w}")
+                            model.add(op_warp[okey] == w).only_enforce_if(on_w)
+                            model.add(op_warp[okey] != w).only_enforce_if(on_w.negated())
+                            both = model.new_bool_var(
+                                f"noob_{p.name}_{k.name}_{op.name}_w{w}")
+                            model.add_bool_and(
+                                [op_present[okey], on_w]
+                            ).only_enforce_if(both)
+                            model.add_bool_or(
+                                [op_present[okey].negated(), on_w.negated()]
+                            ).only_enforce_if(both.negated())
+                            warp_iv = model.new_optional_interval_var(
+                                op_start[okey], op.latency, op_end[okey], both,
+                                f"noiv_{p.name}_{k.name}_{op.name}_w{w}")
+                            warp_no_overlap.append(warp_iv)
+
+                        for b_iv, consumer_key in barriers:
+                            # Barrier interval is active only when consumer is on this warp
+                            on_w_b = model.new_bool_var(
+                                f"bw_{p.name}_{k.name}_{consumer_key[2]}_w{w}")
+                            model.add(op_warp[consumer_key] == w).only_enforce_if(on_w_b)
+                            model.add(op_warp[consumer_key] != w).only_enforce_if(on_w_b.negated())
+                            # Re-wrap barrier interval conditioned on warp assignment
+                            b_start_var = b_iv.StartExpr()
+                            b_size = b_iv.SizeExpr()
+                            b_end_var = b_iv.EndExpr()
+                            cond_b = model.new_bool_var(
+                                f"cb_{p.name}_{k.name}_{consumer_key[2]}_w{w}")
+                            model.add_bool_and(
+                                [op_present[consumer_key], on_w_b]
+                            ).only_enforce_if(cond_b)
+                            model.add_bool_or(
+                                [op_present[consumer_key].negated(), on_w_b.negated()]
+                            ).only_enforce_if(cond_b.negated())
+                            cond_biv = model.new_optional_interval_var(
+                                b_start_var, b_size, b_end_var, cond_b,
+                                f"cbiv_{p.name}_{k.name}_{consumer_key[2]}_w{w}")
+                            warp_no_overlap.append(cond_biv)
+
+                        if len(warp_no_overlap) > 1:
+                            model.add_no_overlap(warp_no_overlap)
+
+        # ============================================================
+        # 4. FU capacity (per kernel, per warp when W > 1)
         # ============================================================
         for p in self.partitions:
             for k in p.kernels:
                 for fu_type, cap in self.fu_caps.items():
-                    intervals_for_fu = []
-                    demands_for_fu = []
-                    for op in k.ops:
-                        if op.resource_type == fu_type:
-                            key = (p.name, k.name, op.name)
+                    fu_ops = [(op, (p.name, k.name, op.name))
+                              for op in k.ops
+                              if op.resource_type == fu_type]
+                    if not fu_ops:
+                        continue
+                    if W == 1:
+                        intervals_for_fu = []
+                        demands_for_fu = []
+                        for op, key in fu_ops:
                             intervals_for_fu.append(op_interval[key])
                             demands_for_fu.append(1)
-                    if intervals_for_fu:
-                        model.add_cumulative(
-                            intervals_for_fu, demands_for_fu, cap)
+                        if intervals_for_fu:
+                            model.add_cumulative(
+                                intervals_for_fu, demands_for_fu, cap)
+                    else:
+                        for w in range(W):
+                            warp_intervals = []
+                            warp_demands = []
+                            for op, key in fu_ops:
+                                on_w = model.new_bool_var(
+                                    f"fuw_{p.name}_{k.name}_{op.name}_w{w}")
+                                model.add(op_warp[key] == w).only_enforce_if(on_w)
+                                model.add(op_warp[key] != w).only_enforce_if(on_w.negated())
+                                both = model.new_bool_var(
+                                    f"fub_{p.name}_{k.name}_{op.name}_w{w}")
+                                model.add_bool_and(
+                                    [op_present[key], on_w]
+                                ).only_enforce_if(both)
+                                model.add_bool_or(
+                                    [op_present[key].negated(), on_w.negated()]
+                                ).only_enforce_if(both.negated())
+                                warp_iv = model.new_optional_interval_var(
+                                    op_start[key], op.latency, op_end[key],
+                                    both,
+                                    f"fuiv_{p.name}_{k.name}_{op.name}_w{w}")
+                                warp_intervals.append(warp_iv)
+                                warp_demands.append(1)
+                            if warp_intervals:
+                                model.add_cumulative(
+                                    warp_intervals, warp_demands, cap)
 
         # ============================================================
-        # 5. Register liveness tracking (per kernel)
+        # 5. Register liveness tracking (per kernel, per warp)
         # ============================================================
-        # For each kernel, for each time step τ, sum of alive output
-        # footprints must be ≤ reg_limit.
-        #
-        # An output x produced by op P is alive at time τ if:
-        #   start[P] ≤ τ  AND  NOT all consumers of x have started by τ
-        #
-        # We discretize into time checkpoints (every few steps) to keep
-        # the model tractable.
-        CHECKPOINT_STEP = 1  # check every step for accuracy
+        CHECKPOINT_STEP = 1
         checkpoints = list(range(0, H + 1, CHECKPOINT_STEP))
 
         for p in self.partitions:
             pv = part_vars[p.name]
             for k in p.kernels:
                 op_map = {op.name: op for op in k.ops}
-                # Build consumer map: output_name -> list of consumer op names
                 consumer_map: Dict[str, List[str]] = {}
                 for op in k.ops:
-                    for dep_name, _ in op.deps:
+                    for dep_tuple in op.deps:
+                        dep_name, _, _ = _unpack_dep(dep_tuple)
                         if dep_name in op_map:
                             for out in op_map[dep_name].outputs:
                                 consumer_map.setdefault(out.name, []).append(op.name)
 
-                # Collect all (producer_op, output) pairs with RMEM storage
                 rmem_outputs: List[Tuple[OpSpec, OutputSpec]] = []
                 for op in k.ops:
                     for out in op.outputs:
@@ -283,80 +426,81 @@ class UnifiedScheduler:
                 if not rmem_outputs:
                     continue
 
-                for tau in checkpoints:
-                    live_terms = []
-                    for prod_op, out in rmem_outputs:
-                        prod_key = (p.name, k.name, prod_op.name)
-                        consumers = consumer_map.get(out.name, [])
+                for w in range(W):
+                    for tau in checkpoints:
+                        live_terms = []
+                        for prod_op, out in rmem_outputs:
+                            prod_key = (p.name, k.name, prod_op.name)
+                            consumers = consumer_map.get(out.name, [])
 
-                        # is_produced: start[producer] <= tau
-                        is_produced = model.new_bool_var(
-                            f"prod_{p.name}_{k.name}_{out.name}_t{tau}")
-                        model.add(
-                            op_start[prod_key] <= tau
-                        ).only_enforce_if(is_produced)
-                        model.add(
-                            op_start[prod_key] > tau
-                        ).only_enforce_if(is_produced.negated())
+                            # on_warp: producer is on this warp
+                            on_warp = model.new_bool_var(
+                                f"ow_{p.name}_{k.name}_{out.name}_w{w}_t{tau}")
+                            model.add(op_warp[prod_key] == w).only_enforce_if(on_warp)
+                            model.add(op_warp[prod_key] != w).only_enforce_if(on_warp.negated())
 
-                        if consumers:
-                            # all_consumed: all consumers have started by tau
-                            consumer_started = []
-                            for c_name in consumers:
-                                c_key = (p.name, k.name, c_name)
-                                cs = model.new_bool_var(
-                                    f"cs_{p.name}_{k.name}_{out.name}_{c_name}_t{tau}")
-                                model.add(
-                                    op_start[c_key] <= tau
-                                ).only_enforce_if(cs)
-                                model.add(
-                                    op_start[c_key] > tau
-                                ).only_enforce_if(cs.negated())
-                                consumer_started.append(cs)
+                            is_produced = model.new_bool_var(
+                                f"prod_{p.name}_{k.name}_{out.name}_w{w}_t{tau}")
+                            model.add(
+                                op_start[prod_key] <= tau
+                            ).only_enforce_if(is_produced)
+                            model.add(
+                                op_start[prod_key] > tau
+                            ).only_enforce_if(is_produced.negated())
 
-                            all_consumed = model.new_bool_var(
-                                f"ac_{p.name}_{k.name}_{out.name}_t{tau}")
-                            # all_consumed ↔ AND(consumer_started)
-                            model.add_bool_and(consumer_started).only_enforce_if(all_consumed)
-                            for cs in consumer_started:
-                                model.add_bool_or([all_consumed.negated(), cs])
-                            model.add_bool_or(
-                                [cs.negated() for cs in consumer_started] + [all_consumed]
+                            if consumers:
+                                consumer_started = []
+                                for c_name in consumers:
+                                    c_key = (p.name, k.name, c_name)
+                                    cs = model.new_bool_var(
+                                        f"cs_{p.name}_{k.name}_{out.name}_{c_name}_w{w}_t{tau}")
+                                    model.add(
+                                        op_start[c_key] <= tau
+                                    ).only_enforce_if(cs)
+                                    model.add(
+                                        op_start[c_key] > tau
+                                    ).only_enforce_if(cs.negated())
+                                    consumer_started.append(cs)
+
+                                all_consumed = model.new_bool_var(
+                                    f"ac_{p.name}_{k.name}_{out.name}_w{w}_t{tau}")
+                                model.add_bool_and(consumer_started).only_enforce_if(all_consumed)
+                                for cs in consumer_started:
+                                    model.add_bool_or([all_consumed.negated(), cs])
+                                model.add_bool_or(
+                                    [cs.negated() for cs in consumer_started] + [all_consumed]
+                                )
+
+                                is_live = model.new_bool_var(
+                                    f"live_{p.name}_{k.name}_{out.name}_w{w}_t{tau}")
+                                model.add_bool_and(
+                                    [is_produced, all_consumed.negated(), on_warp, pv]
+                                ).only_enforce_if(is_live)
+                                model.add_bool_or(
+                                    [is_produced.negated(), all_consumed, on_warp.negated(), pv.negated()]
+                                ).only_enforce_if(is_live.negated())
+
+                                live_terms.append((is_live, out.footprint_bytes))
+                            else:
+                                is_live = model.new_bool_var(
+                                    f"live_{p.name}_{k.name}_{out.name}_w{w}_t{tau}")
+                                model.add_bool_and(
+                                    [is_produced, on_warp, pv]
+                                ).only_enforce_if(is_live)
+                                model.add_bool_or(
+                                    [is_produced.negated(), on_warp.negated(), pv.negated()]
+                                ).only_enforce_if(is_live.negated())
+                                live_terms.append((is_live, out.footprint_bytes))
+
+                        if live_terms:
+                            model.add(
+                                sum(bv * fb for bv, fb in live_terms) <= self.reg_limit
                             )
-
-                            # is_live ↔ is_produced AND NOT all_consumed AND partition active
-                            is_live = model.new_bool_var(
-                                f"live_{p.name}_{k.name}_{out.name}_t{tau}")
-                            model.add_bool_and(
-                                [is_produced, all_consumed.negated(), pv]
-                            ).only_enforce_if(is_live)
-                            model.add_bool_or(
-                                [is_produced.negated(), all_consumed, pv.negated()]
-                            ).only_enforce_if(is_live.negated())
-
-                            live_terms.append((is_live, out.footprint_bytes))
-                        else:
-                            # No consumers — output is alive from production until end
-                            is_live = model.new_bool_var(
-                                f"live_{p.name}_{k.name}_{out.name}_t{tau}")
-                            model.add_bool_and(
-                                [is_produced, pv]
-                            ).only_enforce_if(is_live)
-                            model.add_bool_or(
-                                [is_produced.negated(), pv.negated()]
-                            ).only_enforce_if(is_live.negated())
-                            live_terms.append((is_live, out.footprint_bytes))
-
-                    if live_terms:
-                        model.add(
-                            sum(bv * fb for bv, fb in live_terms) <= self.reg_limit
-                        )
 
         # ============================================================
         # 6. Objective: minimize total execution time (sum of kernels)
         # ============================================================
         total = model.new_int_var(0, H * 10, "total_makespan")
-        # For each partition, total = sum of its kernel makespans
         for p in self.partitions:
             pv = part_vars[p.name]
             km_sum = sum(kernel_makespan[(p.name, k.name)] for k in p.kernels)
@@ -399,50 +543,60 @@ class UnifiedScheduler:
                 break
 
         schedules = {}
+        warp_assigns = {}
         reg_peaks = {}
         for k in chosen_partition.kernels:
             sched = {}
+            warps = {}
             for op in k.ops:
                 key = (chosen_partition.name, k.name, op.name)
                 sched[op.name] = solver.value(op_start[key])
+                warps[op.name] = solver.value(op_warp[key])
             schedules[k.name] = sched
+            warp_assigns[k.name] = warps
 
-            # Compute register peak from solution
+            # Compute register peak per warp from solution
             op_map = {op.name: op for op in k.ops}
             consumer_map: Dict[str, List[str]] = {}
             for op in k.ops:
-                for dep_name, _ in op.deps:
+                for dep_tuple in op.deps:
+                    dep_name, _, _ = _unpack_dep(dep_tuple)
                     if dep_name in op_map:
                         for out in op_map[dep_name].outputs:
                             consumer_map.setdefault(out.name, []).append(op.name)
 
-            peak = 0
-            for tau in range(solver.value(kernel_makespan[(chosen_partition.name, k.name)]) + 1):
-                total_live = 0
-                for op in k.ops:
-                    prod_key = (chosen_partition.name, k.name, op.name)
-                    prod_t = solver.value(op_start[prod_key])
-                    for out in op.outputs:
-                        if out.storage.value != StorageKind.RMEM.value or out.footprint_bytes <= 0:
+            max_peak = 0
+            km_val = solver.value(kernel_makespan[(chosen_partition.name, k.name)])
+            for w in range(W):
+                peak = 0
+                for tau in range(km_val + 1):
+                    total_live = 0
+                    for op in k.ops:
+                        if warps[op.name] != w:
                             continue
-                        if prod_t > tau:
-                            continue
-                        consumers = consumer_map.get(out.name, [])
-                        if consumers:
-                            all_done = all(
-                                solver.value(op_start[(chosen_partition.name, k.name, c)]) <= tau
-                                for c in consumers
-                            )
-                            if not all_done:
+                        prod_t = sched[op.name]
+                        for out in op.outputs:
+                            if out.storage.value != StorageKind.RMEM.value or out.footprint_bytes <= 0:
+                                continue
+                            if prod_t > tau:
+                                continue
+                            consumers = consumer_map.get(out.name, [])
+                            if consumers:
+                                all_done = all(
+                                    sched[c] <= tau for c in consumers
+                                )
+                                if not all_done:
+                                    total_live += out.footprint_bytes
+                            else:
                                 total_live += out.footprint_bytes
-                        else:
-                            total_live += out.footprint_bytes
-                peak = max(peak, total_live)
-            reg_peaks[k.name] = peak
+                    peak = max(peak, total_live)
+                max_peak = max(max_peak, peak)
+            reg_peaks[k.name] = max_peak
 
         return UnifiedResult(
             partition=chosen_partition.name,
             kernel_schedules=schedules,
+            kernel_warp_assigns=warp_assigns,
             kernel_reg_peaks=reg_peaks,
             total_makespan=solver.value(total),
             solve_time_ms=solve_ms,
@@ -534,7 +688,8 @@ class UnifiedScheduler:
                 op_map = {op.name: op for op in k.ops}
                 for op in k.ops:
                     key = (p.name, k.name, op.name)
-                    for dep_name, dist in op.deps:
+                    for dep_tuple in op.deps:
+                        dep_name, dist, _ = _unpack_dep(dep_tuple)
                         if dep_name not in op_map:
                             continue
                         dep_key = (p.name, k.name, dep_name)
@@ -619,7 +774,8 @@ class UnifiedScheduler:
                 op_map = {op.name: op for op in k.ops}
                 consumer_map: Dict[str, List[Tuple[str, int]]] = {}
                 for op in k.ops:
-                    for dep_name, dist in op.deps:
+                    for dep_tuple in op.deps:
+                        dep_name, dist, _ = _unpack_dep(dep_tuple)
                         if dep_name in op_map:
                             for out in op_map[dep_name].outputs:
                                 consumer_map.setdefault(out.name, []).append((op.name, dist))
@@ -745,7 +901,8 @@ class UnifiedScheduler:
                     # Build consumer set: which outputs have consumers?
                     consumed_outputs = set()
                     for op in k.ops:
-                        for dep_name, _ in op.deps:
+                        for dep_tuple in op.deps:
+                            dep_name, _, _ = _unpack_dep(dep_tuple)
                             if dep_name in op_map:
                                 for out in op_map[dep_name].outputs:
                                     consumed_outputs.add(out.name)
@@ -769,7 +926,8 @@ class UnifiedScheduler:
                     op_map_check = {op.name: op for op in k.ops}
                     consumed_check = set()
                     for op in k.ops:
-                        for dep_name, _ in op.deps:
+                        for dep_tuple in op.deps:
+                            dep_name, _, _ = _unpack_dep(dep_tuple)
                             if dep_name in op_map_check:
                                 for out in op_map_check[dep_name].outputs:
                                     consumed_check.add(out.name)
@@ -803,7 +961,8 @@ class UnifiedScheduler:
                     key = (p.name, k.name, op.name)
                     # Find consumers of this producer (ops that depend on it with dist=0)
                     for c_op in k.ops:
-                        for dep_name, dist in c_op.deps:
+                        for dep_tuple in c_op.deps:
+                            dep_name, dist, _ = _unpack_dep(dep_tuple)
                             if dep_name == op.name and dist == 0 and c_op.fixed_warp != 0:
                                 c_key = (p.name, k.name, c_op.name)
                                 # overlap = consumer_start - producer_start
@@ -909,7 +1068,8 @@ class UnifiedScheduler:
             op_map = {op.name: op for op in k.ops}
             cm: Dict[str, List[Tuple[str, int]]] = {}
             for op in k.ops:
-                for dep_name, dist in op.deps:
+                for dep_tuple in op.deps:
+                    dep_name, dist, _ = _unpack_dep(dep_tuple)
                     if dep_name in op_map:
                         for out in op_map[dep_name].outputs:
                             cm.setdefault(out.name, []).append((op.name, dist))
