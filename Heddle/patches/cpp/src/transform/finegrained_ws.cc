@@ -175,6 +175,36 @@ ParseStageOffsets(const std::string &config_str) {
   return result;
 }
 
+/*!
+ * \brief Parse per-op warp group assignments from config string.
+ *
+ * Format: "s0:0,s1:1,s2:0,s3:1"
+ * Each entry maps a compute_stmt name (sN where N = compute_stmt index)
+ * to a warp group ID. Used by Plan B per-op warp dispatch.
+ */
+static std::unordered_map<int, int>
+ParseWarpAssigns(const std::string &config_str) {
+  std::unordered_map<int, int> result;
+  if (config_str.empty())
+    return result;
+
+  std::istringstream stream(config_str);
+  std::string entry;
+  while (std::getline(stream, entry, ',')) {
+    auto colon_pos = entry.find(':');
+    if (colon_pos == std::string::npos)
+      continue;
+    std::string name = entry.substr(0, colon_pos);
+    int warp_id = std::stoi(entry.substr(colon_pos + 1));
+    // Extract compute_stmt index from "sN" format
+    if (name.size() > 1 && name[0] == 's') {
+      int ci = std::stoi(name.substr(1));
+      result[ci] = warp_id;
+    }
+  }
+  return result;
+}
+
 struct LocalAccessSummary {
   BufferSet read_buffers;
   BufferSet write_buffers;
@@ -1255,7 +1285,8 @@ public:
       bool dual_consumer_enabled = false,
       const std::string &consumer_stage_map_str = "",
       const std::string &barrier_hints_str = "",
-      const std::string &stage_offsets_str = "") {
+      const std::string &stage_offsets_str = "",
+      const std::string &warp_assigns_str = "") {
     // Check thread tags
     if (!ThreadTagChecker::HasOnlyThreadIdxX(f)) {
       LOG(WARNING) << "FineGrainedWS: disabled because program uses "
@@ -1271,6 +1302,7 @@ public:
     T.consumer_stage_map_ = ParseConsumerStageMap(consumer_stage_map_str);
     T.barrier_hints_ = ParseBarrierHints(barrier_hints_str);
     T.explicit_stage_offsets_ = ParseStageOffsets(stage_offsets_str);
+    T.warp_assigns_map_ = ParseWarpAssigns(warp_assigns_str);
     f.CopyOnWrite()->body = T(f->body);
 
     // TODO(lei): This should be refactored
@@ -1388,6 +1420,36 @@ private:
         if (anno_str == "1" && !three_role_enabled_) {
           LOG(INFO) << "FineGrainedWS: auto-enabling three-role WS from loop annotation";
           three_role_enabled_ = true;
+        }
+      }
+    }
+
+    // Read per-op warp assignments from loop annotation (Plan B).
+    // Format: "s0:0,s1:1,s2:0,s3:1"
+    {
+      auto wa_anno =
+          pipeline_loop->annotations.Get("tl_finegrainedws_warp_assigns");
+      if (wa_anno.has_value()) {
+        std::string anno_str =
+            static_cast<std::string>(Downcast<String>(wa_anno.value()));
+        if (!anno_str.empty()) {
+          warp_assigns_map_ = ParseWarpAssigns(anno_str);
+          LOG(INFO) << "FineGrainedWS: parsed " << warp_assigns_map_.size()
+                    << " per-op warp assignments from annotation";
+        }
+      }
+      // Also check pcws variant
+      if (warp_assigns_map_.empty()) {
+        auto wa_anno2 =
+            pipeline_loop->annotations.Get("tl_pcws_warp_assigns");
+        if (wa_anno2.has_value()) {
+          std::string anno_str =
+              static_cast<std::string>(Downcast<String>(wa_anno2.value()));
+          if (!anno_str.empty()) {
+            warp_assigns_map_ = ParseWarpAssigns(anno_str);
+            LOG(INFO) << "FineGrainedWS: parsed " << warp_assigns_map_.size()
+                      << " per-op warp assignments from pcws annotation";
+          }
         }
       }
     }
@@ -2118,6 +2180,20 @@ private:
 
     // --- Build Consumer Body ---
     Array<Stmt> consumer_body_stmts;
+    // Per-stmt warp group assignment for Plan B per-op dispatch.
+    // -1 = common (goes to all warp groups), >=0 = assigned warp group.
+    // Populated only when warp_assigns_map_ is non-empty.
+    std::vector<int> consumer_stmt_warp_group;
+    bool track_warp_groups = !warp_assigns_map_.empty();
+    auto push_consumer_stmt = [&](Stmt stmt, int wg) {
+      consumer_body_stmts.push_back(stmt);
+      if (track_warp_groups) consumer_stmt_warp_group.push_back(wg);
+    };
+    // Lookup warp group for a compute_stmt index; returns -1 if unassigned.
+    auto warp_group_for_ci = [&](int ci) -> int {
+      auto it = warp_assigns_map_.find(ci);
+      return (it != warp_assigns_map_.end()) ? it->second : -1;
+    };
 
     // Helper: compute effective stage/parity for a given block, considering
     // the stage_offset of the compute_stmt at its wait position.
@@ -2230,26 +2306,26 @@ private:
                 wait_stmt,
                 dummy_wait);
           }
-          consumer_body_stmts.push_back(wait_stmt);
+          push_consumer_stmt(wait_stmt, warp_group_for_ci(static_cast<int>(ci)));
         }
       }
       // Three-role: insert named_barrier_wait(dQ_empty) before first dQ write.
       // This ensures the dQ writer has finished draining smem from the previous
       // iteration before the consumer overwrites it.
       if (has_three_role && static_cast<int>(ci) == first_dq_write_ci) {
-        consumer_body_stmts.push_back(Evaluate(
+        push_consumer_stmt(Evaluate(
             Call(DataType::Handle(), named_barrier_wait(),
-                 {IntImm(DataType::Int(32), 2), three_role_barrier_count})));
+                 {IntImm(DataType::Int(32), 2), three_role_barrier_count})), -1);
       }
       // Three-role: skip TMA reduce-add stmts (moved to dQ writer).
       // Emit named_barrier_arrive(dQ_full) at the position of the LAST
       // TMA reduce-add stmt to signal that dQ smem is ready for draining.
       if (tma_reduce_add_indices.count(static_cast<int>(ci))) {
         if (static_cast<int>(ci) == last_tma_reduce_add_ci) {
-          consumer_body_stmts.push_back(Evaluate(
+          push_consumer_stmt(Evaluate(
               Call(DataType::Handle(), named_barrier_arrive(),
                    {IntImm(DataType::Int(32), 1),
-                    three_role_barrier_count})));
+                    three_role_barrier_count})), -1);
         }
         // Skip — this stmt is moved to the dQ writer.
       } else if (!moved_compute_stmts[ci]) {
@@ -2276,7 +2352,7 @@ private:
                  IntImm(DataType::Int(32), std::abs(offset))),
               compute_stmt);
         }
-        consumer_body_stmts.push_back(compute_stmt);
+        push_consumer_stmt(compute_stmt, warp_group_for_ci(static_cast<int>(ci)));
       }
       for (size_t ti = 0; ti < extractor.blocks.size(); ++ti) {
         bool is_last_in_group = ti + 1 == extractor.blocks.size() ||
@@ -2317,7 +2393,7 @@ private:
                 protocol_guard_sources[ti], protocol_guards[ti],
                 makeArriveBarrier(bp_id));
           }
-          consumer_body_stmts.push_back(arrive_stmt);
+          push_consumer_stmt(arrive_stmt, warp_group_for_ci(static_cast<int>(ci)));
           arrive_emitted[ti] = true;
         }
       }
@@ -2329,7 +2405,7 @@ private:
         bool is_first_in_group =
             ti == 0 || block_group[ti] != block_group[ti - 1];
         if (is_first_in_group) {
-          consumer_body_stmts.push_back(normalized_waits[ti]);
+          push_consumer_stmt(normalized_waits[ti], -1);
         }
       }
     }
@@ -2363,14 +2439,15 @@ private:
                  IntImm(DataType::Int(32), std::abs(tail_offset))),
               arrive_stmt);
         }
-        consumer_body_stmts.push_back(arrive_stmt);
+        push_consumer_stmt(arrive_stmt,
+            warp_group_for_ci(static_cast<int>(extractor.compute_stmts.size()) - 1));
       }
     }
     // Phase counter increment for the consumer side.
     if (needs_phase_counter) {
-      consumer_body_stmts.push_back(WrapStmtWithGuardSource(
+      push_consumer_stmt(WrapStmtWithGuardSource(
           uniform_phase_guard_source, uniform_phase_guard,
-          consumer_phase_counter->Increment()));
+          consumer_phase_counter->Increment()), -1);
     }
     // --- Async PV: relax the last warpgroup_wait depth ---
     // When Heddle signals tl_finegrainedws_async_pv=1, change the LAST
@@ -3309,6 +3386,137 @@ private:
                   << "/" << consumer_body_stmts.size()
                   << " (WG0: " << pv_split_idx << " stmts, WG1: "
                   << (consumer_body_stmts.size() - pv_split_idx) << " stmts)";
+      }
+    } else if (track_warp_groups && !consumer_stmt_warp_group.empty()) {
+      // --- Plan B: Per-op warp dispatch ---
+      // Each consumer compute stmt is routed to a specific warp group based
+      // on the solver's warp_assigns map. This is a generalization of
+      // dual-consumer: instead of a fixed positional split, each stmt goes
+      // to its assigned warp group. Common stmts (wg=-1) are duplicated
+      // into all warp groups.
+      //
+      // Thread layout (N warp groups):
+      //   WG0: tid [0, 128)
+      //   WG1: tid [128, 256)
+      //   ...
+      //   WG(N-1): tid [(N-1)*128, N*128)
+      //   Producer: tid [N*128, (N+1)*128)
+
+      // Determine number of warp groups
+      int max_wg = 0;
+      for (int wg : consumer_stmt_warp_group) {
+        if (wg > max_wg) max_wg = wg;
+      }
+      int num_warp_groups = max_wg + 1;
+      if (num_warp_groups < 2) {
+        // Only one warp group — fall through to standard two-role
+        LOG(INFO) << "FineGrainedWS per-op dispatch: only 1 warp group, "
+                     "falling back to standard two-role.";
+        goto standard_two_role;
+      }
+
+      PrimExpr wg_extent = IntImm(DataType::Int(32), 128);
+      PrimExpr total_consumer_threads =
+          IntImm(DataType::Int(32), num_warp_groups * 128);
+      int orig_consumer_int =
+          Downcast<IntImm>(consumer_thread_extent)->value;
+
+      {
+        // Build per-WG loop bodies
+        std::vector<Array<Stmt>> wg_stmts(num_warp_groups);
+        ICHECK_EQ(consumer_body_stmts.size(), consumer_stmt_warp_group.size());
+        for (size_t si = 0; si < consumer_body_stmts.size(); ++si) {
+          int wg = consumer_stmt_warp_group[si];
+          if (wg < 0) {
+            // Common stmt: goes to all warp groups
+            for (int w = 0; w < num_warp_groups; ++w) {
+              wg_stmts[w].push_back(consumer_body_stmts[si]);
+            }
+          } else {
+            ICHECK_LT(wg, num_warp_groups)
+                << "warp group " << wg << " exceeds num_warp_groups " << num_warp_groups;
+            wg_stmts[wg].push_back(consumer_body_stmts[si]);
+          }
+        }
+
+        // Build loops for each warp group
+        std::vector<Stmt> wg_loops(num_warp_groups);
+        for (int w = 0; w < num_warp_groups; ++w) {
+          if (wg_stmts[w].empty()) {
+            LOG(WARNING) << "FineGrainedWS per-op dispatch: WG" << w
+                         << " has no stmts, inserting nop";
+            wg_loops[w] = Evaluate(0);
+          } else {
+            Stmt wg_body = MergeAdjacentEquivalentIfs(SeqStmt(wg_stmts[w]));
+            wg_body = rewrap_loop_body_lets(wg_body);
+
+            // Rewrite stage expressions if needed
+            if (needs_phase_counter) {
+              wg_body = StageExprReplacer::Replace(
+                  wg_body, loop_var, loop_min, num_stages,
+                  consumer_phase_counter->StageExpr(num_stages));
+            }
+
+            wg_loops[w] = For(loop_var, loop_min, loop_extent, ForKind::kSerial,
+                              wg_body, Optional<IterVar>(), loop_annos);
+          }
+        }
+
+        // Wrap each WG loop with phase counter allocation
+        if (needs_phase_counter) {
+          wg_loops[0] = consumer_phase_counter->WrapLoopWithAlloc(wg_loops[0]);
+          for (int w = 1; w < num_warp_groups; ++w) {
+            auto wg_phase = PhaseCounter::Create(
+                std::string("wg") + std::to_string(w) + "_phase");
+            wg_loops[w] = wg_phase.WrapLoopWithAlloc(wg_loops[w]);
+          }
+        }
+
+        // Rewrite threadIdx.x for producer
+        producer_loop = PCThreadIdxRewriter::Rewrite(
+            producer_loop, thread_iv_->var,
+            thread_iv_->var - total_consumer_threads, producer_thread_extent,
+            /*do_shuffle=*/true);
+
+        // Rewrite threadIdx.x for each warp group
+        // WG0: threadIdx = tid (range 0-127), barrier rewrite consumer→128
+        wg_loops[0] = PCThreadIdxRewriter::Rewrite(
+            wg_loops[0], thread_iv_->var, thread_iv_->var, wg_extent,
+            /*do_shuffle=*/true,
+            /*rewrite_barrier_from=*/orig_consumer_int,
+            /*rewrite_barrier_to=*/128);
+
+        // WG1..WG(N-1): threadIdx = tid - w*128
+        for (int w = 1; w < num_warp_groups; ++w) {
+          PrimExpr wg_offset = IntImm(DataType::Int(32), w * 128);
+          wg_loops[w] = ThreadIdxSubstitutor::Substitute(
+              wg_loops[w], thread_iv_->var, wg_offset);
+          Var dummy_var(std::string("__no_match_wg") + std::to_string(w) + "__",
+                        DataType::Int(32));
+          wg_loops[w] = PCThreadIdxRewriter::Rewrite(
+              wg_loops[w], dummy_var, dummy_var, wg_extent,
+              /*do_shuffle=*/false,
+              /*rewrite_barrier_from=*/orig_consumer_int,
+              /*rewrite_barrier_to=*/128,
+              /*barrier_id_offset=*/w * 4);
+        }
+
+        // Build nested IfThenElse dispatch for consumer warp groups
+        // WG(N-1) is the else-branch of the last if
+        Stmt consumer_dispatch = wg_loops[num_warp_groups - 1];
+        for (int w = num_warp_groups - 2; w >= 0; --w) {
+          PrimExpr boundary = IntImm(DataType::Int(32), (w + 1) * 128);
+          consumer_dispatch = IfThenElse(
+              LT(thread_iv_->var, boundary), wg_loops[w], consumer_dispatch);
+        }
+        ws_body = IfThenElse(GE(thread_iv_->var, total_consumer_threads),
+                             producer_loop, consumer_dispatch);
+
+        LOG(INFO) << "FineGrainedWS per-op dispatch: " << num_warp_groups
+                  << " warp groups, " << consumer_body_stmts.size() << " total stmts";
+        for (int w = 0; w < num_warp_groups; ++w) {
+          LOG(INFO) << "  WG" << w << ": " << wg_stmts[w].size() << " stmts";
+        }
       }
     } else { standard_two_role:
       // --- Standard two-role thread split ---
@@ -5220,6 +5428,8 @@ private:
   int pure_tma_preloop_fwd_count_ = 0;
   int pure_tma_preloop_fwd_cursor_ = 0;
   VarBindingMap current_loop_guard_bindings_;
+  // Per-op warp group assignments (Plan B): compute_stmt index → warp group ID
+  std::unordered_map<int, int> warp_assigns_map_;
 };
 
 // ---------------------------------------------------------------------------
@@ -5290,11 +5500,16 @@ tvm::transform::Pass MakeFineGrainedWarpSpecializedPass(const std::string &pass_
     std::string stage_offsets_str =
         ctx->GetConfig(kFineGrainedWsStageOffsets, Optional<String>())
             .value_or(String(""));
+    // Per-op warp group assignments (Plan B)
+    std::string warp_assigns_str =
+        ctx->GetConfig(kFineGrainedWsWarpAssigns, Optional<String>())
+            .value_or(String(""));
 
     return FineGrainedWSRewriter::Substitute(
         f, producer_threads, three_role, user_set_producer,
         dual_consumer,
-        consumer_stage_map_str, barrier_hints_str, stage_offsets_str);
+        consumer_stage_map_str, barrier_hints_str, stage_offsets_str,
+        warp_assigns_str);
   };
   return CreatePrimFuncPass(pass_func, 0, pass_name, {});
 }

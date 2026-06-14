@@ -50,6 +50,8 @@ HEDDLE_CONFIG_KEYS: dict[str, str] = {
     "TL_FINEGRAINEDWS_CONSUMER_STAGE_MAP": "tl.finegrainedws_consumer_stage_map",
     "TL_FINEGRAINEDWS_BARRIER_HINTS": "tl.finegrainedws_barrier_hints",
     "TL_FINEGRAINEDWS_STAGE_OFFSETS": "tl.finegrainedws_stage_offsets",
+    "TL_PCWS_WARP_ASSIGNS": "tl.pcws_warp_assigns",
+    "TL_FINEGRAINEDWS_WARP_ASSIGNS": "tl.finegrainedws_warp_assigns",
     "TL_PERSISTENT_KERNEL": "tl.persistent_kernel",
     "TL_PERSISTENT_NUM_SMS": "tl.persistent_num_sms",
     "TL_PERSISTENT_L2_SWIZZLE": "tl.persistent_l2_swizzle",

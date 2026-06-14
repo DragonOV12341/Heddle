@@ -275,6 +275,18 @@ static constexpr const char *kFineGrainedWsBarrierHints = "tl.finegrainedws_barr
 static constexpr const char *kFineGrainedWsStageOffsets = "tl.finegrainedws_stage_offsets";
 
 /*!
+ * \brief Per-op warp group assignments from Heddle CP-SAT solver.
+ *
+ * Comma-separated entries: "op_name:warp_id"
+ * Example: "s0:0,s1:1,s2:0,s3:1"
+ * Each consumer compute statement is assigned to a specific warp group.
+ * Enables solver-driven per-op warp dispatch beyond positional splitting.
+ *
+ * Default: "" (empty, use default dual_consumer heuristic)
+ */
+static constexpr const char *kFineGrainedWsWarpAssigns = "tl.finegrainedws_warp_assigns";
+
+/*!
  * \brief Enable persistent kernel transform.
  *
  * When true, wraps kernel body in persistent tile scheduling loop
