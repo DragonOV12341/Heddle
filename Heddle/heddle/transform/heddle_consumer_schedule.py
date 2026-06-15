@@ -167,6 +167,14 @@ def _get_bool_config(ctx: tvm.ir.transform.PassContext, key: str, default: bool)
         return default
 
 
+def _get_int_config(ctx: tvm.ir.transform.PassContext, key: str, default: int) -> int:
+    try:
+        from heddle._monkey_patch import get_heddle_pass_config
+        return int(ctx.config.get(key, get_heddle_pass_config(key, default)))
+    except Exception:
+        return default
+
+
 def _ws_annotation_aliases(key: str) -> Tuple[str, ...]:
     """Return annotation keys for main PCWS and legacy FineGrainedWS backends."""
     if key.startswith("tl_pcws_"):
@@ -1207,6 +1215,7 @@ def _transform_pipeline_loop(
     buffer_span_aware: bool = True,
     relax_producer_boundary: bool = True,
     use_phase_b: bool = False,
+    consumer_num_warps: int = 1,
     debug: bool = False,
 ) -> tvm.tir.PrimFunc:
     """Find pipeline loops and reorder consumer statements using Heddle."""
@@ -1508,9 +1517,10 @@ def _transform_pipeline_loop(
         # Policy: run Phase B if (a) explicitly enabled, or (b) ≥3 WGMMA
         # consumer ops detected (complex dependency → heuristic may produce
         # FU conflicts that only joint solve can resolve).
+        print("---- start smt solving -----")
         n_tc_ops = len(consumer_wgmma_indices)
         auto_phase_b = (n_tc_ops >= 3) and (len(consumer_indices) >= 6)
-        run_phase_b = use_phase_b or auto_phase_b
+        run_phase_b = use_phase_b or auto_phase_b or consumer_num_warps > 1
 
         if run_phase_b:
             # Adaptive timeout: 500ms base + 100ms per consumer node
@@ -1525,6 +1535,7 @@ def _transform_pipeline_loop(
             phase_b_result = _phase_b_consumer_ordering(
                 infos_list, consumer_indices, deps,
                 use_precise_latency=use_precise_latency,
+                num_warps=consumer_num_warps,
                 timeout_ms=adaptive_timeout,
                 debug=debug,
             )
@@ -1533,6 +1544,26 @@ def _transform_pipeline_loop(
                 phase_b_order, phase_b_times, phase_b_warps = phase_b_result
             else:
                 phase_b_order, phase_b_times, phase_b_warps = None, {}, {}
+
+            if consumer_num_warps > 1 and phase_b_order is None:
+                phase_b_order = list(consumer_indices)
+                phase_b_times = {}
+                phase_b_warps = {}
+                if debug:
+                    print(f"[Heddle] Phase B failed but multi-consumer warp is "
+                          f"requested; using original order and letting PCWS "
+                          f"choose a structured consumer split",
+                          file=sys.stderr, flush=True)
+
+            if consumer_num_warps > 1 and phase_b_order is not None:
+                warp_keys = {int(name[1:]) for name in phase_b_warps}
+                if phase_b_warps and warp_keys != set(consumer_indices):
+                    phase_b_warps = {}
+                    if debug:
+                        print(f"[Heddle] Phase B returned partial warp assigns; "
+                              f"skipping per-op dispatch and letting PCWS choose "
+                              f"a structured consumer split",
+                              file=sys.stderr, flush=True)
 
             if debug:
                 status = "SAT" if phase_b_order is not None else "UNSAT/timeout"
@@ -1579,7 +1610,7 @@ def _transform_pipeline_loop(
                 annotations_changed = False
 
                 # Auto-inject dual-consumer annotation when pattern detected
-                if len(consumer_wgmma_indices) >= 2 and has_non_tc_gap:
+                if not phase_b_warps and len(consumer_wgmma_indices) >= 2 and has_non_tc_gap:
                     annotations_changed = (
                         _ensure_ws_annotation(new_annotations, "tl_pcws_dual_consumer", "1")
                         or annotations_changed
@@ -1619,9 +1650,20 @@ def _transform_pipeline_loop(
                         annotations_changed = True
 
                 if phase_b_warps:
-                    warp_str = ",".join(f"{k}:{v}" for k, v in sorted(phase_b_warps.items()))
+                    pcws_order = phase_b_order if phase_b_order is not None else consumer_indices
+                    pcws_warp_keys = {
+                        f"s{ci}": f"s{pos}"
+                        for pos, ci in enumerate(pcws_order)
+                    }
+                    warp_str = ",".join(
+                        f"{pcws_warp_keys.get(k, k)}:{v}"
+                        for k, v in sorted(phase_b_warps.items())
+                    )
                     _set_ws_annotation(new_annotations, "tl_pcws_warp_assigns", warp_str)
                     annotations_changed = True
+                    if debug:
+                        print(f"[Heddle] Injected per-op warp assigns: {warp_str}",
+                              file=sys.stderr, flush=True)
 
                 if order_changed or annotations_changed:
                     changed[0] = True
@@ -1880,11 +1922,13 @@ def HeddleConsumerSchedule():
         buffer_span_aware = _get_bool_config(ctx, "tl.heddle_buffer_span_aware", True)
         relax_producer_boundary = _get_bool_config(ctx, "tl.heddle_relax_producer_boundary", True)
         use_phase_b = _get_bool_config(ctx, "tl.heddle_use_phase_b", False)
+        consumer_num_warps = max(1, _get_int_config(ctx, "tl.heddle_consumer_num_warps", 1))
 
         if debug:
             print(f"[Heddle] HeddleConsumerSchedule pass running "
                   f"(alap={use_alap_priority}, buf_span={buffer_span_aware}, "
-                  f"relax_pb={relax_producer_boundary}, phase_b={use_phase_b})",
+                  f"relax_pb={relax_producer_boundary}, phase_b={use_phase_b}, "
+                  f"consumer_warps={consumer_num_warps})",
                   file=sys.stderr, flush=True)
 
         try:
@@ -1895,8 +1939,11 @@ def HeddleConsumerSchedule():
                 buffer_span_aware=buffer_span_aware,
                 relax_producer_boundary=relax_producer_boundary,
                 use_phase_b=use_phase_b,
+                consumer_num_warps=consumer_num_warps,
                 debug=debug,
             )
+            print(" --after smt ----\n " ,result.script())
+            
             return result
         except Exception as e:
             if debug:

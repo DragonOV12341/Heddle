@@ -23,6 +23,7 @@ HEDDLE_CONFIG_KEYS: dict[str, str] = {
     "TL_HEDDLE_USE_ALAP_PRIORITY": "tl.heddle_use_alap_priority",
     "TL_HEDDLE_BUFFER_SPAN_AWARE": "tl.heddle_buffer_span_aware",
     "TL_HEDDLE_USE_PHASE_B": "tl.heddle_use_phase_b",
+    "TL_HEDDLE_CONSUMER_NUM_WARPS": "tl.heddle_consumer_num_warps",
     "TL_HEDDLE_RELAX_PRODUCER_BOUNDARY": "tl.heddle_relax_producer_boundary",
     "TL_PCWS_ENABLE_THREE_ROLE": "tl.pcws_enable_three_role",
     "TL_PCWS_PRODUCER_THREAD_EXTENT": "tl.pcws_producer_thread_extent",
@@ -173,69 +174,19 @@ def _patch_pass_context() -> None:
 
 
 def _patch_phase() -> None:
-    """Patch OptimizeForTarget to use heddle.transform.heddle_consumer_schedule."""
+    """Keep TileLang's native lowering pipeline intact.
+
+    Heddle is inserted by wrapping ProducerConsumerWarpSpecialized in
+    _patch_transform_init().  Replacing OptimizeForTarget is too brittle
+    because TileLang's native pipeline contains many post-WS cleanups.
+    """
     try:
         import tilelang.engine.phase as phase_mod
     except ImportError:
         _log.warning("tilelang.engine.phase not found; skipping phase patch")
         return
 
-    _original = phase_mod.OptimizeForTarget
-
-    def _patched_optimize_for_target(mod, target):
-        import tilelang.transform
-        from tilelang import tvm as tvm
-        Target = tvm.target.Target
-
-        pass_ctx = tilelang.transform.get_pass_context()
-
-        mod = tilelang.transform.LowerSharedTmem()(mod)
-
-        if phase_mod.allow_tma_lower(pass_ctx=pass_ctx, target=target):
-            mod = tilelang.transform.IfStmtBinding()(mod)
-            mod = tilelang.transform.MultiVersionBuffer()(mod)
-            mod = tilelang.transform.LowerSharedBarrier()(mod)
-            if phase_mod.allow_warp_specialized(pass_ctx=pass_ctx, target=target):
-                from heddle.transform.heddle_consumer_schedule import HeddleConsumerSchedule
-                mod = HeddleConsumerSchedule()(mod)
-                ws_pass = getattr(tilelang.transform, "FineGrainedWarpSpecialized", None)
-                if ws_pass is None:
-                    ws_pass = tilelang.transform.ProducerConsumerWarpSpecialized
-                mod = ws_pass()(mod)
-            else:
-                mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
-                mod = tilelang.transform.PipelinePlanning()(mod)
-                mod = tilelang.transform.InjectSoftwarePipeline()(mod)
-            mod = tilelang.transform.FuseMBarrierArriveExpectTx()(mod)
-            mod = tilelang.transform.LowerOpaqueBlock()(mod)
-            if phase_mod.is_hopper(target):
-                mod = tilelang.transform.RewriteWgmmaSync()(mod)
-        else:
-            mod = tilelang.transform.LowerSharedBarrier()(mod)
-            mod = tilelang.transform.IfStmtBinding()(mod)
-            mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
-            mod = tilelang.transform.PipelinePlanning()(mod)
-            mod = tilelang.transform.InjectSoftwarePipeline()(mod)
-
-        # Persistent kernel transform (if available)
-        try:
-            from heddle.transform.persistent_kernel import PersistentKernelTransform
-            mod = PersistentKernelTransform()(mod)
-        except (ImportError, AttributeError):
-            pass
-
-        if hasattr(tilelang.transform, 'LowerPTXAsyncCopy'):
-            mod = tilelang.transform.LowerPTXAsyncCopy()(mod)
-        if hasattr(tilelang.transform, 'OptimizeCPAsyncSync'):
-            mod = tilelang.transform.OptimizeCPAsyncSync()(mod)
-
-        mod = tilelang.transform.AnnotateDeviceRegions()(mod)
-        mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
-
-        return mod
-
-    phase_mod.OptimizeForTarget = _patched_optimize_for_target
-    _log.info("Patched tilelang.engine.phase.OptimizeForTarget")
+    _log.info("Using TileLang native OptimizeForTarget; Heddle wraps PCWS pass")
 
 
 def _patch_transform_init() -> None:
@@ -246,8 +197,21 @@ def _patch_transform_init() -> None:
         return
 
     from heddle.transform.heddle_consumer_schedule import HeddleConsumerSchedule
+    from tilelang import tvm as tvm
+
     if not hasattr(transform_mod, 'HeddleConsumerSchedule'):
         transform_mod.HeddleConsumerSchedule = HeddleConsumerSchedule
+
+    if not hasattr(transform_mod, "_heddle_original_pcws"):
+        transform_mod._heddle_original_pcws = transform_mod.ProducerConsumerWarpSpecialized
+
+        def _heddle_pcws_wrapper():
+            return tvm.transform.Sequential([
+                HeddleConsumerSchedule(),
+                transform_mod._heddle_original_pcws(),
+            ])
+
+        transform_mod.ProducerConsumerWarpSpecialized = _heddle_pcws_wrapper
 
 
 def apply_all_patches() -> None:

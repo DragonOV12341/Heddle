@@ -1512,6 +1512,7 @@ private:
     consumer_thread_extent_ =
         consumer_thread_extent; // Store for RebuildBlockBody
     producer_thread_extent_ = producer_thread_extent;
+    PrimExpr ws_consumer_thread_extent = consumer_thread_extent;
 
     // Barrier layout has two modes:
     // 1) Mixed TMA + cp.async:
@@ -2185,6 +2186,15 @@ private:
     // Populated only when warp_assigns_map_ is non-empty.
     std::vector<int> consumer_stmt_warp_group;
     bool track_warp_groups = !warp_assigns_map_.empty();
+    if (track_warp_groups &&
+        warp_assigns_map_.size() < extractor.compute_stmts.size()) {
+      LOG(WARNING) << "FineGrainedWS per-op dispatch requires warp assigns "
+                   << "for every consumer stmt; got "
+                   << warp_assigns_map_.size() << " assigns for "
+                   << extractor.compute_stmts.size()
+                   << " stmts. Falling back to structured WS dispatch.";
+      track_warp_groups = false;
+    }
     auto push_consumer_stmt = [&](Stmt stmt, int wg) {
       consumer_body_stmts.push_back(stmt);
       if (track_warp_groups) consumer_stmt_warp_group.push_back(wg);
@@ -3337,6 +3347,7 @@ private:
         // Thread layout: [0, 128) = WG0, [128, 256) = WG1, [256, 384) = producer
         PrimExpr dual_consumer_extent =
             IntImm(DataType::Int(32), 2) * wg_extent;  // 256
+        ws_consumer_thread_extent = dual_consumer_extent;
 
         // Rewrite threadIdx.x for each role
         producer_loop = PCThreadIdxRewriter::Rewrite(
@@ -3418,6 +3429,7 @@ private:
       PrimExpr wg_extent = IntImm(DataType::Int(32), 128);
       PrimExpr total_consumer_threads =
           IntImm(DataType::Int(32), num_warp_groups * 128);
+      ws_consumer_thread_extent = total_consumer_threads;
       int orig_consumer_int =
           Downcast<IntImm>(consumer_thread_extent)->value;
 
@@ -3585,7 +3597,7 @@ private:
 
     // Add warp specialization scope attribute
     Array<IntImm> ws_partition = {Downcast<IntImm>(producer_thread_extent),
-                                  Downcast<IntImm>(consumer_thread_extent)};
+                                  Downcast<IntImm>(ws_consumer_thread_extent)};
     ws_body =
         AttrStmt(ws_partition, attr::kWarpSpecializationScope, 0, ws_body);
 
@@ -3649,6 +3661,8 @@ private:
     consumer_live_seed.AddUses(
         LocalAccessCollector::CollectExpr(loop_extent, buffer_data_to_buffer));
 
+    consumer_thread_extent_ = ws_consumer_thread_extent;
+
     // Reconstruct block body: replace the pipeline loop and
     // create_list_of_mbarrier with new init_barrier + ws_body.
     Stmt new_block_body = RebuildBlockBody(
@@ -3682,14 +3696,13 @@ private:
       auto cimm = consumer_thread_extent.as<IntImmNode>();
       int64_t cext = cimm ? cimm->value : -1;
       if (cext == 128) {
-        num_threads_ = consumer_thread_extent +
-                       IntImm(DataType::Int(32), 128) + producer_thread_extent;
+        num_threads_ = ws_consumer_thread_extent + producer_thread_extent;
       } else {
         // consumer already >= 2 WGs; dual-consumer only relabels threads
-        num_threads_ = consumer_thread_extent + producer_thread_extent;
+        num_threads_ = ws_consumer_thread_extent + producer_thread_extent;
       }
     } else {
-      num_threads_ = consumer_thread_extent + producer_thread_extent;
+      num_threads_ = ws_consumer_thread_extent + producer_thread_extent;
     }
     ws_transformed_ = true;
     use_full_tma_forward_barrier_protocol_ =
