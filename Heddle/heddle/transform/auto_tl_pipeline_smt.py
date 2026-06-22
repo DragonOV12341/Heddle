@@ -7,6 +7,8 @@ import re
 import sys
 from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
+from tvm import tir
+
 import tilelang
 from tilelang import tvm as tvm
 
@@ -524,13 +526,59 @@ class _StmtInfo:
     is_wgmma: bool
     touches_local: bool
     touches_external_local: bool
+    is_wait_barrier : bool
+
+
+import tvm
+from tvm import tir
+
+@tir.functor.visitor
+class FullBarrierExtractor(tir.PyStmtExprVisitor):
+    def __init__(self):
+        super().__init__()
+        # 用来存放提取到的 barrier 及其对应的操作类型
+        # 格式: (barrier_expr, op_type, stmt_or_call_node)
+        self.barrier_operations = []
+
+    def visit_call_(self, call):
+        # 针对以 Call 形式存在的原语 (通常是外部函数调用或特定 Op)
+        if isinstance(call.op, tvm.ir.Op):
+            op_name = call.op.name
+
+            # 1. 处理 tma_load
+            if op_name in {"tl.tma_load", "tl.tma_load_im2col", "tir.tma_load"}:
+                self.barrier_operations.append((call.args[1], "TMA_LOAD", call))
+
+            # 2. 处理 ptx_arrive_barrier
+            elif op_name == "tir.ptx_arrive_barrier":
+                self.barrier_operations.append((call.args[0], "ARRIVE", call))
+
+            elif op_name == "tir.ptx_arrive_barrier_expect_tx":
+                self.barrier_operations.append((call.args[0], "ARRIVE_EXPECT_TX", call))
+
+            # 3. 处理 mbarrier_expect_tx
+            elif op_name in {"tl.mbarrier_expect_tx", "tir.mbarrier_expect_tx"}:
+                self.barrier_operations.append((call.args[0], "EXPECT_TX", call))
+
+            # 4. 处理 mbarrier_wait_parity
+            elif op_name in {"tl.mbarrier_wait_parity", "tir.mbarrier_wait_parity"}:
+                self.barrier_operations.append((call.args[0], "WAIT", call))
+
+        # 继续向下遍历
+        super().visit_call_(call)
+
 
 
 def _build_stmt_infos(
     seq: tvm.tir.SeqStmt,
     buffer_var_map: Dict[tvm.tir.Var, tvm.tir.Buffer],
     func_alloc_vars: Set[tvm.tir.Var],
-) -> List[_StmtInfo]:
+) -> Tuple[List[_StmtInfo], Dict[tvm.tir.PrimExpr, Tuple[str, int]]]:
+    import tvm
+    from collections import defaultdict
+    grouped_barriers = defaultdict(list)  # Dict[ simplified_expr, (op_type, op_idx) ]
+    analyzer = tvm.arith.Analyzer()
+
     """Build a list of _StmtInfo for every statement in *seq*."""
     infos: List[_StmtInfo] = []
     for i, s in enumerate(seq.seq):
@@ -542,6 +590,36 @@ def _build_stmt_infos(
         is_true_tma = _is_true_tma_producer(s)
         is_copy = _is_copy_pattern_producer(reads, writes)
         is_prod = bool(is_intr or is_copy)
+
+        extractor = FullBarrierExtractor()
+        extractor.visit_stmt(s)
+        
+        is_wait_barrier = False
+        
+        # 假设已经通过 visitor 拿到了 self.barrier_operations
+        for barrier_expr, op_type, node in extractor.barrier_operations:
+            # 1. 表达式化简 (比如把 k % 2 + 1 化简为标准形式)
+            simplified_expr = analyzer.simplify(barrier_expr)
+
+            # 2. 寻找是否已有结构相同的 barrier 分组
+            found_key = None
+            for existing_key in grouped_barriers.keys():
+                if tvm.ir.structural_equal(simplified_expr, existing_key):
+                    found_key = existing_key
+                    break
+            if found_key is not None:
+                grouped_barriers[found_key].append((op_type, i))
+            else:
+                grouped_barriers[simplified_expr].append((op_type, i))
+            # 3. 记录信息-是否为 wait_barrier 操作
+            if op_type == 'WAIT':
+                is_wait_barrier = True
+
+        # 此时：
+        # grouped_barriers 里面就会有两个明确的 key：
+        # 一个代表 `k % 2 + 1` (控制 K 矩阵的 TMA)
+        # 一个代表 `k % 2 + 3` (控制 V 矩阵的 TMA)
+
         infos.append(
             _StmtInfo(
                 idx=i,
@@ -557,9 +635,10 @@ def _build_stmt_infos(
                 touches_external_local=_touches_external_non_shared_global(
                     s, reads, writes, func_alloc_vars
                 ),
+                is_wait_barrier=is_wait_barrier
             )
         )
-    return infos
+    return infos, grouped_barriers
 
 
 def _estimate_buffer_footprint_bytes(buf: tvm.tir.Buffer) -> int:
@@ -1263,7 +1342,7 @@ def AutoTLPipelineSMTAnnotations():
                             _ag_bvm[b.data] = b
                         _ag_bvm.update(func_alloc_map)
                         _ag_bvm.update(_ag_extra)
-                        _ag_infos = _build_stmt_infos(_ag_seq, _ag_bvm, set(func_alloc_map.keys()))
+                        _ag_infos, _ = _build_stmt_infos(_ag_seq, _ag_bvm, set(func_alloc_map.keys()))
                         _n_ag = len(_ag_infos)
                         _needs_split = False
                         for g in auto_group:
@@ -1310,7 +1389,7 @@ def AutoTLPipelineSMTAnnotations():
                         buffer_var_map.update(extra_map)
 
                         func_alloc_vars = set(func_alloc_map.keys())
-                        infos_amode = _build_stmt_infos(seq, buffer_var_map, func_alloc_vars)
+                        infos_amode, _  = _build_stmt_infos(seq, buffer_var_map, func_alloc_vars)
 
                         # A-mode only needs relative ordering for consumer group reordering;
                         # use Phase A only (precise=False) to avoid Z3.Optimize crashes on
@@ -1424,7 +1503,7 @@ def AutoTLPipelineSMTAnnotations():
             buffer_var_map.update(extra_map)
 
             func_alloc_vars = set(func_alloc_map.keys())
-            infos = _build_stmt_infos(seq, buffer_var_map, func_alloc_vars)
+            infos, _ = _build_stmt_infos(seq, buffer_var_map, func_alloc_vars)
 
             # --- Compute-bound quality gate ---
             # For loops dominated by compute (many WGMMAs, SFU ops), SMT pipeline

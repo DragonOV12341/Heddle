@@ -89,7 +89,7 @@ def test_gemm():
 
 def test_fa_fwd():
     print("\n=== FlashAttention FWD (B=4 H=32 T=4096 D=128) ===")
-    B, H, Tseq, D = 4, 32, 4096, 128
+    B, H, Tseq, D = 1, 32, 4096, 128
     bM, bN, stages, threads = 128, 64, 2, 128
     scale = (1.0 / D) ** 0.5 * 1.44269504
     shape = [B, Tseq, H, D]
@@ -129,24 +129,34 @@ def test_fa_fwd():
                         T.fill(acc_o, 0); T.fill(ls, 0); T.fill(sm, -T.infinity(T.float32))
                         for k in T.Pipelined(T.ceildiv(Tseq, bN), num_stages=stages):
                             T.copy(K_[bz, k*bN:(k+1)*bN, by, :], Ks)
+                            # smp : sm_prev 旧的 QK max值
                             T.copy(sm, smp); T.fill(sm, -T.infinity(T.float32)); T.clear(acc_s)
+                            # sm 存放 QK 的 新的max, acc_s = QK
                             T.gemm(Qs, Ks, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
                             T.reduce_max(acc_s, sm, dim=1, clear=False)
                             for i in T.Parallel(bM):
+                                # 取最大
                                 sm[i] = T.max(sm[i], smp[i])
                             for i in T.Parallel(bM):
+                                # 根据新旧max 计算缩放因子 ss[i]
                                 ss[i] = T.exp2(smp[i] * scale - sm[i] * scale)
                             for i, j in T.Parallel(bM, bN):
+                                # acc_s = exp((QK - 行max)*scale)
                                 acc_s[i, j] = T.exp2(acc_s[i, j] * scale - sm[i] * scale)
+                            # X方向reduce sum , 存入 ssum
                             T.reduce_sum(acc_s, ssum, dim=1)
                             for i, j in T.Parallel(bM, D):
                                 acc_o[i, j] *= ss[i]
                             for i in T.Parallel(bM):
+                                # ssum 累加，放进 ls（分母） （考虑每轮做缩放 ）
                                 ls[i] = ls[i] * ss[i] + ssum[i]
+                            # 类型cast f32->f16
                             T.copy(acc_s, acc_s_c)
                             T.copy(V[bz, k*bN:(k+1)*bN, by, :], Vs)
+                            # acc_o += acc_s_c @ Vs
                             T.gemm(acc_s_c, Vs, acc_o)
                         for i, j in T.Parallel(bM, D):
+                            # acc_o 除以分母
                             acc_o[i, j] /= ls[i]
                         T.copy(acc_o, O[bz, bx*bM:(bx+1)*bM, by, :])
                 return main

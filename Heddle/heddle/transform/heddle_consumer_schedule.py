@@ -37,6 +37,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
+from tvm.ir.expr import PrimExpr
+
 import tilelang
 from tilelang import tvm as tvm
 
@@ -48,6 +50,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 from heddle.transform.auto_tl_pipeline_smt import (
     _build_stmt_infos,
+    _call_op_names,
     _collect_func_alloc_buffers,
     _collect_rw_regions,
     _detect_op_latency_and_resource,
@@ -207,15 +210,18 @@ def _ensure_ws_annotation(annotations: Dict[str, object], key: str, value: objec
 # ---------------------------------------------------------------------------
 
 def _build_consumer_dep_graph(
-    infos: List[_StmtInfo],
+    infos: List[_StmtInfo], barrier_infos: Dict[PrimExpr, List[Tuple[str, int]]],
     *,
     relax_producer_boundary: bool = False,
-) -> Tuple[List[int], Dict[int, List[int]]]:
+) -> Tuple[List[int], Dict[int, List[int]], List[int], Dict[int, List[int]]]:
     """Build a dependency graph for consumer statements.
 
     Returns:
         consumer_indices: list of statement indices that are consumers
         deps: dict mapping consumer_idx -> list of consumer_idx it depends on
+        all_indices: list of all statement indices
+        deps_all: dict mapping stmt_idx -> list of stmt_idx it depends on,
+            including producer/consumer dependencies
 
     Dependencies include:
     1. Buffer RAW (read-after-write) through any buffer
@@ -225,36 +231,56 @@ def _build_consumer_dep_graph(
        must stay ordered (preserves PCWS barrier placement semantics)
     """
     consumer_indices = [info.idx for info in infos if not info.is_producer]
+    all_indices = [info.idx for info in infos]
 
     last_writer: Dict[str, int] = {}  # buffer_name -> stmt_idx
     deps: Dict[int, List[int]] = {idx: [] for idx in consumer_indices}
+    deps_all: Dict[int, List[int]] = {idx: [] for idx in all_indices}
 
     consumer_set = set(consumer_indices)
 
-    # Track which consumers directly follow each producer
-    # (these are implicit sync points that should be preserved)
-    last_producer_idx = -1
+    def _add_all_dep(dst: int, src: int) -> None:
+        if src != dst and src not in deps_all[dst]:
+            deps_all[dst].append(src)
+
+    def _add_consumer_dep(dst: int, src: int) -> None:
+        if dst in consumer_set and src in consumer_set:
+            if src != dst and src not in deps[dst]:
+                deps[dst].append(src)
+        _add_all_dep(dst, src)
+
+    def _is_barrier_wait(info: _StmtInfo) -> bool:
+        if not (info.is_sync_top or info.is_sync_nested):
+            return False
+        return bool(_call_op_names(info.stmt) & {
+            "tl.mbarrier_wait_parity",
+            "tir.ptx_wait_barrier",
+        })
 
     for info in infos:
         idx = info.idx
+        for rd in info.reads:
+            buf_name = rd.buffer.name
+            if buf_name in last_writer:
+                _add_consumer_dep(idx, last_writer[buf_name])
+
         if info.is_producer:
-            last_producer_idx = idx
             for wr in info.writes:
                 if _is_shared(wr.buffer):
                     last_writer[wr.buffer.name] = idx
             continue
 
-        # Consumer: add RAW dep from last writer if it's also a consumer
-        for rd in info.reads:
-            buf_name = rd.buffer.name
-            if buf_name in last_writer and last_writer[buf_name] in consumer_set:
-                src = last_writer[buf_name]
-                if src != idx and src not in deps[idx]:
-                    deps[idx].append(src)
-
-        # Record consumer writes
         for wr in info.writes:
             last_writer[wr.buffer.name] = idx
+
+    prev_producer = None
+    for info in infos:
+        if info.is_producer:
+            if any(_is_shared(wr.buffer) for wr in info.writes):
+                prev_producer = info.idx
+            continue
+        if prev_producer is not None and _is_barrier_wait(info):
+            _add_all_dep(info.idx, prev_producer)
 
     # Add sync-chain constraints: sync statements must stay in program order
     # relative to each other AND relative to compute that reads producer buffers.
@@ -263,9 +289,30 @@ def _build_consumer_dep_graph(
     for ci in consumer_indices:
         info = infos[ci]
         if info.is_sync_top or info.is_sync_nested:
-            if prev_sync is not None and prev_sync not in deps[ci]:
-                deps[ci].append(prev_sync)
+            if prev_sync is not None:
+                _add_consumer_dep(ci, prev_sync)
             prev_sync = ci
+
+    # A barrier wait does not necessarily read the shared buffer it protects, so
+    # region analysis cannot infer wait -> reader.  Add that semantic edge for
+    # readers of producer-written shared buffers after the nearest wait.
+    producer_written_bufs: Set[str] = set()
+    for info in infos:
+        if info.is_producer:
+            producer_written_bufs.update(
+                wr.buffer.name for wr in info.writes if _is_shared(wr.buffer)
+            )
+
+    prev_wait = None
+    for ci in consumer_indices:
+        info = infos[ci]
+        if _is_barrier_wait(info):
+            prev_wait = ci
+            continue
+        if prev_wait is None:
+            continue
+        if any(rd.buffer.name in producer_written_bufs for rd in info.reads):
+            _add_consumer_dep(ci, prev_wait)
 
     # Add producer-boundary constraints
     producer_groups: List[Tuple[int, Set[str]]] = []  # (producer_idx, written_buffer_names)
@@ -301,10 +348,215 @@ def _build_consumer_dep_graph(
                     break
 
             if last_prev_reader is not None and first_curr_reader is not None:
-                if last_prev_reader != first_curr_reader and last_prev_reader not in deps[first_curr_reader]:
-                    deps[first_curr_reader].append(last_prev_reader)
+                _add_consumer_dep(first_curr_reader, last_prev_reader)
 
-    return consumer_indices, deps
+    # barrier_infos groups barrier-touching statements by the actual barrier
+    # expression.  Preserve the per-barrier program order in deps_all so the
+    # full graph contains explicit expect/load/arrive/wait dependencies even
+    # when those calls do not expose normal buffer read/write regions.
+    for _, raw_ops in (barrier_infos or {}).items():
+        if isinstance(raw_ops, tuple) and len(raw_ops) >= 2 and isinstance(raw_ops[0], str):
+            raw_iter = [raw_ops]
+        else:
+            raw_iter = list(raw_ops)
+
+        barrier_ops: List[Tuple[int, str]] = []
+        for item in raw_iter:
+            if not isinstance(item, tuple) or len(item) < 2:
+                continue
+            op_type, stmt_idx = item[0], item[1]
+            try:
+                idx = int(stmt_idx)
+            except (TypeError, ValueError):
+                continue
+            if idx in deps_all:
+                barrier_ops.append((idx, str(op_type)))
+
+        barrier_ops.sort(key=lambda x: x[0])
+        for pos, (idx, _) in enumerate(barrier_ops):
+            for prev_idx, _ in barrier_ops[:pos]:
+                _add_all_dep(idx, prev_idx)
+
+    return consumer_indices, deps, all_indices, deps_all
+
+def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_StmtInfo], op_indices : List[int]) :
+    from ortools.sat.python import cp_model
+    print('enter _solve_naive_modulo_sched',flush=True)
+    
+    # _estimate_buffer_footprint_bytes(wr.buffer)
+    
+    def solve_for_I(I: int, H: Optional[int] = None):
+        ops : List[int] = list(op_indices)
+        if not ops:
+            return None
+
+        if H is None:
+            # Keep the toy/default lower bound, but give real kernels enough
+            # room for long dependency chains plus exclusive barrier slots.
+            H = max(8, len(ops) + 1)
+
+        duration = { key : 1 for key in ops }
+
+        # RRT[v][c][resource] = resource usage at local cycle c of op v.
+
+        rrt = {}
+        for idx in ops:
+            info = infos[idx]
+            if info.is_wait_barrier :
+                # mbarrier_wait 必须单独放一个slot，不能和其他op一起发射（wait会阻塞warp）
+                rrt[info.idx] = [{"TMA": 1, "TC": 1, "ALU": 1, "SFU": 1 }]
+            elif info.is_true_tma :
+                rrt[info.idx] = [{"TMA" : 1}]
+            else:
+                latency, rty = _detect_op_latency_and_resource(info.stmt)
+                rrt[info.idx] = [{rty.value : 1}]
+        
+        # 使用 issue-slot 模型。
+        capacity = {
+            "TMA": 1, "TC": 1, "ALU": 1, "SFU": 1 
+        }
+        
+        reg_limit = 65536  # 32-bit regs per SM
+        shm_limit = 227 * 1024  # per CTA max
+        
+        
+        # Edges: (producer, consumer, latency d, iteration distance δ)
+        # 依赖关系需要根据 tilelang IR 得到
+        edges = []
+        for v, deps in op_deps.items() :
+            if v not in ops:
+                continue
+            for u in deps :
+                if u not in ops:
+                    continue
+                edges.append(( u, v , 1, 0))
+            # 跨循环依赖关系: 如果读写同一buffer 则自己存在跨循环依赖
+            write_buf_names = set()
+            read_buf_names = set()
+            for buf in infos[v].writes :
+                write_buf_names.add(buf.buffer.name)
+            for buf in infos[v].reads :
+                read_buf_names.add(buf.buffer.name)
+            intersect = write_buf_names & read_buf_names
+            if intersect :
+                edges.append((v, v , 1, 1))
+            if infos[v].is_sync_top and infos[v].is_sync_nested :
+                edges.append((v,v,1,1))
+
+        model = cp_model.CpModel()
+
+        # x[v,t] = whether op v is scheduled at absolute modulo-schedule time t.
+        x = {}
+        for v in ops:
+            for t in range(H - duration[v] + 1):
+                x[v, t] = model.NewBoolVar(f"x_{v}_{t}")
+
+        # Each op is scheduled exactly once.
+        for v in ops:
+            model.AddExactlyOne(x[v, t] for t in range(H - duration[v] + 1))
+
+        # M[v] = scheduled time of op v.
+        M = {}
+        for v in ops:
+            M[str(v)] = model.NewIntVar(0, H, f"M_{v}")
+            model.Add(
+                M[str(v)] == sum(t * x[v, t] for t in range(H - duration[v] + 1))
+            )
+
+        # Symmetry breaking: shift the whole schedule so the first consumer starts at 0.
+        # Without this, equivalent shifted schedules may also be found.
+        model.Add(M[str(ops[0])] == 0)
+        # Dependency constraints:
+        # M[v] + i*I >= M[u] + (i-δ)*I + d
+        # => M[v] - M[u] + δ*I >= d
+        for u, v, d, delta in edges:
+            model.Add(M[str(v)] - M[str(u)] + delta * I >= d)
+
+        # Modular resource capacity constraints.
+        for r in range(I):
+            for f, cap in capacity.items():
+                terms = []
+                for v in ops:
+                    for t in range(H - duration[v] + 1):
+                        for c in range(duration[v]):
+                            usage = rrt[v][c].get(f, 0)
+                            if usage and (t + c) % I == r:
+                                terms.append(usage * x[v, t])
+
+                if terms:
+                    model.Add(sum(terms) <= cap)
+
+        # Schedule length L = max(M[v] + duration[v]).
+        end = {}
+        for v in ops:
+            end[v] = model.NewIntVar(0, H + duration[v], f"end_{v}")
+            model.Add(end[v] == M[str(v)] + duration[v])
+
+        L = model.NewIntVar(0, H + max(duration.values()), "L")
+        model.AddMaxEquality(L, [end[v] for v in ops])
+
+        BIG = 100
+        model.Minimize(BIG * L - sum(M[str(v)] for v in ops))
+
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = 5
+        status = solver.Solve(model)
+
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            return None
+
+        result = {
+            "I": I,
+            "L": solver.Value(L),
+            "M": {v: solver.Value(M[str(v)]) for v in ops},
+        }
+
+        # Build modular RRT table for printing.
+        table = []
+        for r in range(I):
+            row = {"slot": f"{r} mod {I}"}
+            for f in capacity:
+                row[f] = []
+            for v in ops:
+                t = result["M"][v]
+                for c in range(duration[v]):
+                    slot = (t + c) % I
+                    if slot == r:
+                        for f in capacity:
+                            if rrt[v][c].get(f, 0):
+                                row[f].append(v)
+            table.append(row)
+
+        result["modular_rrt"] = table
+        return result
+
+    def solve_min_I(max_I: int = 6):
+        # 从小到大寻找。如果可行，就直接输出I
+        # 问题 ： 多个 I L 都可行怎么办？如何权衡？
+        for I in range(1, max_I + 1):
+            ans = solve_for_I(I)
+            if ans is not None:
+                return ans
+        return None
+
+    ans = None
+    try:
+        ans = solve_min_I(len(infos) + 10)
+    except Exception as e :
+        print(e, flush=True)
+        return None
+    print('solve done')
+    if ans is not None :
+        print('ans not None')
+        print("I =", ans["I"], flush=True)
+        print("L =", ans["L"], flush=True)
+        print("M =", ans["M"], flush=True)
+        print("Modular RRT:")
+        for row in ans["modular_rrt"]:
+            print(row)
+    else:
+        print('ans none')
+    return ans
 
 
 def _topo_sort_with_priority(
@@ -1302,6 +1554,8 @@ def _transform_pipeline_loop(
             return None
 
         # Unwrap to SeqStmt
+        print('----- stmt :\n', stmt.script())
+
         seq, local_buf_map = _unwrap_to_seqstmt(stmt.body)
         if seq is None or len(seq.seq) < 2:
             return None
@@ -1311,7 +1565,7 @@ def _transform_pipeline_loop(
         merged_buf_map.update(local_buf_map)
 
         # Build statement infos
-        infos_list = _build_stmt_infos(seq, merged_buf_map, func_alloc_vars)
+        infos_list, barrier_infos = _build_stmt_infos(seq, merged_buf_map, func_alloc_vars)
 
         # Check we have both producers and consumers
         has_producer = any(info.is_producer for info in infos_list)
@@ -1470,10 +1724,23 @@ def _transform_pipeline_loop(
                           file=sys.stderr, flush=True)
 
         # Build consumer dependency graph (Opt 3: relaxed producer boundaries)
-        consumer_indices, deps = _build_consumer_dep_graph(
-            infos_list,
+        consumer_indices, deps, all_indices ,deps_all = _build_consumer_dep_graph(
+            infos_list, barrier_infos,
             relax_producer_boundary=relax_producer_boundary,
         )
+        print(f'----{consumer_indices=} ')
+        print(f'----{deps=} ')
+        print(f'----{deps_all=} ')
+        print(f'----{barrier_infos=} ')
+        print('---- infos_list : ')
+        for info in infos_list :
+            msg = f"[{info.idx}] wr:"
+            for wr in info.writes :
+                msg += f"{wr.buffer.name}, "
+            msg += " / rd:"
+            for rd in info.reads :
+                msg += f"{rd.buffer.name}, "
+            print(msg)
 
         # ── Skip reordering for simple kernels ──
         # When there is at most 1 WGMMA consumer (e.g. GEMM, Dequant GEMM),
@@ -1512,6 +1779,9 @@ def _transform_pipeline_loop(
                     stmt.body, stmt.thread_binding, phase_a_annotations,
                 )
             return None
+
+        # ---- TWill : step 1 求解基础模调度M
+        _solve_naive_modulo_sched(deps_all, infos_list, all_indices)
 
         # ── Phase B: SMT-based joint ordering ──
         # Policy: run Phase B if (a) explicitly enabled, or (b) ≥3 WGMMA
@@ -1836,6 +2106,7 @@ def _transform_pipeline_loop(
             phase_a_annotations,
         )
 
+    print("[d] ---- func before SMT -----", func.script())
     new_body = tvm.tir.stmt_functor.ir_transform(
         func.body, None, _visit_for, ["tir.For"]
     )

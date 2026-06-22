@@ -168,6 +168,8 @@ class UnifiedScheduler:
     def solve(self) -> Optional[UnifiedResult]:
         from ortools.sat.python import cp_model
 
+        # CP-SAT 的建模套路是先声明所有候选变量，再用约束把“不合法”
+        # 的组合排除掉，最后给一个优化目标让 solver 在可行解中选最优。
         model = cp_model.CpModel()
         H = self.horizon
         W = max(self.num_warps, 1)
@@ -177,7 +179,10 @@ class UnifiedScheduler:
         # ============================================================
         part_vars = {}
         for p in self.partitions:
+            # 每个 partition 一个 BoolVar；值为 1 表示最终选择该切分策略。
             part_vars[p.name] = model.new_bool_var(f"part_{p.name}")
+        # 所有候选 partition 中必须且只能选一个。当前实际调用点常常只传
+        # 一个 partition，但这里仍保留了联合选择多个策略的通用建模。
         model.add_exactly_one(part_vars.values())
 
         # ============================================================
@@ -194,18 +199,24 @@ class UnifiedScheduler:
         for p in self.partitions:
             pv = part_vars[p.name]
             for k in p.kernels:
+                # kernel_makespan 是该 kernel 内所有 op 结束时间的上界。
                 km_var = model.new_int_var(0, H, f"km_{p.name}_{k.name}")
                 kernel_makespan[(p.name, k.name)] = km_var
 
                 for op in k.ops:
                     key = (p.name, k.name, op.name)
 
+                    # pres 表示这个 op 是否存在于当前解中。因为每个 op
+                    # 归属于某个 partition，所以它跟 partition 选择变量绑定。
                     pres = model.new_bool_var(f"pres_{p.name}_{k.name}_{op.name}")
                     op_present[key] = pres
 
                     model.add(pres == 1).only_enforce_if(pv)
                     model.add(pres == 0).only_enforce_if(pv.negated())
 
+                    # s/e 是调度时间；optional interval 把 “存在性 + 固定时长
+                    # + 起止时间” 包成 CP-SAT 的调度对象，后面 cumulative /
+                    # no_overlap 这类全局约束会直接消费它。
                     s = model.new_int_var(0, H, f"s_{p.name}_{k.name}_{op.name}")
                     e = model.new_int_var(0, H + op.latency, f"e_{p.name}_{k.name}_{op.name}")
                     iv = model.new_optional_interval_var(
@@ -217,11 +228,14 @@ class UnifiedScheduler:
                     op_interval[key] = iv
 
                     # Warp assignment
+                    # 每个 op 绑定一个 warp id。fixed_warp >= 0 时不让 solver
+                    # 自由选择，而是强制放到调用方指定的 warp。
                     w_var = model.new_int_var(0, W - 1, f"w_{p.name}_{k.name}_{op.name}")
                     op_warp[key] = w_var
                     if op.fixed_warp >= 0:
                         model.add(w_var == op.fixed_warp)
 
+                    # 只要 op 存在，kernel makespan 至少要覆盖它的结束时间。
                     model.add(km_var >= e).only_enforce_if(pres)
 
         # ============================================================
@@ -246,6 +260,10 @@ class UnifiedScheduler:
                         base_lat = dep_op.latency
 
                         # 3a. Dependency timing with optional spill cost
+                        # 普通依赖：consumer 不能早于 producer latency 之后开始。
+                        # 如果有多个 warp 且 producer 标了 spill_cost，则把
+                        # “同 warp / 跨 warp” reify 成 same_w，跨 warp 时额外加
+                        # spill_cost，近似表达数据搬运或同步代价。
                         if W > 1 and dep_op.spill_cost > 0:
                             same_w = model.new_bool_var(
                                 f"sw_{p.name}_{k.name}_{op.name}_{dep_name}")
@@ -269,6 +287,8 @@ class UnifiedScheduler:
                         # 3b. Blocking sync constraints
                         if is_blocking and W > 1:
                             # Same-warp enforcement: producer and consumer must share a warp
+                            # blocking_sync 表示这条边不能靠跨 warp spill 解决；
+                            # producer 和 consumer 必须落在同一个 warp 上。
                             model.add(
                                 op_warp[key] == op_warp[dep_key]
                             ).only_enforce_if(pres)
@@ -276,6 +296,8 @@ class UnifiedScheduler:
                             # Exclusive execution: create a barrier interval covering
                             # [consumer_start - producer_latency, consumer_start).
                             # Other ops on the same warp must not overlap this window.
+                            # 这里把 “consumer 开始前必须保留的一段同步窗口”
+                            # 建成一个 interval，稍后放进该 warp 的 no_overlap。
                             if base_lat > 0:
                                 b_start = model.new_int_var(
                                     0, H,
@@ -309,6 +331,8 @@ class UnifiedScheduler:
                         for op in k.ops:
                             okey = (p.name, k.name, op.name)
                             # Skip ops that are endpoints of a barrier on this warp
+                            # on_w/both 用来重新包装 interval：只有 op 存在且
+                            # 被分配到当前 warp 时，它才参与这个 warp 的互斥检查。
                             on_w = model.new_bool_var(
                                 f"noo_{p.name}_{k.name}_{op.name}_w{w}")
                             model.add(op_warp[okey] == w).only_enforce_if(on_w)
@@ -328,6 +352,8 @@ class UnifiedScheduler:
 
                         for b_iv, consumer_key in barriers:
                             # Barrier interval is active only when consumer is on this warp
+                            # barrier interval 原本只由 consumer 是否存在控制；
+                            # 这里再加一层 “consumer 是否在当前 warp” 的条件。
                             on_w_b = model.new_bool_var(
                                 f"bw_{p.name}_{k.name}_{consumer_key[2]}_w{w}")
                             model.add(op_warp[consumer_key] == w).only_enforce_if(on_w_b)
@@ -350,6 +376,8 @@ class UnifiedScheduler:
                             warp_no_overlap.append(cond_biv)
 
                         if len(warp_no_overlap) > 1:
+                            # 同一个 warp 上，真实 op interval 和 blocking sync
+                            # 的保护窗口不能互相重叠。
                             model.add_no_overlap(warp_no_overlap)
 
         # ============================================================
@@ -364,6 +392,8 @@ class UnifiedScheduler:
                     if not fu_ops:
                         continue
                     if W == 1:
+                        # 单 warp 情况：同类 FU 的所有 op 共享一个 cumulative
+                        # 容量约束，cap 表示同一时间最多可并发的同类 op 数。
                         intervals_for_fu = []
                         demands_for_fu = []
                         for op, key in fu_ops:
@@ -373,6 +403,8 @@ class UnifiedScheduler:
                             model.add_cumulative(
                                 intervals_for_fu, demands_for_fu, cap)
                     else:
+                        # 多 warp 情况：先按 warp 条件化地重包 interval，再对
+                        # 每个 warp 单独做 FU 容量约束。
                         for w in range(W):
                             warp_intervals = []
                             warp_demands = []
@@ -403,6 +435,8 @@ class UnifiedScheduler:
         # 5. Register liveness tracking (per kernel, per warp)
         # ============================================================
         CHECKPOINT_STEP = 1
+        # 用离散 checkpoint 近似寄存器活跃区间。这里步长为 1，所以会检查
+        # horizon 内每个整数时刻的 RMEM live bytes。
         checkpoints = list(range(0, H + 1, CHECKPOINT_STEP))
 
         for p in self.partitions:
@@ -415,6 +449,8 @@ class UnifiedScheduler:
                         dep_name, _, _ = _unpack_dep(dep_tuple)
                         if dep_name in op_map:
                             for out in op_map[dep_name].outputs:
+                                # 反向索引：某个 output 会被哪些 consumer 使用。
+                                # 后面用它判断 output 是否已经被全部消费。
                                 consumer_map.setdefault(out.name, []).append(op.name)
 
                 rmem_outputs: List[Tuple[OpSpec, OutputSpec]] = []
@@ -434,11 +470,13 @@ class UnifiedScheduler:
                             consumers = consumer_map.get(out.name, [])
 
                             # on_warp: producer is on this warp
+                            # 只把该 warp 生产的 RMEM output 计入该 warp 的压力。
                             on_warp = model.new_bool_var(
                                 f"ow_{p.name}_{k.name}_{out.name}_w{w}_t{tau}")
                             model.add(op_warp[prod_key] == w).only_enforce_if(on_warp)
                             model.add(op_warp[prod_key] != w).only_enforce_if(on_warp.negated())
 
+                            # output 在 tau 时刻前已经产生，才可能进入 live 集合。
                             is_produced = model.new_bool_var(
                                 f"prod_{p.name}_{k.name}_{out.name}_w{w}_t{tau}")
                             model.add(
@@ -452,6 +490,9 @@ class UnifiedScheduler:
                                 consumer_started = []
                                 for c_name in consumers:
                                     c_key = (p.name, k.name, c_name)
+                                    # 这里以 consumer 的 start 作为 “已经读取/消费”
+                                    # 的近似边界；所有 consumer 都开始后认为该
+                                    # output 不再需要保持 live。
                                     cs = model.new_bool_var(
                                         f"cs_{p.name}_{k.name}_{out.name}_{c_name}_w{w}_t{tau}")
                                     model.add(
@@ -471,6 +512,8 @@ class UnifiedScheduler:
                                     [cs.negated() for cs in consumer_started] + [all_consumed]
                                 )
 
+                                # live = 已产生 且 尚未被全部 consumer 消费 且
+                                # producer 在当前 warp 且 partition 被选中。
                                 is_live = model.new_bool_var(
                                     f"live_{p.name}_{k.name}_{out.name}_w{w}_t{tau}")
                                 model.add_bool_and(
@@ -482,6 +525,8 @@ class UnifiedScheduler:
 
                                 live_terms.append((is_live, out.footprint_bytes))
                             else:
+                                # 没有显式 consumer 的 output 一旦产生就一直计入
+                                # live pressure，直到 kernel 结束。
                                 is_live = model.new_bool_var(
                                     f"live_{p.name}_{k.name}_{out.name}_w{w}_t{tau}")
                                 model.add_bool_and(
@@ -493,6 +538,8 @@ class UnifiedScheduler:
                                 live_terms.append((is_live, out.footprint_bytes))
 
                         if live_terms:
+                            # 这是硬约束：每个 warp 在每个 checkpoint 的 RMEM
+                            # live bytes 不能超过 reg_limit。
                             model.add(
                                 sum(bv * fb for bv, fb in live_terms) <= self.reg_limit
                             )
@@ -500,6 +547,9 @@ class UnifiedScheduler:
         # ============================================================
         # 6. Objective: minimize total execution time (sum of kernels)
         # ============================================================
+        # total 只绑定到被选中的 partition：它等于该 partition 内所有 kernel
+        # makespan 的和。注意这里的目标只最小化时间，寄存器压力目前是硬约束，
+        # 不是 tie-breaker。
         total = model.new_int_var(0, H * 10, "total_makespan")
         for p in self.partitions:
             pv = part_vars[p.name]
@@ -528,6 +578,8 @@ class UnifiedScheduler:
         }.get(status, f"STATUS_{status}")
 
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            # 不可行/超时无可行解时也返回 UnifiedResult，方便调用方看 status
+            # 和 solve_time，而不是只拿到 None。
             return UnifiedResult(
                 partition="NONE", kernel_schedules={}, kernel_reg_peaks={},
                 total_makespan=-1, solve_time_ms=solve_ms, status=status_name,
@@ -536,6 +588,7 @@ class UnifiedScheduler:
         # ============================================================
         # 8. Extract solution
         # ============================================================
+        # 先根据 partition BoolVar 找到被选中的 PartitionSpec。
         chosen_partition = None
         for p in self.partitions:
             if solver.value(part_vars[p.name]):
@@ -550,12 +603,16 @@ class UnifiedScheduler:
             warps = {}
             for op in k.ops:
                 key = (chosen_partition.name, k.name, op.name)
+                # 调用方主要消费两类结果：op 的开始时间用于排序，
+                # op_warp 用于后续 warp-specialized lowering 的 hint。
                 sched[op.name] = solver.value(op_start[key])
                 warps[op.name] = solver.value(op_warp[key])
             schedules[k.name] = sched
             warp_assigns[k.name] = warps
 
             # Compute register peak per warp from solution
+            # 下面不是再加约束，而是用已求出的 schedule/warp assignment
+            # 重新扫描一遍，计算实际 peak，写进 UnifiedResult 供外部诊断。
             op_map = {op.name: op for op in k.ops}
             consumer_map: Dict[str, List[str]] = {}
             for op in k.ops:
