@@ -379,7 +379,8 @@ def _build_consumer_dep_graph(
 
     return consumer_indices, deps, all_indices, deps_all
 
-def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_StmtInfo], op_indices : List[int]) :
+
+def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_StmtInfo], op_indices : List[int]) -> List[Dict]:
     from ortools.sat.python import cp_model
     print('enter _solve_naive_modulo_sched',flush=True)
     
@@ -530,33 +531,35 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
         result["modular_rrt"] = table
         return result
 
-    def solve_min_I(max_I: int = 6):
+    def solve_min_I(max_I: int = 6) -> List:
         # 从小到大寻找。如果可行，就直接输出I
-        # 问题 ： 多个 I L 都可行怎么办？如何权衡？
+        # 多个IL时，且 I<=L 时，都返回。I==L 的情况无跨循环交叠，但作为fallback备选（性能不太差）
+        rets = []
         for I in range(1, max_I + 1):
             ans = solve_for_I(I)
-            if ans is not None:
-                return ans
-        return None
+            if ans is not None and ans["I"] <= ans["L"]:
+                rets.append(ans)
+        return rets
 
-    ans = None
+    results = None
     try:
-        ans = solve_min_I(len(infos) + 10)
+        results = solve_min_I(len(infos) + 1)
     except Exception as e :
         print(e, flush=True)
         return None
     print('solve done')
-    if ans is not None :
+    if results is not None :
         print('ans not None')
-        print("I =", ans["I"], flush=True)
-        print("L =", ans["L"], flush=True)
-        print("M =", ans["M"], flush=True)
-        print("Modular RRT:")
-        for row in ans["modular_rrt"]:
-            print(row)
+        for ans in results :
+            print("I =", ans["I"], flush=True)
+            print("L =", ans["L"], flush=True)
+            print("M =", ans["M"], flush=True)
+            print("Modular RRT:")
+            for row in ans["modular_rrt"]:
+                print(row)
     else:
         print('ans none')
-    return ans
+    return results
 
 
 def _topo_sort_with_priority(
@@ -856,6 +859,279 @@ def _compute_buffer_span_priorities(
 
     return adjusted
 
+def _solve_smt_joint_optimize(
+    op_deps : Dict[int, List[int]], infos : List[_StmtInfo], all_indices : List[int], mod_sched_plan : Dict
+):
+    '''
+    参照 _phase_b_consumer_ordering 实现 SMT 求解 optimized 模调度方案.
+    [输入] 基础模调度方案 mod_sched_plan, 来自 _solve_naive_modulo_sched . mod_sched_plan含 ans["M"] ans["I"] ans["L"];  
+        ans["M"] 表达单次循环内， opId:slot 位置分布
+        ans['I'] 为最小启动周期； ans['L'] 为循环体长度  还有一个表格 用于展示调度结果
+        op依赖关系 op_deps ; 
+        all_indices 所有op的id ; 
+        op信息 infos
+    [输出] optimized_sched_plan 
+    [过程] 参考  _phase_b_consumer_ordering ，用SMT。添加 warp_assign,  FU capacity, memory capacity 约束。
+    '''
+    from heddle.scheduler.smt import (
+        HeddleScheduler,
+        LifetimeSemantic,
+        OpNode,
+        OutputValue,
+        ResourceType,
+        StorageKind,
+    )
+
+    if not mod_sched_plan:
+        return None
+
+    ops = list(all_indices)
+    if not ops:
+        return None
+
+    base_M = dict(mod_sched_plan.get("M", {}))
+    try:
+        base_I = int(mod_sched_plan.get("I", 0))
+    except (TypeError, ValueError):
+        base_I = 0
+    try:
+        base_L = int(mod_sched_plan.get("L", 0))
+    except (TypeError, ValueError):
+        base_L = 0
+    if base_I <= 0:
+        return dict(mod_sched_plan)
+
+    _rtype_map = {
+        "TMA": ResourceType.TMA,
+        "TC": ResourceType.TensorCore,
+        "ALU": ResourceType.ALU,
+        "SFU": ResourceType.SFU,
+    }
+    
+    def _get_warpgroup_count_from_info() :
+        warps = {
+            "tma" : 0,
+            "wgmma_consumer" : 0,
+            "alu_consumer" : 4  # 暂且认为 ALU consumer 使用一个warpgroup
+        }
+        for info in infos :
+            if info.is_wgmma :
+                warps["wgmma_consumer"] = 4
+            if info.is_true_tma :
+                warps["tma"] = 4  # tma copy global->shm 暂且认为是 wg级别的？
+        return  warps['tma'] +warps['wgmma_consumer'] +warps['alu_consumer']
+    
+    def _resource_for_info(info: _StmtInfo) -> ResourceType:
+        if getattr(info, "is_true_tma", False):
+            return ResourceType.TMA
+        _, rty = _detect_op_latency_and_resource(info.stmt)
+        return _rtype_map.get(getattr(rty, "value", str(rty)), ResourceType.ALU)
+
+    def _reservation_for_info(info: _StmtInfo, rty: ResourceType) -> List[Dict[ResourceType, int]]:
+        # wait/try_wait barrier 会阻塞当前发射 warp；这里把它建模成
+        # 占满所有 FU 的独占 issue slot，和 _solve_naive_modulo_sched 保持一致。
+        if getattr(info, "is_wait_barrier", False):
+            return [{
+                ResourceType.TMA: 1,
+                ResourceType.TensorCore: 1,
+                ResourceType.ALU: 1,
+                ResourceType.SFU: 1,
+            }]
+        return [{rty: 1}]
+
+    nodes: List[OpNode] = []
+    node_by_idx: Dict[int, OpNode] = {}
+    for idx in ops:
+        info = infos[idx]
+        rty = _resource_for_info(info)
+        latency = 1
+        outputs: List[OutputValue] = []
+        for wr in info.writes:
+            storage = StorageKind.SMEM if _is_shared(wr.buffer) else StorageKind.RMEM
+            footprint = _estimate_buffer_footprint_bytes(wr.buffer)
+            outputs.append(OutputValue(
+                name=f"s{idx}_w_{wr.buffer.name}",
+                storage=storage,
+                footprint_bytes=footprint,
+                lifetime=LifetimeSemantic.DEAD_ON_ENTRY,
+            ))
+        
+        wc = 4 if info.is_wgmma else 1
+        
+        node = OpNode(
+            name=f"s{idx}",
+            resource_type=rty,
+            latency=latency,
+            reservation=_reservation_for_info(info, rty),
+            outputs=outputs,
+            warp_count=wc,
+            warp_align=4 if info.is_wgmma else 1,
+        )
+        nodes.append(node)
+        node_by_idx[idx] = node
+
+    # 同一轮迭代内的依赖边，来自 IR 分析得到的 op_deps 图。
+    for v, deps in op_deps.items():
+        if v not in node_by_idx:
+            continue
+        for u in deps:
+            if u not in node_by_idx:
+                continue
+            warpgroup_disjoint = bool(
+                getattr(infos[u], "is_true_tma", False)
+                and getattr(infos[v], "is_wgmma", False)
+            )
+            if infos[u].is_sync_top or infos[u].is_sync_nested :
+                node_by_idx[v].add_dependency(
+                    node_by_idx[u],
+                    distance=0,
+                    blocking_sync=True,
+                    warpgroup_disjoint=warpgroup_disjoint,
+                )
+            else:
+                node_by_idx[v].add_dependency(
+                    node_by_idx[u],
+                    distance=0,
+                    warpgroup_disjoint=warpgroup_disjoint,
+                )
+
+    # 跨迭代 hazard 与 _solve_naive_modulo_sched 保持一致：
+    # 如果一个 stmt 同时读写同一个 buffer，或者它是 sync-like 阻塞语句，
+    # 那么相邻两轮迭代中的该 stmt 必须至少间隔一个依赖延迟。
+    for idx in ops:
+        info = infos[idx]
+        write_bufs = {wr.buffer.name for wr in info.writes}
+        read_bufs = {rd.buffer.name for rd in info.reads}
+        if write_bufs & read_bufs:
+            node_by_idx[idx].add_dependency(node_by_idx[idx], distance=1)
+        if info.is_sync_top and info.is_sync_nested:
+            node_by_idx[idx].add_dependency(node_by_idx[idx], distance=1)
+
+    capacity = {
+        ResourceType.TMA: 1,
+        ResourceType.TensorCore: 1,
+        ResourceType.ALU: 1,
+        ResourceType.SFU: 1,
+    }
+    nwarps = _get_warpgroup_count_from_info()
+    mod_sched_plan['num_warps'] = nwarps
+    print(f'---- num_warps = {nwarps}')
+    num_warps = max(1, int(mod_sched_plan.get("num_warps", 1)))
+    reg_limit = int(mod_sched_plan.get("reg_limit", 65536))
+    smem_limit = int(mod_sched_plan.get("smem_limit", 227 * 1024))
+
+    # SMT 优化器使用 naive plan 的基础窗口；如果 naive 的绝对调度时间
+    # 比记录的 L 更宽，则补一点 slack，避免可行解被窗口截断。
+    base_max_time = max((int(base_M.get(v, 0)) for v in ops), default=0)
+    window = max(base_L, base_max_time + 1, base_I)
+
+    def _run_joint_solver(*, hard_warp_disjoint: bool, solve_window: int, optimize: bool):
+        solver = HeddleScheduler(
+            nodes,
+            fu_caps=capacity,
+            reg_limit=reg_limit,
+            smem_limit=smem_limit,
+            num_warps=num_warps,
+            timeout_ms=int(mod_sched_plan.get("timeout_ms", 15000)),
+            hard_warp_disjoint=hard_warp_disjoint,
+        )
+        return solver.schedule_joint(
+            min_ii=base_I,
+            max_ii=base_I,
+            window=solve_window,
+            optimize=optimize,
+        )
+
+    candidate_windows = []
+    for candidate in (window, window + base_I, window + 2 * base_I):
+        if candidate not in candidate_windows:
+            candidate_windows.append(candidate)
+
+    sol = None
+    for solve_window in candidate_windows:
+        sol = _run_joint_solver(
+            hard_warp_disjoint=True,
+            solve_window=solve_window,
+            optimize=True,
+        )
+        if sol is not None:
+            break
+
+    if sol is None:
+        print("---- hard warpgroup_disjoint optimize failed; retry feasibility", flush=True)
+        for solve_window in candidate_windows:
+            sol = _run_joint_solver(
+                hard_warp_disjoint=True,
+                solve_window=solve_window,
+                optimize=False,
+            )
+            if sol is not None:
+                break
+
+    if sol is None:
+        print("---- hard warpgroup_disjoint failed; retry soft warp_disjoint", flush=True)
+        for solve_window in candidate_windows:
+            sol = _run_joint_solver(
+                hard_warp_disjoint=False,
+                solve_window=solve_window,
+                optimize=False,
+            )
+            if sol is not None:
+                break
+    if sol is None:
+        fallback = dict(mod_sched_plan)
+        fallback.setdefault("status", "SMT_UNSAT")
+        return fallback
+
+    schedule = sol.get("schedule", {})
+    warp_assign = sol.get("warp_assign", {})
+    print(f"----{warp_assign=}")
+    optimized_M = {
+        idx: int(schedule[f"s{idx}"])
+        for idx in ops
+        if f"s{idx}" in schedule
+    }
+    for idx in ops:
+        if idx not in optimized_M and idx in base_M:
+            optimized_M[idx] = int(base_M[idx])
+
+    optimized_L = max((t + 1 for t in optimized_M.values()), default=0)
+
+    table = []
+    for r in range(base_I):
+        row = {"slot": f"{r} mod {base_I}"}
+        for f in ("TMA", "TC", "ALU", "SFU"):
+            row[f] = []
+        for idx in ops:
+            t = optimized_M.get(idx)
+            if t is None or t % base_I != r:
+                continue
+            info = infos[idx]
+            if getattr(info, "is_wait_barrier", False):
+                for f in ("TMA", "TC", "ALU", "SFU"):
+                    row[f].append(idx)
+                continue
+            rty = _resource_for_info(info).value
+            row[rty].append(idx)
+        table.append(row)
+
+    optimized = dict(mod_sched_plan)
+    optimized.update({
+        "I": base_I,
+        "L": optimized_L,
+        "M": optimized_M,
+        "status": "SMT_OPTIMIZED",
+        "window": int(sol.get("window", window)),
+        "warp_assign": {
+            int(name[1:]): int(w)
+            for name, w in warp_assign.items()
+            if isinstance(name, str) and name.startswith("s") and name[1:].isdigit()
+        },
+        "reg_peak": sol.get("reg_peak", {}),
+        "modular_rrt": table,
+        "ordering": [idx for idx, _ in sorted(optimized_M.items(), key=lambda item: (item[1], item[0]))],
+    })
+    return optimized
 
 # ---------------------------------------------------------------------------
 # Phase B: SMT-based joint consumer ordering with register awareness
@@ -1781,7 +2057,14 @@ def _transform_pipeline_loop(
             return None
 
         # ---- TWill : step 1 求解基础模调度M
-        _solve_naive_modulo_sched(deps_all, infos_list, all_indices)
+        mod_sched_plans = _solve_naive_modulo_sched(deps_all, infos_list, all_indices)
+        # ---- TWill : step 2 求解联合优化问题： 基础模调度M + warp_spec
+        for plan in mod_sched_plans :
+            print('----start  _solve_smt_joint_optimize')
+            optimized =  _solve_smt_joint_optimize(deps_all, infos_list, all_indices, plan)
+            if optimized and optimized['modular_rrt'] is not None :
+                for row in optimized['modular_rrt'] :
+                    print(row)
 
         # ── Phase B: SMT-based joint ordering ──
         # Policy: run Phase B if (a) explicitly enabled, or (b) ≥3 WGMMA
