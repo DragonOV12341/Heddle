@@ -383,18 +383,30 @@ def _build_consumer_dep_graph(
 def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_StmtInfo], op_indices : List[int]) -> List[Dict]:
     from ortools.sat.python import cp_model
     print('enter _solve_naive_modulo_sched',flush=True)
-    
-    # _estimate_buffer_footprint_bytes(wr.buffer)
-    
+        
+    ops : List[int] = list(op_indices)
+    if not ops:
+        return None
+
+    latency_of: Dict[int, int] = {}
+    resource_of: Dict[int, str] = {}
+    estimated_total_cycles = 0
+    for idx in ops:
+        info = infos[idx]
+        latency, rty = _detect_op_latency_and_resource(info.stmt)
+        estimated_total_cycles += latency
+        
+        latency_of[idx] = max(int(latency), 1)
+        resource_of[idx] = getattr(rty, "value", str(rty))
+        
     def solve_for_I(I: int, H: Optional[int] = None):
-        ops : List[int] = list(op_indices)
-        if not ops:
-            return None
 
         if H is None:
-            # Keep the toy/default lower bound, but give real kernels enough
-            # room for long dependency chains plus exclusive barrier slots.
-            H = max(8, len(ops) + 1)
+            # duration is issue occupancy, while latency_of is dependency
+            # delay.  The absolute search window must be large enough for
+            # long dependency chains even though each op occupies one issue
+            # slot in the resource table.
+            H = max(8, len(ops) + 1, sum(latency_of.values()) + 1)
 
         duration = { key : 1 for key in ops }
 
@@ -409,8 +421,7 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
             elif info.is_true_tma :
                 rrt[info.idx] = [{"TMA" : 1}]
             else:
-                latency, rty = _detect_op_latency_and_resource(info.stmt)
-                rrt[info.idx] = [{rty.value : 1}]
+                rrt[info.idx] = [{resource_of[idx] : 1}]
         
         # 使用 issue-slot 模型。
         capacity = {
@@ -430,7 +441,7 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
             for u in deps :
                 if u not in ops:
                     continue
-                edges.append(( u, v , 1, 0))
+                edges.append((u, v, latency_of[u], 0))
             # 跨循环依赖关系: 如果读写同一buffer 则自己存在跨循环依赖
             write_buf_names = set()
             read_buf_names = set()
@@ -440,9 +451,9 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
                 read_buf_names.add(buf.buffer.name)
             intersect = write_buf_names & read_buf_names
             if intersect :
-                edges.append((v, v , 1, 1))
+                edges.append((v, v, latency_of[v], 1))
             if infos[v].is_sync_top and infos[v].is_sync_nested :
-                edges.append((v,v,1,1))
+                edges.append((v, v, latency_of[v], 1))
 
         model = cp_model.CpModel()
 
@@ -459,19 +470,19 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
         # M[v] = scheduled time of op v.
         M = {}
         for v in ops:
-            M[str(v)] = model.NewIntVar(0, H, f"M_{v}")
+            M[v] = model.NewIntVar(0, H, f"M_{v}")
             model.Add(
-                M[str(v)] == sum(t * x[v, t] for t in range(H - duration[v] + 1))
+                M[v] == sum(t * x[v, t] for t in range(H - duration[v] + 1))
             )
 
         # Symmetry breaking: shift the whole schedule so the first consumer starts at 0.
         # Without this, equivalent shifted schedules may also be found.
-        model.Add(M[str(ops[0])] == 0)
+        model.Add(M[ops[0]] == 0)
         # Dependency constraints:
         # M[v] + i*I >= M[u] + (i-δ)*I + d
         # => M[v] - M[u] + δ*I >= d
         for u, v, d, delta in edges:
-            model.Add(M[str(v)] - M[str(u)] + delta * I >= d)
+            model.Add(M[v] - M[u] + delta * I >= d)
 
         # Modular resource capacity constraints.
         for r in range(I):
@@ -491,13 +502,13 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
         end = {}
         for v in ops:
             end[v] = model.NewIntVar(0, H + duration[v], f"end_{v}")
-            model.Add(end[v] == M[str(v)] + duration[v])
+            model.Add(end[v] == M[v] + duration[v])
 
         L = model.NewIntVar(0, H + max(duration.values()), "L")
         model.AddMaxEquality(L, [end[v] for v in ops])
 
         BIG = 100
-        model.Minimize(BIG * L - sum(M[str(v)] for v in ops))
+        model.Minimize(BIG * L - sum(M[v] for v in ops))
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = 5
@@ -509,7 +520,7 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
         result = {
             "I": I,
             "L": solver.Value(L),
-            "M": {v: solver.Value(M[str(v)]) for v in ops},
+            "M": {v: solver.Value(M[v]) for v in ops},
         }
 
         # Build modular RRT table for printing.
@@ -535,7 +546,7 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
         # 从小到大寻找。如果可行，就直接输出I
         # 多个IL时，且 I<L 时，都返回。I==L 的情况无跨循环交叠，但可作为fallback备选（性能不太差）
         rets = []
-        for I in range(1, max_I + 1):
+        for I in range(1, estimated_total_cycles):
             ans = solve_for_I(I)
             if ans is not None and ans["I"] < ans["L"]:
                 rets.append(ans)
@@ -927,6 +938,10 @@ def _solve_smt_joint_optimize(
         _, rty = _detect_op_latency_and_resource(info.stmt)
         return _rtype_map.get(getattr(rty, "value", str(rty)), ResourceType.ALU)
 
+    def _latency_for_info(info: _StmtInfo) -> int:
+        latency, _ = _detect_op_latency_and_resource(info.stmt)
+        return max(int(latency), 1)
+
     def _reservation_for_info(info: _StmtInfo, rty: ResourceType) -> List[Dict[ResourceType, int]]:
         # wait/try_wait barrier 会阻塞当前发射 warp；这里把它建模成
         # 占满所有 FU 的独占 issue slot，和 _solve_naive_modulo_sched 保持一致。
@@ -944,7 +959,7 @@ def _solve_smt_joint_optimize(
     for idx in ops:
         info = infos[idx]
         rty = _resource_for_info(info)
-        latency = 1
+        latency = _latency_for_info(info)
         outputs: List[OutputValue] = []
         for wr in info.writes:
             storage = StorageKind.SMEM if _is_shared(wr.buffer) else StorageKind.RMEM

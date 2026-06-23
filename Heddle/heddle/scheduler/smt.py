@@ -386,6 +386,10 @@ class HeddleScheduler:
             v for v, is_variable in enumerate(is_varialble_latency_op)
             if is_variable
         ]
+        non_variable_latency_ops = [
+            v for v, is_variable in enumerate(is_varialble_latency_op)
+            if not is_variable
+        ]
         for i, u in enumerate(variable_latency_ops):
             for v in variable_latency_ops[i + 1:]:
                 for wu in range(W):
@@ -393,18 +397,10 @@ class HeddleScheduler:
                         if wu // 4 != wv // 4:
                             solver.add(z3.Not(z3.And(warp[(u, wu)], warp[(v, wv)])))
 
-        # WGMMA 类节点会占用完整 warpgroup；variable latency op（如 TMA）
-        # 需要和这些 WGMMA 节点分配到不同 warpgroup。
-        wgmma_ops = [
-            v for v, nd in enumerate(self.nodes)
-            if (
-                nd.resource_type == ResourceType.TensorCore
-                and max(int(nd.warp_count), 1) >= 4
-                and max(int(nd.warp_align), 1) >= 4
-            )
-        ]
+        # variable latency op（如 TMA）需要和其他op分配到不同 warpgroup。
+
         for u in variable_latency_ops:
-            for v in wgmma_ops:
+            for v in non_variable_latency_ops:
                 for wu in range(W):
                     for wv in range(W):
                         if wu // 4 == wv // 4:
@@ -413,21 +409,22 @@ class HeddleScheduler:
         # ---- 整数启动时间表达式 -------------------------------------------
         Tv = [z3.Sum([z3.If(op[(v, t)], t, 0) for t in range(L)]) for v in range(N)]
 
-        # ---- P3：由 APLSP 推导出的时间下界 -------------------------------
-        for (u, v), d in aplsp.items():
-            if d > 0:
-                solver.add(Tv[v] - Tv[u] >= d)
+        # debug : 去掉 APLSP 的时间下界收紧
+        # # ---- P3：由 APLSP 推导出的时间下界 -------------------------------
+        # for (u, v), d in aplsp.items():
+        #     if d > 0:
+        #         solver.add(Tv[v] - Tv[u] >= d)
 
-        # ---- P4：对独立同类节点做对称性破除 -------------------------------
-        # 如果两个节点没有依赖关系，且 FU 类型和 latency 完全相同，
-        # 则强制前者不晚于后者启动，减少等价调度带来的搜索空间。
-        dep_pairs = set(aplsp.keys())
-        for v1 in range(N):
-            for v2 in range(v1 + 1, N):
-                n1, n2 = self.nodes[v1], self.nodes[v2]
-                if (n1.resource_type == n2.resource_type and n1.latency == n2.latency
-                        and (v1, v2) not in dep_pairs and (v2, v1) not in dep_pairs):
-                    solver.add(Tv[v1] <= Tv[v2])
+        # # ---- P4：对独立同类节点做对称性破除 -------------------------------
+        # # 如果两个节点没有依赖关系，且 FU 类型和 latency 完全相同，
+        # # 则强制前者不晚于后者启动，减少等价调度带来的搜索空间。
+        # dep_pairs = set(aplsp.keys())
+        # for v1 in range(N):
+        #     for v2 in range(v1 + 1, N):
+        #         n1, n2 = self.nodes[v1], self.nodes[v2]
+        #         if (n1.resource_type == n2.resource_type and n1.latency == n2.latency
+        #                 and (v1, v2) not in dep_pairs and (v2, v1) not in dep_pairs):
+        #             solver.add(Tv[v1] <= Tv[v2])
 
         # ---- 依赖、跨 warp spill 代价和 blocking sync ---------------------
         for v_node in self.nodes:

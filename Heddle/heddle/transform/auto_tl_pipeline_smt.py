@@ -239,6 +239,72 @@ def _call_op_names(stmt: tvm.tir.Stmt) -> Set[str]:
     return names
 
 
+def _static_positive_int(expr: tvm.tir.PrimExpr) -> Optional[int]:
+    if isinstance(expr, tvm.tir.IntImm):
+        v = int(expr.value)
+        return v if v > 0 else None
+    return None
+
+
+def _is_wgmma_call(call: tvm.tir.Call) -> bool:
+    if not isinstance(call.op, tvm.ir.Op):
+        return False
+    op_name = call.op.name
+    if op_name in {"tl.tl_gemm", "tl.tl_gemm_sp", "tl.ptx_wgmma_ss", "tl.ptx_wgmma_rs"}:
+        return True
+    if op_name == "tir.call_extern" and call.args and isinstance(call.args[0], tvm.tir.StringImm):
+        f = call.args[0].value
+        return (
+            f.startswith("tl::tcgen5mma_gemm_")
+            or f.startswith("tl::wgmma")
+            or f.startswith("tl::tcgen05")
+        )
+    return False
+
+
+def _is_tma_call(call: tvm.tir.Call) -> bool:
+    if not isinstance(call.op, tvm.ir.Op):
+        return False
+    return call.op.name in {"tl.tma_load", "tl.tma_load_im2col", "tir.tma_load"}
+
+
+def _count_calls_with_static_loop_multiplier(stmt: tvm.tir.Stmt, pred) -> int:
+    count = 0
+    loop_multiplier = 1
+
+    @tir.functor.visitor
+    class CountVisitor(tir.PyStmtExprVisitor):
+        def visit_for_(self, op):
+            nonlocal loop_multiplier
+            extent = _static_positive_int(op.extent)
+            if extent is None:
+                super().visit_for_(op)
+                return
+
+            prev = loop_multiplier
+            loop_multiplier *= extent
+            super().visit_for_(op)
+            loop_multiplier = prev
+
+        def visit_call_(self, call):
+            nonlocal count
+            if pred(call):
+                count += loop_multiplier
+            super().visit_call_(call)
+
+    CountVisitor().visit_stmt(stmt)
+    return count
+
+
+def _count_wgmma_ops_with_static_loop_multiplier(stmt: tvm.tir.Stmt) -> int:
+    return _count_calls_with_static_loop_multiplier(stmt, _is_wgmma_call)
+
+
+def _count_tma_ops_with_static_loop_multiplier(stmt: tvm.tir.Stmt) -> int:
+    count = _count_calls_with_static_loop_multiplier(stmt, _is_tma_call)
+    return count
+
+
 def _is_sync_like(stmt: tvm.tir.Stmt, *, nested: bool) -> bool:
     sync_ops = {
         "tl.mbarrier_wait_parity",
@@ -404,6 +470,7 @@ def _detect_op_latency_and_resource(stmt: tvm.tir.Stmt) -> tuple:
 
     Reference latencies from Hopper architecture:
     - WGMMA (warp_group_dot): ~27 cycles, TensorCore
+    - TMA load issue: ~20 cycles, TMA
     - Reduce (max/sum): ~3 cycles, ALU
     - SFU (exp2, rsqrt, log2): ~25 cycles, SFU
     - Copy/Fill: ~1 cycle, ALU
@@ -414,19 +481,16 @@ def _detect_op_latency_and_resource(stmt: tvm.tir.Stmt) -> tuple:
     except Exception:  # pragma: no cover
         from heddle.scheduler.smt import ResourceType  # type: ignore
 
+    wgmma_op_count = _count_wgmma_ops_with_static_loop_multiplier(stmt)
+    if wgmma_op_count > 0:
+        return 27 * wgmma_op_count, ResourceType.TensorCore
+
+    tma_op_count = _count_tma_ops_with_static_loop_multiplier(stmt)
+    if tma_op_count > 0:
+        return 20 * tma_op_count, ResourceType.TMA
+
     op_names = _call_op_names(stmt)
     
-    # Check for WGMMA operations (~27 cycles on Hopper)
-    if ("tl.tl_gemm" in op_names) or ("tl.tl_gemm_sp" in op_names) or \
-       ("tl.ptx_wgmma_ss" in op_names) or ("tl.ptx_wgmma_rs" in op_names):
-        return 27, ResourceType.TensorCore
-
-    for n in op_names:
-        if n.startswith("extern:"):
-            f = n[len("extern:"):]
-            if f.startswith("tl::tcgen5mma_gemm_") or f.startswith("tl::wgmma") or f.startswith("tl::tcgen05"):
-                return 27, ResourceType.TensorCore
-
     # Check for legacy PTX MMA (non-WGMMA, ~8 cycles on Hopper)
     ptx_mma_ops = {"tl.ptx_mma", "tl.ptx_mma_sp", "tl.ptx_mma_sm70"}
     if op_names & ptx_mma_ops:
