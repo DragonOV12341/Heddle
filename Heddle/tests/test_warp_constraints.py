@@ -377,6 +377,26 @@ class TestSMTWarpAssignment:
         wa = result["warp_assign"]
         assert all(v == 0 for v in wa.values())
 
+    def test_variable_latency_ops_share_warpgroup(self):
+        smt = _make_smt_nodes([
+            ("TMA0", "TMA", 2, [], [], {
+                "warp_count": 4,
+                "warp_align": 4,
+                "is_varialble_latency": True,
+            }),
+            ("TMA1", "TMA", 2, [], [], {
+                "warp_count": 4,
+                "warp_align": 4,
+                "is_varialble_latency": True,
+            }),
+            ("C", "TC", 2, [], [], {"warp_count": 4, "warp_align": 4}),
+        ], num_warps=8)
+        result = smt._solve_phase_b(ii=8, L=16)
+        assert result is not None
+        wa = result["warp_assign"]
+        assert wa["TMA0"] // 4 == wa["TMA1"] // 4
+        assert wa["TMA0"] // 4 != wa["C"] // 4
+
 
 @pytest.mark.skipif(not _has_z3(), reason="z3-solver not installed")
 class TestSMTBlockingSync:

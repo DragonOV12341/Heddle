@@ -533,11 +533,11 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
 
     def solve_min_I(max_I: int = 6) -> List:
         # 从小到大寻找。如果可行，就直接输出I
-        # 多个IL时，且 I<=L 时，都返回。I==L 的情况无跨循环交叠，但作为fallback备选（性能不太差）
+        # 多个IL时，且 I<L 时，都返回。I==L 的情况无跨循环交叠，但可作为fallback备选（性能不太差）
         rets = []
         for I in range(1, max_I + 1):
             ans = solve_for_I(I)
-            if ans is not None and ans["I"] <= ans["L"]:
+            if ans is not None and ans["I"] < ans["L"]:
                 rets.append(ans)
         return rets
 
@@ -956,8 +956,10 @@ def _solve_smt_joint_optimize(
                 lifetime=LifetimeSemantic.DEAD_ON_ENTRY,
             ))
         
-        wc = 4 if info.is_wgmma else 1
-        
+        need_warpgroup = info.is_wgmma
+        single_warp_eligible = info.is_true_tma
+        wc = 4 if need_warpgroup else 1  # producer consumer 都按WG安排；barrier可能需要特殊处理
+        _is_variable_latency = info.is_true_tma  # 只有真正的 TMA load 按 variable latency 建模
         node = OpNode(
             name=f"s{idx}",
             resource_type=rty,
@@ -965,7 +967,9 @@ def _solve_smt_joint_optimize(
             reservation=_reservation_for_info(info, rty),
             outputs=outputs,
             warp_count=wc,
-            warp_align=4 if info.is_wgmma else 1,
+            warp_align=4 if need_warpgroup else 1,
+            is_varialble_latency=_is_variable_latency,
+            replicable=single_warp_eligible
         )
         nodes.append(node)
         node_by_idx[idx] = node
@@ -977,22 +981,16 @@ def _solve_smt_joint_optimize(
         for u in deps:
             if u not in node_by_idx:
                 continue
-            warpgroup_disjoint = bool(
-                getattr(infos[u], "is_true_tma", False)
-                and getattr(infos[v], "is_wgmma", False)
-            )
             if infos[u].is_sync_top or infos[u].is_sync_nested :
                 node_by_idx[v].add_dependency(
                     node_by_idx[u],
                     distance=0,
                     blocking_sync=True,
-                    warpgroup_disjoint=warpgroup_disjoint,
                 )
             else:
                 node_by_idx[v].add_dependency(
                     node_by_idx[u],
                     distance=0,
-                    warpgroup_disjoint=warpgroup_disjoint,
                 )
 
     # 跨迭代 hazard 与 _solve_naive_modulo_sched 保持一致：
@@ -1025,7 +1023,7 @@ def _solve_smt_joint_optimize(
     base_max_time = max((int(base_M.get(v, 0)) for v in ops), default=0)
     window = max(base_L, base_max_time + 1, base_I)
 
-    def _run_joint_solver(*, hard_warp_disjoint: bool, solve_window: int, optimize: bool):
+    def _run_joint_solver(*, solve_window: int, optimize: bool):
         solver = HeddleScheduler(
             nodes,
             fu_caps=capacity,
@@ -1033,7 +1031,6 @@ def _solve_smt_joint_optimize(
             smem_limit=smem_limit,
             num_warps=num_warps,
             timeout_ms=int(mod_sched_plan.get("timeout_ms", 15000)),
-            hard_warp_disjoint=hard_warp_disjoint,
         )
         return solver.schedule_joint(
             min_ii=base_I,
@@ -1050,7 +1047,6 @@ def _solve_smt_joint_optimize(
     sol = None
     for solve_window in candidate_windows:
         sol = _run_joint_solver(
-            hard_warp_disjoint=True,
             solve_window=solve_window,
             optimize=True,
         )
@@ -1058,21 +1054,9 @@ def _solve_smt_joint_optimize(
             break
 
     if sol is None:
-        print("---- hard warpgroup_disjoint optimize failed; retry feasibility", flush=True)
+        print("---- SMT optimize failed; retry feasibility", flush=True)
         for solve_window in candidate_windows:
             sol = _run_joint_solver(
-                hard_warp_disjoint=True,
-                solve_window=solve_window,
-                optimize=False,
-            )
-            if sol is not None:
-                break
-
-    if sol is None:
-        print("---- hard warpgroup_disjoint failed; retry soft warp_disjoint", flush=True)
-        for solve_window in candidate_windows:
-            sol = _run_joint_solver(
-                hard_warp_disjoint=False,
                 solve_window=solve_window,
                 optimize=False,
             )

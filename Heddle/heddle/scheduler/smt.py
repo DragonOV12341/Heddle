@@ -70,8 +70,6 @@ class OutputValue:
 @dataclass
 class EdgeInfo:
     blocking_sync: bool = False
-    warp_disjoint: bool = False
-    warpgroup_disjoint: bool = False
 
 
 @dataclass
@@ -93,18 +91,15 @@ class OpNode:
     warp_count: int = 1
     warp_align: int = 1
     replicable: bool = False
+    is_varialble_latency : bool = False
 
     def add_dependency(self, parent: "OpNode", distance: int = 0,
-                       blocking_sync: bool = False,
-                       warp_disjoint: bool = False,
-                       warpgroup_disjoint: bool = False):
+                       blocking_sync: bool = False):
         self.parents.append(parent)
         parent.children.append(self)
         self.dependency_distance[parent.name] = distance
         self.edge_info[parent.name] = EdgeInfo(
             blocking_sync=blocking_sync,
-            warp_disjoint=warp_disjoint,
-            warpgroup_disjoint=warpgroup_disjoint,
         )
 
 
@@ -176,7 +171,6 @@ class HeddleScheduler:
         disallow_spills: bool = False,
         use_spill_concurrency: bool = True,
         include_incoming_live: bool = True,
-        hard_warp_disjoint: bool = True,
     ):
         self.nodes = nodes
         self.fu_caps = fu_caps or {
@@ -190,7 +184,6 @@ class HeddleScheduler:
         self.disallow_spills = disallow_spills
         self.use_spill_concurrency = use_spill_concurrency
         self.include_incoming_live = include_incoming_live
-        self.hard_warp_disjoint = hard_warp_disjoint
 
     # ------------------------------------------------------------------ #
     # Phase A  (unchanged API)
@@ -339,6 +332,12 @@ class HeddleScheduler:
         for v in range(N):
             for w in range(W):
                 warp[(v, w)] = z3.Bool(f"PB{p}_warp_v={v}_w={w}")
+        
+        # 特殊标记：是否是 variable latency 操作（如 TMA）。
+        is_varialble_latency_op = [
+            bool(self.nodes[v].is_varialble_latency)
+            for v in range(N)
+        ]
 
         # ---- 唯一启动时间 --------------------------------------------------
         for v in range(N):
@@ -381,7 +380,36 @@ class HeddleScheduler:
                     solver.add(warp[(v, w)] == (
                         z3.Or(covering_starts) if covering_starts else z3.BoolVal(False)
                     ))
+        # 对于 variable latency op，应将它们放到同一个 warpgroup 内。
+        # 这里按 Hopper warpgroup 语义建模：warpId // 4 相同。
+        variable_latency_ops = [
+            v for v, is_variable in enumerate(is_varialble_latency_op)
+            if is_variable
+        ]
+        for i, u in enumerate(variable_latency_ops):
+            for v in variable_latency_ops[i + 1:]:
+                for wu in range(W):
+                    for wv in range(W):
+                        if wu // 4 != wv // 4:
+                            solver.add(z3.Not(z3.And(warp[(u, wu)], warp[(v, wv)])))
 
+        # WGMMA 类节点会占用完整 warpgroup；variable latency op（如 TMA）
+        # 需要和这些 WGMMA 节点分配到不同 warpgroup。
+        wgmma_ops = [
+            v for v, nd in enumerate(self.nodes)
+            if (
+                nd.resource_type == ResourceType.TensorCore
+                and max(int(nd.warp_count), 1) >= 4
+                and max(int(nd.warp_align), 1) >= 4
+            )
+        ]
+        for u in variable_latency_ops:
+            for v in wgmma_ops:
+                for wu in range(W):
+                    for wv in range(W):
+                        if wu // 4 == wv // 4:
+                            solver.add(z3.Not(z3.And(warp[(u, wu)], warp[(v, wv)])))
+        
         # ---- 整数启动时间表达式 -------------------------------------------
         Tv = [z3.Sum([z3.If(op[(v, t)], t, 0) for t in range(L)]) for v in range(N)]
 
@@ -402,7 +430,6 @@ class HeddleScheduler:
                     solver.add(Tv[v1] <= Tv[v2])
 
         # ---- 依赖、跨 warp spill 代价和 blocking sync ---------------------
-        warp_disjoint_penalties: list[z3.ArithRef] = []
         for v_node in self.nodes:
             vi = idx[v_node.name]
             for par in v_node.parents:
@@ -423,25 +450,6 @@ class HeddleScheduler:
                         solver.add(Tv[vi] - Tv[ui] >= eff - delta * ii)
                 else:
                     solver.add(Tv[vi] - Tv[ui] >= base_delay - delta * ii)
-
-                # producer / WGMMA consumer 必须分属不同 warpgroup：
-                # 任意被选中的 warp id 都不能满足 wu // 4 == wv // 4。
-                # 这是硬约束，即使 fallback 到 soft warp_disjoint 也不能放松。
-                if edge and edge.warpgroup_disjoint and W > 1:
-                    for wu in range(W):
-                        for wv in range(W):
-                            if wu // 4 == wv // 4:
-                                solver.add(z3.Not(z3.And(warp[(ui, wu)], warp[(vi, wv)])))
-
-                # producer / consumer 角色分离偏好：用于较弱的“不要同 warp”
-                # 情况；hard_warp_disjoint=False 时可降级成 penalty。
-                if edge and edge.warp_disjoint and W > 1:
-                    for w in range(W):
-                        overlap = z3.And(warp[(ui, w)], warp[(vi, w)])
-                        if self.hard_warp_disjoint:
-                            solver.add(z3.Not(overlap))
-                        else:
-                            warp_disjoint_penalties.append(z3.If(overlap, 1, 0))
 
                 # P2：blocking sync 的完整并发约束。
                 # 这种边不仅要求时间顺序，还会约束相关 warp 的覆盖关系；
@@ -631,8 +639,6 @@ class HeddleScheduler:
 
         # ---- 优化目标：偏好更紧凑的调度 -------------------------------
         if optimize:
-            if warp_disjoint_penalties:
-                solver.minimize(z3.Sum(warp_disjoint_penalties))
             mx = z3.Int(f"PB{p}_max_T")
             solver.add(mx >= 0)
             for texpr in Tv:
