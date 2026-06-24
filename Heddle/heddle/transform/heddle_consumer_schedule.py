@@ -1221,6 +1221,13 @@ def _solve_smt_joint_optimize(
         return _rtype_map.get(getattr(rty, "value", str(rty)), ResourceType.ALU)
 
     def _latency_for_info(info: _StmtInfo) -> int:
+        # Keep the joint solver at the same abstraction level as
+        # _solve_naive_modulo_sched: TMA and wait barriers consume one issue
+        # slot here. Their long data-ready / synchronization semantics are
+        # represented by explicit barrier ordering and resource constraints,
+        # not by turning every dependent edge into a long latency edge.
+        if getattr(info, "is_wait_barrier", False) or getattr(info, "is_true_tma", False):
+            return 1
         latency, _ = _detect_op_latency_and_resource(info.stmt)
         return max(int(latency), 1)
 
@@ -1278,17 +1285,16 @@ def _solve_smt_joint_optimize(
         for u in deps:
             if u not in node_by_idx:
                 continue
-            if infos[u].is_sync_top or infos[u].is_sync_nested :
-                node_by_idx[v].add_dependency(
-                    node_by_idx[u],
-                    distance=0,
-                    blocking_sync=True,
-                )
-            else:
-                node_by_idx[v].add_dependency(
-                    node_by_idx[u],
-                    distance=0,
-                )
+            # deps_all already contains the conservative ordering needed for
+            # sync/barrier statements. Do not upgrade every sync parent edge to
+            # HeddleScheduler.blocking_sync: that additionally enforces same
+            # warp and a long active-window exclusion, which is stronger than
+            # the issue-slot model used by the modulo scheduler and makes real
+            # producer/consumer graphs presolve UNSAT.
+            node_by_idx[v].add_dependency(
+                node_by_idx[u],
+                distance=0,
+            )
 
     # 跨迭代 hazard 与 _solve_naive_modulo_sched 保持一致：
     # 如果一个 stmt 同时读写同一个 buffer，或者它是 sync-like 阻塞语句，
@@ -1352,13 +1358,13 @@ def _solve_smt_joint_optimize(
 
     if sol is None:
         print("---- SMT optimize failed; retry feasibility", flush=True)
-        for solve_window in candidate_windows:
-            sol = _run_joint_solver(
-                solve_window=solve_window,
-                optimize=False,
-            )
-            if sol is not None:
-                break
+    #     for solve_window in candidate_windows:
+    #         sol = _run_joint_solver(
+    #             solve_window=solve_window,
+    #             optimize=False,
+    #         )
+    #         if sol is not None:
+    #             break
     if sol is None:
         fallback = dict(mod_sched_plan)
         fallback.setdefault("status", "SMT_UNSAT")
@@ -1383,6 +1389,7 @@ def _solve_smt_joint_optimize(
         row = {"slot": f"{r} mod {base_I}"}
         for f in ("TMA", "TC", "ALU", "SFU"):
             row[f] = []
+        modified=False
         for idx in ops:
             t = optimized_M.get(idx)
             if t is None or t % base_I != r:
@@ -1391,10 +1398,13 @@ def _solve_smt_joint_optimize(
             if getattr(info, "is_wait_barrier", False):
                 for f in ("TMA", "TC", "ALU", "SFU"):
                     row[f].append(idx)
+                    modified=True
                 continue
             rty = _resource_for_info(info).value
             row[rty].append(idx)
-        table.append(row)
+            modified=True
+        if modified:
+            table.append(row)
 
     optimized = dict(mod_sched_plan)
     optimized.update({
@@ -2341,7 +2351,7 @@ def _transform_pipeline_loop(
         mod_sched_plans = _solve_naive_modulo_sched(deps_all, infos_list, all_indices)
         # ---- TWill : step 2 求解联合优化问题： 基础模调度M + warp_spec
         for plan in mod_sched_plans :
-            print('----start  _solve_smt_joint_optimize')
+            print('----start  _solve_smt_joint_optimize', flush=True)
             optimized =  _solve_smt_joint_optimize(deps_all, infos_list, all_indices, plan)
             if optimized and optimized['modular_rrt'] is not None :
                 for row in optimized['modular_rrt'] :

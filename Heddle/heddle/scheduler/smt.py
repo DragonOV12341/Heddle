@@ -324,6 +324,25 @@ class HeddleScheduler:
             model.add_bool_or([lit.negated() for lit in lits] + [b])
             return b
 
+        le_cache = {}
+
+        def _start_le_var(v: int, bound: int):
+            # Reified form of Tv[v] <= bound. This replaces large prefix ORs
+            # over op[(v, 0..bound)] with two linear half-reifications.
+            key = (v, bound)
+            if key in le_cache:
+                return le_cache[key]
+            if bound < 0:
+                b = _false_var(f"start_le_false_v={v}_b={bound}")
+            elif bound >= L - 1:
+                b = _true_var(f"start_le_true_v={v}_b={bound}")
+            else:
+                b = model.new_bool_var(f"start_le_v={v}_b={bound}")
+                model.add(Tv[v] <= bound).only_enforce_if(b)
+                model.add(Tv[v] >= bound + 1).only_enforce_if(b.negated())
+            le_cache[key] = b
+            return b
+
         # ---- P3：APLSP 时间边界收紧 --------------------------------------
         aplsp = _compute_aplsp(self.nodes, idx, ii)
 
@@ -426,6 +445,24 @@ class HeddleScheduler:
         for v in range(N):
             model.add(Tv[v] == sum(t * op[(v, t)] for t in range(L)))
 
+        # CP-SAT 的 interval/no_overlap 比手工枚举所有 (time, other-op)
+        # 冲突子句紧凑得多。这里按需缓存“op v 在 warp w 上执行”的可选区间，
+        # 后续 blocking_sync / spill 并发约束都复用它们。
+        max_latency = max((max(int(n.latency), 1) for n in self.nodes), default=1)
+        interval_end_max = L - 1 + max_latency
+        op_intervals: dict[tuple[int, int], object] = {}
+
+        def _op_interval(v: int, w: int):
+            key = (v, w)
+            if key not in op_intervals:
+                size = max(int(self.nodes[v].latency), 1)
+                end = model.new_int_var(0, interval_end_max, f"op_end_v={v}_w={w}")
+                model.add(end == Tv[v] + size)
+                op_intervals[key] = model.new_optional_interval_var(
+                    Tv[v], size, end, warp[(v, w)], f"op_iv_v={v}_w={w}"
+                )
+            return op_intervals[key]
+
         # debug : 去掉 APLSP 的时间下界收紧
         # # ---- P3：由 APLSP 推导出的时间下界 -------------------------------
         # for (u, v), d in aplsp.items():
@@ -478,25 +515,37 @@ class HeddleScheduler:
                     if W > 1:
                         for w in range(W):
                             model.add_implication(warp[(ui, w)], warp[(vi, w)])
-                    lat_u = max(int(par.latency), 1)
+
+                    # v 在 t 启动时，u 的阻塞同步窗口近似为
+                    # [t - base_delay, t)。用 NoOverlap 表达“同一 warp
+                    # 上其他 op 不能与该窗口重叠”，避免按每个 t/to 展开
+                    # 成海量 BoolOr。
+                    block_size = max(base_delay, 1)
+                    block_start_min = -block_size
+                    block_end_min = 0
                     for w in range(W):
+                        block_start = model.new_int_var(
+                            block_start_min, L - 1, f"block_start_u={ui}_v={vi}_w={w}"
+                        )
+                        block_end = model.new_int_var(
+                            block_end_min, L - 1, f"block_end_u={ui}_v={vi}_w={w}"
+                        )
+                        model.add(block_start == Tv[vi] - block_size)
+                        model.add(block_end == Tv[vi])
+                        block_interval = model.new_optional_interval_var(
+                            block_start,
+                            block_size,
+                            block_end,
+                            warp[(vi, w)],
+                            f"block_iv_u={ui}_v={vi}_w={w}",
+                        )
+                        # 注意：NoOverlap 会约束列表中任意两个 interval
+                        # 都不重叠。这里需要的是“阻塞窗口 vs 其他 op”的
+                        # 星形排斥，而不是把所有 other op 彼此串行化。
                         for other in range(N):
                             if other == ui or other == vi:
                                 continue
-                            lat_o = max(int(self.nodes[other].latency), 1)
-                            for t in range(L):
-                                # v 在 t 启动时，u 近似活跃于 [t - base_delay, t)。
-                                # 若 other 的执行窗口与该阻塞区间重叠，则禁止
-                                # other 使用同一个 warp。
-                                for to in range(max(0, t - base_delay - lat_o + 1), t + 1):
-                                    if to >= L:
-                                        continue
-                                    model.add_bool_or([
-                                        op[(vi, t)].negated(),
-                                        warp[(vi, w)].negated(),
-                                        op[(other, to)].negated(),
-                                        warp[(other, w)].negated(),
-                                    ])
+                            model.add_no_overlap([block_interval, _op_interval(other, w)])
 
         # P2：spill 并发约束。
         # 当 producer/consumer 分配到不同 warp，且 producer 输出带 spill_cost
@@ -514,20 +563,31 @@ class HeddleScheduler:
                         for w_dst in range(W):
                             if w_src == w_dst:
                                 continue
+                            spill_present = _and_var(
+                                f"spill_present_u={ui}_v={vi}_ws={w_src}_wd={w_dst}",
+                                [warp[(ui, w_src)], warp[(vi, w_dst)]],
+                            )
+                            spill_start = model.new_int_var(
+                                -sc, L - 1, f"spill_start_u={ui}_v={vi}_ws={w_src}_wd={w_dst}"
+                            )
+                            spill_end = model.new_int_var(
+                                0, L - 1, f"spill_end_u={ui}_v={vi}_ws={w_src}_wd={w_dst}"
+                            )
+                            model.add(spill_start == Tv[vi] - sc)
+                            model.add(spill_end == Tv[vi])
+                            spill_interval = model.new_optional_interval_var(
+                                spill_start,
+                                sc,
+                                spill_end,
+                                spill_present,
+                                f"spill_iv_u={ui}_v={vi}_ws={w_src}_wd={w_dst}",
+                            )
+                            # 同理只禁止 spill 窗口和接收方 warp 上的其他 op
+                            # 重叠，不约束这些 other op 之间的相互重叠。
                             for other in range(N):
                                 if other == vi:
                                     continue
-                                for t in range(L):
-                                    for to in range(max(0, t - sc + 1), t + 1):
-                                        if to >= L:
-                                            continue
-                                        model.add_bool_or([
-                                            warp[(ui, w_src)].negated(),
-                                            warp[(vi, w_dst)].negated(),
-                                            op[(vi, t)].negated(),
-                                            op[(other, to)].negated(),
-                                            warp[(other, w_dst)].negated(),
-                                        ])
+                                model.add_no_overlap([spill_interval, _op_interval(other, w_dst)])
 
         # ---- FU 容量约束 ---------------------------------------------------
         expanded = self._fold_reservations(ii)
@@ -590,10 +650,7 @@ class HeddleScheduler:
                 producer_lat = int(self.nodes[producer_v].latency)
 
                 for tau in range(L):
-                    produced_by = _or_var(
-                        f"produced_x={xi}_t={tau}",
-                        [op[(producer_v, t)] for t in range(tau + 1)],
-                    )
+                    produced_by = _start_le_var(producer_v, tau)
 
                     if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY:
                         if same_iter_consumers:
@@ -603,18 +660,12 @@ class HeddleScheduler:
                             # 这个语义对应 Twill warpspecialization.rs L371-409。
                             if producer_lat == 0:
                                 all_consumed = _and_var(f"consumed_x={xi}_t={tau}", [
-                                    _or_var(
-                                        f"consumer_started_x={xi}_cv={cv}_t={tau}",
-                                        [op[(cv, tc)] for tc in range(tau)],
-                                    )
+                                    _start_le_var(cv, tau - 1)
                                     for cv, _ in same_iter_consumers
                                 ]) if tau > 1 else _false_var(f"consumed_false_x={xi}_t={tau}")
                             else:
                                 all_consumed = _and_var(f"consumed_x={xi}_t={tau}", [
-                                    _or_var(
-                                        f"consumer_started_x={xi}_cv={cv}_t={tau}",
-                                        [op[(cv, tc)] for tc in range(tau + 1)],
-                                    )
+                                    _start_le_var(cv, tau)
                                     for cv, _ in same_iter_consumers
                                 ]) if tau > 0 else _false_var(f"consumed_false_x={xi}_t={tau}")
                             model.add_bool_or([
@@ -643,10 +694,7 @@ class HeddleScheduler:
                             # 如果第 0 轮迭代中仍有消费者在 tau 时刻前尚未启动，
                             # 那么来自上一轮的值在 tau 时刻仍需要保持 live。
                             some_consumer_pending = _or_var(f"pending_x={xi}_t={tau}", [
-                                _or_var(
-                                    f"consumer_not_started_x={xi}_cv={cv}_t={tau}",
-                                    [op[(cv, tc)] for tc in range(tau + 1)],
-                                ).negated()
+                                _start_le_var(cv, tau).negated()
                                 for cv, _ in cross_iter_consumers
                             ]) if tau > 0 else _true_var(f"pending_true_x={xi}_t={tau}")
                             model.add(incoming_live[(xi, tau)] == some_consumer_pending)
@@ -699,8 +747,11 @@ class HeddleScheduler:
 
         # ---- 求解 ---------------------------------------------------------
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = max(float(self.timeout_ms) / 1000.0, 0.001)
+        solver.parameters.max_time_in_seconds = max(float(self.timeout_ms) / 1000.0, 1)
         solver.parameters.num_workers = 4
+        solver.parameters.log_search_progress=True
+        
+        
         status = solver.solve(model)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             return None
