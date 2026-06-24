@@ -380,80 +380,76 @@ def _build_consumer_dep_graph(
     return consumer_indices, deps, all_indices, deps_all
 
 
-def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_StmtInfo], op_indices : List[int]) -> List[Dict]:
+def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtInfo'], op_indices: List[int]) -> List[Dict]:
     from ortools.sat.python import cp_model
-    print('enter _solve_naive_modulo_sched',flush=True)
-        
-    ops : List[int] = list(op_indices)
+    print('enter _solve_naive_modulo_sched', flush=True)
+    
+    ops: List[int] = list(op_indices)
     if not ops:
         return None
 
-    latency_of: Dict[int, int] = {}
-    resource_of: Dict[int, str] = {}
-    estimated_total_cycles = 0
+    # duration 代表发射占用时长（Issue Cycle），单发射模型下统一为 1
+    duration = { key : 1 for key in ops }
+    
+    # ---------------------------------------------------------
+    # 【修改点 1】引入 latencies 字典，用于记录真实的计算/写回时延
+    # ---------------------------------------------------------
+    latencies = {} 
+    rrt = {}
+    estimated_total_latency = 0
+    
     for idx in ops:
         info = infos[idx]
-        latency, rty = _detect_op_latency_and_resource(info.stmt)
-        estimated_total_cycles += latency
-        
-        latency_of[idx] = max(int(latency), 1)
-        resource_of[idx] = getattr(rty, "value", str(rty))
-        
-    def solve_for_I(I: int, H: Optional[int] = None):
-
-        if H is None:
-            # duration is issue occupancy, while latency_of is dependency
-            # delay.  The absolute search window must be large enough for
-            # long dependency chains even though each op occupies one issue
-            # slot in the resource table.
-            H = max(8, len(ops) + 1, sum(latency_of.values()) + 1)
-
-        duration = { key : 1 for key in ops }
-
-        # RRT[v][c][resource] = resource usage at local cycle c of op v.
-
-        rrt = {}
-        for idx in ops:
-            info = infos[idx]
-            if info.is_wait_barrier :
-                # mbarrier_wait 必须单独放一个slot，不能和其他op一起发射（wait会阻塞warp）
-                rrt[info.idx] = [{"TMA": 1, "TC": 1, "ALU": 1, "SFU": 1 }]
-            elif info.is_true_tma :
-                rrt[info.idx] = [{"TMA" : 1}]
-            else:
-                rrt[info.idx] = [{resource_of[idx] : 1}]
-        
-        # 使用 issue-slot 模型。
-        capacity = {
-            "TMA": 1, "TC": 1, "ALU": 1, "SFU": 1 
-        }
-        
-        reg_limit = 65536  # 32-bit regs per SM
-        shm_limit = 227 * 1024  # per CTA max
-        
-        
+        if info.is_wait_barrier:
+            # mbarrier_wait 必须单独放一个 slot
+            rrt[info.idx] = [{"TMA": 1, "TC": 1, "ALU": 1, "SFU": 1 }]
+            latencies[info.idx] = 1  # 屏障等待本身阻塞发射或紧邻同步，设为 1
+            estimated_total_latency += 1
+        elif info.is_true_tma:
+            rrt[info.idx] = [{"TMA" : 1}]
+            # TMA 是异步指令，发射只需 1 周期，真实数据就绪依赖 barrier，此处发射层面设为 1
+            latencies[info.idx] = 1 
+            estimated_total_latency += 1
+        else:
+            latency, rty = _detect_op_latency_and_resource(info.stmt)
+            rrt[info.idx] = [{rty.value : 1}]
+            latencies[info.idx] = latency  # 记录真实的硬件执行延迟（如 TC=16, ALU=4 等）
+            estimated_total_latency += latency
+    # 硬件发射槽位容量模型
+    capacity = {
+        "TMA": 1, "TC": 1, "ALU": 1, "SFU": 1 
+    }
+    print(f"-------- {latencies=}")
+    
+    def solve_for_I(I: int):
+        # ---------------------------------------------------------
+        # 【修改点 2】修正数据依赖与跨循环依赖的边权重（使用真实时延）
+        # ---------------------------------------------------------
         # Edges: (producer, consumer, latency d, iteration distance δ)
-        # 依赖关系需要根据 tilelang IR 得到
         edges = []
-        for v, deps in op_deps.items() :
+        H = estimated_total_latency
+        for v, deps in op_deps.items():
             if v not in ops:
                 continue
-            for u in deps :
+            for u in deps:
                 if u not in ops:
                     continue
-                edges.append((u, v, latency_of[u], 0))
-            # 跨循环依赖关系: 如果读写同一buffer 则自己存在跨循环依赖
+                # 消费者 v 必须等生产者 u 的真实计算时延（latencies[u]）结束后才能发射
+                edges.append((u, v, latencies[u], 0))
+                
+            # 跨循环依赖关系: 如果读写同一 buffer 则自己存在跨循环依赖
             write_buf_names = set()
             read_buf_names = set()
-            for buf in infos[v].writes :
+            for buf in infos[v].writes:
                 write_buf_names.add(buf.buffer.name)
-            for buf in infos[v].reads :
+            for buf in infos[v].reads:
                 read_buf_names.add(buf.buffer.name)
             intersect = write_buf_names & read_buf_names
-            if intersect :
-                edges.append((v, v, latency_of[v], 1))
-            if infos[v].is_sync_top and infos[v].is_sync_nested :
-                edges.append((v, v, latency_of[v], 1))
+            if intersect:
+                # 跨循环依赖同样需要等待当前算子自身的真实时延结束
+                edges.append((v, v, latencies[v], 1))
+            if infos[v].is_sync_top and infos[v].is_sync_nested:
+                edges.append((v, v, latencies[v], 1))
 
         model = cp_model.CpModel()
 
@@ -467,7 +463,7 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
         for v in ops:
             model.AddExactlyOne(x[v, t] for t in range(H - duration[v] + 1))
 
-        # M[v] = scheduled time of op v.
+        # M[v] = scheduled time of op v (发射槽位时间戳).
         M = {}
         for v in ops:
             M[v] = model.NewIntVar(0, H, f"M_{v}")
@@ -475,16 +471,16 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
                 M[v] == sum(t * x[v, t] for t in range(H - duration[v] + 1))
             )
 
-        # Symmetry breaking: shift the whole schedule so the first consumer starts at 0.
-        # Without this, equivalent shifted schedules may also be found.
+        # Symmetry breaking
         model.Add(M[ops[0]] == 0)
+        
         # Dependency constraints:
-        # M[v] + i*I >= M[u] + (i-δ)*I + d
-        # => M[v] - M[u] + δ*I >= d
+        # M[v] - M[u] + δ*I >= d (此时 d 已经是真实的硬件 latency)
         for u, v, d, delta in edges:
             model.Add(M[v] - M[u] + delta * I >= d)
 
         # Modular resource capacity constraints.
+        # 确保同一个发射周期内，发射的某种指令数量不超过硬件单元容量
         for r in range(I):
             for f, cap in capacity.items():
                 terms = []
@@ -499,6 +495,9 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
                     model.Add(sum(terms) <= cap)
 
         # Schedule length L = max(M[v] + duration[v]).
+        # 注：如果你希望 L 代表全流水线完全排空（包含最后一条指令执行完）的长度，
+        # 可以把这里的 duration[v] 替换为 latencies[v]。
+        # 目前保持 duration[v] 代表“所有指令发射完毕所需的总周期数”。
         end = {}
         for v in ops:
             end[v] = model.NewIntVar(0, H + duration[v], f"end_{v}")
@@ -526,6 +525,7 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
         # Build modular RRT table for printing.
         table = []
         for r in range(I):
+            modified = False
             row = {"slot": f"{r} mod {I}"}
             for f in capacity:
                 row[f] = []
@@ -537,31 +537,67 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
                         for f in capacity:
                             if rrt[v][c].get(f, 0):
                                 row[f].append(v)
-            table.append(row)
+                                modified = True
+            if modified:
+                table.append(row)
 
         result["modular_rrt"] = table
         return result
 
     def solve_min_I(max_I: int = 6) -> List:
-        # 从小到大寻找。如果可行，就直接输出I
-        # 多个IL时，且 I<L 时，都返回。I==L 的情况无跨循环交叠，但可作为fallback备选（性能不太差）
         rets = []
-        for I in range(1, estimated_total_cycles):
-            ans = solve_for_I(I)
-            if ans is not None and ans["I"] < ans["L"]:
-                rets.append(ans)
+        print(f'{estimated_total_latency=}') 
+        lb = 1
+        ub = estimated_total_latency
+        ans_ub = None
+        ans_lb = None
+        last_lb = lb
+        while True :
+            print(f"\r[Modulo Sched] Testing Initiation Interval: {lb=},{ub=} ...", end="", flush=True)
+
+            if ans_ub is None:
+                ans_ub = solve_for_I(ub)
+            if ans_lb is None: 
+                ans_lb = solve_for_I(lb)
+            assert ans_ub is not None 
+            if ans_lb is None :
+                if ub-lb <= 10 :
+                    break
+                if lb > last_lb :
+                    last_lb = lb
+                lb = (ub + lb) // 2
+            else:
+                ub = lb
+                lb = last_lb
+                ans_ub = ans_lb
+                ans_lb = None
+
+        
+        for i in range(lb,ub+1) :
+            print(f"\r[Modulo Sched] Testing Initiation Interval: I = {i}/{max_I} ...", end="", flush=True)
+            ans = solve_for_I(i)
+            if ans is not None :
+                rets.append(ans);break
+                    
+        # for I in range(1, max_I + 1):
+        #     print(f"\r[Modulo Sched] Testing Initiation Interval: I = {I}/{max_I} ...", end="", flush=True)
+        #     ans = solve_for_I(I)
+        #     if ans is not None and ans["I"] < ans["L"]:
+        #         rets.append(ans)
+        #         break
         return rets
 
     results = None
     try:
-        results = solve_min_I(len(infos) + 1)
-    except Exception as e :
+        results = solve_min_I(estimated_total_latency)
+    except Exception as e:
         print(e, flush=True)
         return None
+        
     print('solve done')
-    if results is not None :
+    if results is not None:
         print('ans not None')
-        for ans in results :
+        for ans in results:
             print("I =", ans["I"], flush=True)
             print("L =", ans["L"], flush=True)
             print("M =", ans["M"], flush=True)
@@ -571,6 +607,252 @@ def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_Stm
     else:
         print('ans none')
     return results
+
+# def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_StmtInfo], op_indices : List[int]) -> List[Dict]:
+#     from ortools.sat.python import cp_model
+#     print('enter _solve_naive_modulo_sched',flush=True)
+        
+#     ops : List[int] = list(op_indices)
+#     if not ops:
+#         return None
+
+#     latency_of: Dict[int, int] = {}
+#     resource_of: Dict[int, str] = {}
+#     estimated_total_cycles = 0
+#     for idx in ops:
+#         info = infos[idx]
+#         latency, rty = _detect_op_latency_and_resource(info.stmt)
+#         estimated_total_cycles += latency
+        
+#         latency_of[idx] = max(int(latency), 1)
+#         resource_of[idx] = getattr(rty, "value", str(rty))
+
+#     def _critical_path_upper_bound() -> int:
+#         """Return the single-iteration DAG critical path length in cycles."""
+#         ops_set = set(ops)
+#         succs: Dict[int, List[int]] = {idx: [] for idx in ops}
+#         indegree: Dict[int, int] = {idx: 0 for idx in ops}
+
+#         for v, deps in op_deps.items():
+#             if v not in ops_set:
+#                 continue
+#             for u in deps:
+#                 if u not in ops_set or u == v:
+#                     continue
+#                 succs[u].append(v)
+#                 indegree[v] += 1
+
+#         ready = [idx for idx in ops if indegree[idx] == 0]
+#         finish_time: Dict[int, int] = {idx: latency_of[idx] for idx in ops}
+#         visited = 0
+
+#         while ready:
+#             u = ready.pop(0)
+#             visited += 1
+#             for v in succs[u]:
+#                 finish_time[v] = max(
+#                     finish_time[v], finish_time[u] + latency_of[v]
+#                 )
+#                 indegree[v] -= 1
+#                 if indegree[v] == 0:
+#                     ready.append(v)
+
+#         if visited != len(ops):
+#             # Keep the solver robust if an unexpected intra-iteration cycle
+#             # appears in op_deps; the serial latency bound is conservative.
+#             return max(1, estimated_total_cycles)
+
+#         return max(1, max(finish_time.values(), default=1))
+
+#     def _resource_pressure_upper_bound() -> int:
+#         per_resource: Dict[str, int] = {"TMA": 0, "TC": 0, "ALU": 0, "SFU": 0}
+#         for idx in ops:
+#             info = infos[idx]
+#             if info.is_wait_barrier:
+#                 for key in per_resource:
+#                     per_resource[key] += 1
+#             elif info.is_true_tma:
+#                 per_resource["TMA"] += 1
+#             else:
+#                 resource = resource_of[idx]
+#                 per_resource[resource] = per_resource.get(resource, 0) + 1
+#         return max(1, max(per_resource.values(), default=1))
+        
+#     def solve_for_I(I: int, H: Optional[int] = None):
+
+#         if H is None:
+#             # duration is issue occupancy, while latency_of is dependency
+#             # delay.  The absolute search window must be large enough for
+#             # long dependency chains even though each op occupies one issue
+#             # slot in the resource table.
+#             H = max(8, len(ops) + 1, sum(latency_of.values()) + 1)
+
+#         duration = { key : 1 for key in ops }
+
+#         # RRT[v][c][resource] = resource usage at local cycle c of op v.
+
+#         rrt = {}
+#         for idx in ops:
+#             info = infos[idx]
+#             if info.is_wait_barrier :
+#                 # mbarrier_wait 必须单独放一个slot，不能和其他op一起发射（wait会阻塞warp）
+#                 rrt[info.idx] = [{"TMA": 1, "TC": 1, "ALU": 1, "SFU": 1 }]
+#             elif info.is_true_tma :
+#                 rrt[info.idx] = [{"TMA" : 1}]
+#             else:
+#                 rrt[info.idx] = [{resource_of[idx] : 1}]
+        
+#         # 使用 issue-slot 模型。
+#         capacity = {
+#             "TMA": 1, "TC": 1, "ALU": 1, "SFU": 1 
+#         }
+        
+#         reg_limit = 65536  # 32-bit regs per SM
+#         shm_limit = 227 * 1024  # per CTA max
+        
+        
+#         # Edges: (producer, consumer, latency d, iteration distance δ)
+#         # 依赖关系需要根据 tilelang IR 得到
+#         edges = []
+#         for v, deps in op_deps.items() :
+#             if v not in ops:
+#                 continue
+#             for u in deps :
+#                 if u not in ops:
+#                     continue
+#                 edges.append((u, v, latency_of[u], 0))
+#             # 跨循环依赖关系: 如果读写同一buffer 则自己存在跨循环依赖
+#             write_buf_names = set()
+#             read_buf_names = set()
+#             for buf in infos[v].writes :
+#                 write_buf_names.add(buf.buffer.name)
+#             for buf in infos[v].reads :
+#                 read_buf_names.add(buf.buffer.name)
+#             intersect = write_buf_names & read_buf_names
+#             if intersect :
+#                 edges.append((v, v, latency_of[v], 1))
+#             if infos[v].is_sync_top and infos[v].is_sync_nested :
+#                 edges.append((v, v, latency_of[v], 1))
+
+#         model = cp_model.CpModel()
+
+#         # x[v,t] = whether op v is scheduled at absolute modulo-schedule time t.
+#         x = {}
+#         for v in ops:
+#             for t in range(H - duration[v] + 1):
+#                 x[v, t] = model.NewBoolVar(f"x_{v}_{t}")
+
+#         # Each op is scheduled exactly once.
+#         for v in ops:
+#             model.AddExactlyOne(x[v, t] for t in range(H - duration[v] + 1))
+
+#         # M[v] = scheduled time of op v.
+#         M = {}
+#         for v in ops:
+#             M[v] = model.NewIntVar(0, H, f"M_{v}")
+#             model.Add(
+#                 M[v] == sum(t * x[v, t] for t in range(H - duration[v] + 1))
+#             )
+
+#         # Symmetry breaking: shift the whole schedule so the first consumer starts at 0.
+#         # Without this, equivalent shifted schedules may also be found.
+#         model.Add(M[ops[0]] == 0)
+#         # Dependency constraints:
+#         # M[v] + i*I >= M[u] + (i-δ)*I + d
+#         # => M[v] - M[u] + δ*I >= d
+#         for u, v, d, delta in edges:
+#             model.Add(M[v] - M[u] + delta * I >= d)
+
+#         # Modular resource capacity constraints.
+#         for r in range(I):
+#             for f, cap in capacity.items():
+#                 terms = []
+#                 for v in ops:
+#                     for t in range(H - duration[v] + 1):
+#                         for c in range(duration[v]):
+#                             usage = rrt[v][c].get(f, 0)
+#                             if usage and (t + c) % I == r:
+#                                 terms.append(usage * x[v, t])
+
+#                 if terms:
+#                     model.Add(sum(terms) <= cap)
+
+#         # Schedule length L = max(M[v] + duration[v]).
+#         end = {}
+#         for v in ops:
+#             end[v] = model.NewIntVar(0, H + duration[v], f"end_{v}")
+#             model.Add(end[v] == M[v] + duration[v])
+
+#         L = model.NewIntVar(0, H + max(duration.values()), "L")
+#         model.AddMaxEquality(L, [end[v] for v in ops])
+
+#         BIG = 100
+#         model.Minimize(BIG * L - sum(M[v] for v in ops))
+
+#         solver = cp_model.CpSolver()
+#         solver.parameters.max_time_in_seconds = 5
+#         status = solver.Solve(model)
+
+#         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+#             return None
+
+#         result = {
+#             "I": I,
+#             "L": solver.Value(L),
+#             "M": {v: solver.Value(M[v]) for v in ops},
+#         }
+
+#         # Build modular RRT table for printing.
+#         table = []
+#         for r in range(I):
+#             row = {"slot": f"{r} mod {I}"}
+#             for f in capacity:
+#                 row[f] = []
+#             for v in ops:
+#                 t = result["M"][v]
+#                 for c in range(duration[v]):
+#                     slot = (t + c) % I
+#                     if slot == r:
+#                         for f in capacity:
+#                             if rrt[v][c].get(f, 0):
+#                                 row[f].append(v)
+#             table.append(row)
+
+#         result["modular_rrt"] = table
+#         return result
+
+#     def solve_min_I(max_I: int = 6) -> List:
+#         # 从小到大寻找。如果可行，就直接输出I
+#         # 多个IL时，且 I<L 时，都返回。I==L 的情况无跨循环交叠，但可作为fallback备选（性能不太差）
+#         rets = []
+#         for I in range(1, max_I + 1):
+#             ans = solve_for_I(I)
+#             if ans is not None and ans["I"] < ans["L"]:
+#                 rets.append(ans)
+#                 break
+#         return rets
+
+#     results = None
+#     try:
+#         results = solve_min_I(
+#             max(_critical_path_upper_bound(), _resource_pressure_upper_bound())
+#         )
+#     except Exception as e :
+#         print(e, flush=True)
+#         return None
+#     print('solve done')
+#     if results is not None :
+#         print('ans not None')
+#         for ans in results :
+#             print("I =", ans["I"], flush=True)
+#             print("L =", ans["L"], flush=True)
+#             print("M =", ans["M"], flush=True)
+#             print("Modular RRT:")
+#             for row in ans["modular_rrt"]:
+#                 print(row)
+#     else:
+#         print('ans none')
+#     return results
 
 
 def _topo_sort_with_priority(

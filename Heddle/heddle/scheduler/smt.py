@@ -1,39 +1,21 @@
 """
-Heddle Scheduler (SMT-based modulo scheduler).
+Heddle Scheduler (modulo scheduler).
 
 Canonical import path:
   - `from heddle.scheduler.smt import HeddleScheduler, OpNode, ResourceType`
 
 Phase A: Find minimum II with dependency + FU capacity constraints.
-Phase B: Joint schedule + warp assignment + liveness (incl. incoming_live for
-         loop-carried deps) + register/SMEM capacity + spill cost + full
-         concurrency constraints + APLSP bound tightening.
+Phase B: CP-SAT joint schedule + warp assignment + liveness (incl.
+         incoming_live for loop-carried deps) + register/SMEM capacity
+         + spill cost + full concurrency constraints + APLSP bound tightening.
 """
 
 from __future__ import annotations
 
 import enum
-import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-
-# Thread-safe global call counter for unique Z3 variable names.
-# Z3 uses a global hash-cons table keyed by variable name.  When many solver
-# instances reuse the same names, the reference-counting can go wrong if
-# Python's GC frees a BoolRef/IntRef while a C-level Z3 struct still holds a
-# raw pointer to the same AST node (or vice-versa).  Unique names per call
-# eliminate the collision entirely at the cost of a small counter bump.
-_z3_call_counter_lock = threading.Lock()
-_z3_call_counter = 0
-
-def _next_call_id() -> int:
-    global _z3_call_counter
-    with _z3_call_counter_lock:
-        _z3_call_counter += 1
-        return _z3_call_counter
-
-import z3
 
 
 # ====================================================================== #
@@ -157,7 +139,7 @@ def _compute_aplsp(nodes: List[OpNode], idx: Dict[str, int], ii: int
 # ====================================================================== #
 
 class HeddleScheduler:
-    """SMT-based Modulo Scheduler for Hopper Pipelines."""
+    """Modulo scheduler for Hopper pipelines."""
 
     def __init__(
         self,
@@ -236,11 +218,9 @@ class HeddleScheduler:
     def _solve_phase_a(self, ii: int, *, optimize: bool) -> Optional[Dict[str, int]]:
         # Pure-Python ASAP modulo scheduler — no Z3.
         #
-        # Motivation: Z3 (v4.15.4) crashes during model evaluation when
-        # _solve_phase_b's z3.Optimize() runs first (global context state
-        # becomes corrupted). An ASAP longest-path solver is sufficient for
-        # Phase A's purpose (finding any valid schedule for ordering), and
-        # has no Z3 dependency that can be corrupted.
+        # Motivation: An ASAP longest-path solver is sufficient for Phase A's
+        # purpose (finding any valid schedule for ordering), and keeps this
+        # preliminary feasibility pass independent from the CP-SAT model below.
         #
         # Algorithm: Bellman-Ford longest-path to compute ASAP times.
         #   T[v] = max over parents p of (T[p] + latency[p] - delta[v,p] * ii)
@@ -303,19 +283,46 @@ class HeddleScheduler:
     # ================================================================== #
 
     def _solve_phase_b(self, ii: int, L: int, *, optimize: bool = True) -> Optional[Dict[str, object]]:
+        from ortools.sat.python import cp_model
+
         self._ensure_reservations()
         N = len(self.nodes)
         idx = {n.name: i for i, n in enumerate(self.nodes)}
         if N == 0:
-            return {"ii": ii, "schedule": {}, "warp_assign": {}, "reg_peak": {}}
+            return {"ii": ii, "window": L, "schedule": {}, "warp_assign": {}, "reg_peak": {}}
 
         W = max(self.num_warps, 1)
-        # 每次调用都给 Z3 变量加唯一前缀，避免不同 solver 调用之间
-        # 因变量名相同而在 Z3 全局 hash-cons 表里发生 AST 别名冲突。
-        p = _next_call_id()
-        solver: z3.Solver | z3.Optimize
-        solver = z3.Optimize() if optimize else z3.Solver()
-        solver.set("timeout", self.timeout_ms)
+        model = cp_model.CpModel()
+
+        def _false_var(name: str):
+            b = model.new_bool_var(name)
+            model.add(b == 0)
+            return b
+
+        def _true_var(name: str):
+            b = model.new_bool_var(name)
+            model.add(b == 1)
+            return b
+
+        def _or_var(name: str, lits):
+            lits = list(lits)
+            if not lits:
+                return _false_var(name)
+            b = model.new_bool_var(name)
+            model.add_bool_or(lits).only_enforce_if(b)
+            for lit in lits:
+                model.add_implication(lit, b)
+            return b
+
+        def _and_var(name: str, lits):
+            lits = list(lits)
+            if not lits:
+                return _true_var(name)
+            b = model.new_bool_var(name)
+            for lit in lits:
+                model.add_implication(b, lit)
+            model.add_bool_or([lit.negated() for lit in lits] + [b])
+            return b
 
         # ---- P3：APLSP 时间边界收紧 --------------------------------------
         aplsp = _compute_aplsp(self.nodes, idx, ii)
@@ -323,15 +330,15 @@ class HeddleScheduler:
         # P4 的对称性破除会在变量定义之后添加。
 
         # ---- 决策变量 ------------------------------------------------------
-        op: dict[tuple[int, int], z3.BoolRef] = {}
+        op = {}
         for v in range(N):
             for t in range(L):
-                op[(v, t)] = z3.Bool(f"PB{p}_op_v={v}_t={t}")
+                op[(v, t)] = model.new_bool_var(f"op_v={v}_t={t}")
 
-        warp: dict[tuple[int, int], z3.BoolRef] = {}
+        warp = {}
         for v in range(N):
             for w in range(W):
-                warp[(v, w)] = z3.Bool(f"PB{p}_warp_v={v}_w={w}")
+                warp[(v, w)] = model.new_bool_var(f"warp_v={v}_w={w}")
         
         # 特殊标记：是否是 variable latency 操作（如 TMA）。
         is_varialble_latency_op = [
@@ -341,14 +348,14 @@ class HeddleScheduler:
 
         # ---- 唯一启动时间 --------------------------------------------------
         for v in range(N):
-            solver.add(z3.Sum([z3.If(op[(v, t)], 1, 0) for t in range(L)]) == 1)
+            model.add_exactly_one(op[(v, t)] for t in range(L))
 
         # ---- warp 分配（支持多 warp op 和可复制 op） -----------------------
         for v in range(N):
             nd = self.nodes[v]
             wc = max(nd.warp_count, 1)
             if nd.replicable or wc == 1:
-                solver.add(z3.Sum([z3.If(warp[(v, w)], 1, 0) for w in range(W)]) == 1)
+                model.add_exactly_one(warp[(v, w)] for w in range(W))
             else:
                 if wc > W:
                     return None
@@ -367,19 +374,21 @@ class HeddleScheduler:
                     return None
 
                 starts = {
-                    s: z3.Bool(f"PB{p}_warp_start_v={v}_w={s}")
+                    s: model.new_bool_var(f"warp_start_v={v}_w={s}")
                     for s in start_slots
                 }
-                solver.add(z3.Sum([z3.If(st, 1, 0) for st in starts.values()]) == 1)
+                model.add_exactly_one(starts.values())
                 for w in range(W):
                     covering_starts = [
                         starts[s]
                         for s in start_slots
                         if s <= w < s + wc
                     ]
-                    solver.add(warp[(v, w)] == (
-                        z3.Or(covering_starts) if covering_starts else z3.BoolVal(False)
-                    ))
+                    if covering_starts:
+                        model.add_max_equality(warp[(v, w)], covering_starts)
+                    else:
+                        model.add(warp[(v, w)] == 0)
+
         # 对于 variable latency op，应将它们放到同一个 warpgroup 内。
         # 这里按 Hopper warpgroup 语义建模：warpId // 4 相同。
         variable_latency_ops = [
@@ -395,7 +404,10 @@ class HeddleScheduler:
                 for wu in range(W):
                     for wv in range(W):
                         if wu // 4 != wv // 4:
-                            solver.add(z3.Not(z3.And(warp[(u, wu)], warp[(v, wv)])))
+                            model.add_bool_or([
+                                warp[(u, wu)].negated(),
+                                warp[(v, wv)].negated(),
+                            ])
 
         # variable latency op（如 TMA）需要和其他op分配到不同 warpgroup。
 
@@ -404,10 +416,15 @@ class HeddleScheduler:
                 for wu in range(W):
                     for wv in range(W):
                         if wu // 4 == wv // 4:
-                            solver.add(z3.Not(z3.And(warp[(u, wu)], warp[(v, wv)])))
+                            model.add_bool_or([
+                                warp[(u, wu)].negated(),
+                                warp[(v, wv)].negated(),
+                            ])
         
         # ---- 整数启动时间表达式 -------------------------------------------
-        Tv = [z3.Sum([z3.If(op[(v, t)], t, 0) for t in range(L)]) for v in range(N)]
+        Tv = [model.new_int_var(0, L - 1, f"T_v={v}") for v in range(N)]
+        for v in range(N):
+            model.add(Tv[v] == sum(t * op[(v, t)] for t in range(L)))
 
         # debug : 去掉 APLSP 的时间下界收紧
         # # ---- P3：由 APLSP 推导出的时间下界 -------------------------------
@@ -438,15 +455,21 @@ class HeddleScheduler:
                 spill_cost = max((o.spill_cost for o in par.outputs), default=0)
 
                 if spill_cost > 0 and W > 1:
-                    same_w = z3.Or([z3.And(warp[(ui, w)], warp[(vi, w)]) for w in range(W)])
+                    same_pairs = [
+                        _and_var(f"same_pair_u={ui}_v={vi}_w={w}", [warp[(ui, w)], warp[(vi, w)]])
+                        for w in range(W)
+                    ]
+                    same_w = _or_var(f"same_w_u={ui}_v={vi}", same_pairs)
                     if self.disallow_spills:
-                        solver.add(same_w)
-                        solver.add(Tv[vi] - Tv[ui] >= base_delay - delta * ii)
+                        model.add(same_w == 1)
+                        model.add(Tv[vi] - Tv[ui] >= base_delay - delta * ii)
                     else:
-                        eff = z3.If(same_w, base_delay, base_delay + spill_cost)
-                        solver.add(Tv[vi] - Tv[ui] >= eff - delta * ii)
+                        model.add(Tv[vi] - Tv[ui] >= base_delay - delta * ii).only_enforce_if(same_w)
+                        model.add(
+                            Tv[vi] - Tv[ui] >= base_delay + spill_cost - delta * ii
+                        ).only_enforce_if(same_w.negated())
                 else:
-                    solver.add(Tv[vi] - Tv[ui] >= base_delay - delta * ii)
+                    model.add(Tv[vi] - Tv[ui] >= base_delay - delta * ii)
 
                 # P2：blocking sync 的完整并发约束。
                 # 这种边不仅要求时间顺序，还会约束相关 warp 的覆盖关系；
@@ -454,8 +477,7 @@ class HeddleScheduler:
                 if edge and edge.blocking_sync:
                     if W > 1:
                         for w in range(W):
-                            solver.add(z3.Implies(
-                                warp[(ui, w)], warp[(vi, w)]))
+                            model.add_implication(warp[(ui, w)], warp[(vi, w)])
                     lat_u = max(int(par.latency), 1)
                     for w in range(W):
                         for other in range(N):
@@ -469,10 +491,12 @@ class HeddleScheduler:
                                 for to in range(max(0, t - base_delay - lat_o + 1), t + 1):
                                     if to >= L:
                                         continue
-                                    solver.add(z3.Implies(
-                                        z3.And(op[(vi, t)], warp[(vi, w)],
-                                               op[(other, to)]),
-                                        z3.Not(warp[(other, w)])))
+                                    model.add_bool_or([
+                                        op[(vi, t)].negated(),
+                                        warp[(vi, w)].negated(),
+                                        op[(other, to)].negated(),
+                                        warp[(other, w)].negated(),
+                                    ])
 
         # P2：spill 并发约束。
         # 当 producer/consumer 分配到不同 warp，且 producer 输出带 spill_cost
@@ -497,10 +521,13 @@ class HeddleScheduler:
                                     for to in range(max(0, t - sc + 1), t + 1):
                                         if to >= L:
                                             continue
-                                        solver.add(z3.Implies(
-                                            z3.And(warp[(ui, w_src)], warp[(vi, w_dst)],
-                                                   op[(vi, t)], op[(other, to)]),
-                                            z3.Not(warp[(other, w_dst)])))
+                                        model.add_bool_or([
+                                            warp[(ui, w_src)].negated(),
+                                            warp[(vi, w_dst)].negated(),
+                                            op[(vi, t)].negated(),
+                                            op[(other, to)].negated(),
+                                            warp[(other, w_dst)].negated(),
+                                        ])
 
         # ---- FU 容量约束 ---------------------------------------------------
         expanded = self._fold_reservations(ii)
@@ -511,11 +538,11 @@ class HeddleScheduler:
                     for l in range(ii):
                         c = int(expanded[v][l].get(r, 0))
                         if c:
-                            tp = (t - l) % ii
-                            if tp < L:
-                                terms.append(z3.If(op[(v, tp)], c, 0))
+                            for tp in range(L):
+                                if (tp + l) % ii == t % ii:
+                                    terms.append(c * op[(v, tp)])
                 if terms:
-                    solver.add(z3.Sum(terms) <= int(cap))
+                    model.add(sum(terms) <= int(cap))
 
         # ---- 活跃区间、P1 incoming_live 和容量约束 ------------------------
         all_outputs: list[tuple[int, OutputValue]] = []
@@ -544,18 +571,18 @@ class HeddleScheduler:
 
         if all_outputs and self.reg_limit > 0:
             # live[xi, tau]：第 xi 个输出在第 0 轮迭代的 tau 时刻是否 live。
-            live: dict[tuple[int, int], z3.BoolRef] = {}
+            live = {}
             for xi in range(len(all_outputs)):
                 for tau in range(L):
-                    live[(xi, tau)] = z3.Bool(f"PB{p}_live_x={xi}_t={tau}")
+                    live[(xi, tau)] = model.new_bool_var(f"live_x={xi}_t={tau}")
 
             # P1：incoming_live[xi, tau] 表示跨迭代值 xi 是否在 tau 时刻
             # 仍然由“上一轮迭代”带入并保持 live，用于统计跨迭代寄存器压力。
-            incoming_live: dict[tuple[int, int], z3.BoolRef] = {}
+            incoming_live = {}
             if self.include_incoming_live:
                 for xi in loop_carried:
                     for tau in range(L):
-                        incoming_live[(xi, tau)] = z3.Bool(f"PB{p}_ilive_x={xi}_t={tau}")
+                        incoming_live[(xi, tau)] = model.new_bool_var(f"ilive_x={xi}_t={tau}")
 
             # ---- 活跃区间约束 ---------------------------------------------
             for xi, (producer_v, oval) in enumerate(all_outputs):
@@ -563,7 +590,10 @@ class HeddleScheduler:
                 producer_lat = int(self.nodes[producer_v].latency)
 
                 for tau in range(L):
-                    produced_by = z3.Or([op[(producer_v, t)] for t in range(tau + 1)])
+                    produced_by = _or_var(
+                        f"produced_x={xi}_t={tau}",
+                        [op[(producer_v, t)] for t in range(tau + 1)],
+                    )
 
                     if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY:
                         if same_iter_consumers:
@@ -572,20 +602,38 @@ class HeddleScheduler:
                             # 因此判断“是否已消费完”时必须严格早于 tau。
                             # 这个语义对应 Twill warpspecialization.rs L371-409。
                             if producer_lat == 0:
-                                all_consumed = z3.And([
-                                    z3.Or([op[(cv, tc)] for tc in range(tau)])
+                                all_consumed = _and_var(f"consumed_x={xi}_t={tau}", [
+                                    _or_var(
+                                        f"consumer_started_x={xi}_cv={cv}_t={tau}",
+                                        [op[(cv, tc)] for tc in range(tau)],
+                                    )
                                     for cv, _ in same_iter_consumers
-                                ]) if tau > 1 else z3.BoolVal(False)
+                                ]) if tau > 1 else _false_var(f"consumed_false_x={xi}_t={tau}")
                             else:
-                                all_consumed = z3.And([
-                                    z3.Or([op[(cv, tc)] for tc in range(tau + 1)])
+                                all_consumed = _and_var(f"consumed_x={xi}_t={tau}", [
+                                    _or_var(
+                                        f"consumer_started_x={xi}_cv={cv}_t={tau}",
+                                        [op[(cv, tc)] for tc in range(tau + 1)],
+                                    )
                                     for cv, _ in same_iter_consumers
-                                ]) if tau > 0 else z3.BoolVal(False)
-                            solver.add(live[(xi, tau)] == z3.And(produced_by, z3.Not(all_consumed)))
+                                ]) if tau > 0 else _false_var(f"consumed_false_x={xi}_t={tau}")
+                            model.add_bool_or([
+                                live[(xi, tau)].negated(),
+                                produced_by,
+                            ])
+                            model.add_bool_or([
+                                live[(xi, tau)].negated(),
+                                all_consumed.negated(),
+                            ])
+                            model.add_bool_or([
+                                produced_by.negated(),
+                                all_consumed,
+                                live[(xi, tau)],
+                            ])
                         else:
-                            solver.add(live[(xi, tau)] == z3.BoolVal(False))
+                            model.add(live[(xi, tau)] == 0)
                     else:
-                        solver.add(live[(xi, tau)] == produced_by)
+                        model.add(live[(xi, tau)] == produced_by)
 
                 # P1：为跨迭代值建立 incoming_live。
                 if self.include_incoming_live and xi in loop_carried:
@@ -594,13 +642,16 @@ class HeddleScheduler:
                         if cross_iter_consumers:
                             # 如果第 0 轮迭代中仍有消费者在 tau 时刻前尚未启动，
                             # 那么来自上一轮的值在 tau 时刻仍需要保持 live。
-                            some_consumer_pending = z3.Or([
-                                z3.Not(z3.Or([op[(cv, tc)] for tc in range(tau + 1)]))
+                            some_consumer_pending = _or_var(f"pending_x={xi}_t={tau}", [
+                                _or_var(
+                                    f"consumer_not_started_x={xi}_cv={cv}_t={tau}",
+                                    [op[(cv, tc)] for tc in range(tau + 1)],
+                                ).negated()
                                 for cv, _ in cross_iter_consumers
-                            ]) if tau > 0 else z3.BoolVal(True)
-                            solver.add(incoming_live[(xi, tau)] == some_consumer_pending)
+                            ]) if tau > 0 else _true_var(f"pending_true_x={xi}_t={tau}")
+                            model.add(incoming_live[(xi, tau)] == some_consumer_pending)
                         else:
-                            solver.add(incoming_live[(xi, tau)] == z3.BoolVal(False))
+                            model.add(incoming_live[(xi, tau)] == 0)
 
             # ---- 每个 warp、每个时间步的寄存器容量约束 --------------------
             for w in range(W):
@@ -610,16 +661,22 @@ class HeddleScheduler:
                         if oval.storage != StorageKind.RMEM or oval.footprint_bytes <= 0:
                             continue
                         # 同一轮迭代内的 live 值。
+                        live_on_warp = _and_var(
+                            f"live_on_warp_x={xi}_w={w}_t={tau}",
+                            [warp[(pv, w)], live[(xi, tau)]],
+                        )
                         rmem_terms.append(
-                            z3.If(z3.And(warp[(pv, w)], live[(xi, tau)]),
-                                  oval.footprint_bytes, 0))
+                            oval.footprint_bytes * live_on_warp)
                         # P1：跨迭代 live 值，计入 producer 所在 warp 的压力。
                         if self.include_incoming_live and xi in loop_carried:
+                            incoming_on_warp = _and_var(
+                                f"ilive_on_warp_x={xi}_w={w}_t={tau}",
+                                [warp[(pv, w)], incoming_live[(xi, tau)]],
+                            )
                             rmem_terms.append(
-                                z3.If(z3.And(warp[(pv, w)], incoming_live[(xi, tau)]),
-                                      oval.footprint_bytes, 0))
+                                oval.footprint_bytes * incoming_on_warp)
                     if rmem_terms:
-                        solver.add(z3.Sum(rmem_terms) <= self.reg_limit)
+                        model.add(sum(rmem_terms) <= self.reg_limit)
 
             # ---- SMEM 容量约束（全局统计，也包含 incoming_live） ----------
             for tau in range(L):
@@ -627,40 +684,38 @@ class HeddleScheduler:
                 for xi, (pv, oval) in enumerate(all_outputs):
                     if oval.storage != StorageKind.SMEM or oval.footprint_bytes <= 0:
                         continue
-                    smem_terms.append(z3.If(live[(xi, tau)], oval.footprint_bytes, 0))
+                    smem_terms.append(oval.footprint_bytes * live[(xi, tau)])
                     if self.include_incoming_live and xi in loop_carried:
                         smem_terms.append(
-                            z3.If(incoming_live[(xi, tau)], oval.footprint_bytes, 0))
+                            oval.footprint_bytes * incoming_live[(xi, tau)])
                 if smem_terms:
-                    solver.add(z3.Sum(smem_terms) <= self.smem_limit)
+                    model.add(sum(smem_terms) <= self.smem_limit)
 
         # ---- 优化目标：偏好更紧凑的调度 -------------------------------
         if optimize:
-            mx = z3.Int(f"PB{p}_max_T")
-            solver.add(mx >= 0)
-            for texpr in Tv:
-                solver.add(mx >= texpr)
-            solver.minimize(mx)
-            if Tv:
-                solver.minimize(z3.Sum(Tv))
+            mx = model.new_int_var(0, L - 1, "max_T")
+            model.add_max_equality(mx, Tv)
+            model.minimize(L * N * mx + sum(Tv))
 
         # ---- 求解 ---------------------------------------------------------
-        if solver.check() != z3.sat:
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = max(float(self.timeout_ms) / 1000.0, 0.001)
+        solver.parameters.num_workers = 4
+        status = solver.solve(model)
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             return None
-
-        model = solver.model()
 
         schedule = {}
         for v in range(N):
             for t in range(L):
-                if z3.is_true(model.eval(op[(v, t)])):
+                if solver.value(op[(v, t)]):
                     schedule[self.nodes[v].name] = t
                     break
 
         warp_assign = {}
         for v in range(N):
             for w in range(W):
-                if z3.is_true(model.eval(warp[(v, w)])):
+                if solver.value(warp[(v, w)]):
                     warp_assign[self.nodes[v].name] = w
                     break
 
@@ -673,10 +728,10 @@ class HeddleScheduler:
                     for xi, (pv, oval) in enumerate(all_outputs):
                         if oval.storage != StorageKind.RMEM:
                             continue
-                        owned = z3.is_true(model.eval(warp[(pv, w)]))
-                        is_live = z3.is_true(model.eval(live[(xi, tau)]))
+                        owned = bool(solver.value(warp[(pv, w)]))
+                        is_live = bool(solver.value(live[(xi, tau)]))
                         is_incoming = (self.include_incoming_live and xi in loop_carried and
-                                       z3.is_true(model.eval(incoming_live[(xi, tau)])))
+                                       bool(solver.value(incoming_live[(xi, tau)])))
                         if owned and (is_live or is_incoming):
                             total += oval.footprint_bytes
                     peak = max(peak, total)
