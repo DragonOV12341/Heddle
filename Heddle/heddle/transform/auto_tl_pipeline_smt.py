@@ -262,6 +262,57 @@ def _is_wgmma_call(call: tvm.tir.Call) -> bool:
     return False
 
 
+def _parse_wgmma_mnk_from_string(s: str) -> Optional[Tuple[int, int, int]]:
+    m = re.search(r"\bm(\d+)n(\d+)k(\d+)\b", s)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def _parse_wgmma_kind_from_string(s: str) -> Optional[str]:
+    if re.search(r"(?:^|[_:])wgmma_ss(?:[<_]|$)", s):
+        return "ss"
+    if re.search(r"(?:^|[_:])wgmma_rs(?:[<_]|$)", s):
+        return "rs"
+    return None
+
+
+def _wgmma_call_kind(call: tvm.tir.Call) -> Optional[str]:
+    if not isinstance(call.op, tvm.ir.Op):
+        return None
+
+    op_name = call.op.name
+    if op_name == "tl.ptx_wgmma_ss":
+        return "ss"
+    if op_name == "tl.ptx_wgmma_rs":
+        return "rs"
+    if op_name == "tir.call_extern" and call.args and isinstance(call.args[0], tvm.tir.StringImm):
+        return _parse_wgmma_kind_from_string(call.args[0].value)
+    return None
+
+
+def _wgmma_call_mnk(call: tvm.tir.Call) -> Optional[Tuple[int, int, int]]:
+    if not isinstance(call.op, tvm.ir.Op):
+        return None
+
+    op_name = call.op.name
+    if op_name in {"tl.ptx_wgmma_ss", "tl.ptx_wgmma_rs"}:
+        if call.args and isinstance(call.args[0], tvm.tir.StringImm):
+            return _parse_wgmma_mnk_from_string(call.args[0].value)
+        return None
+
+    if op_name == "tir.call_extern" and call.args and isinstance(call.args[0], tvm.tir.StringImm):
+        return _parse_wgmma_mnk_from_string(call.args[0].value)
+
+    return None
+
+
+def _wgmma_call_desc(call: tvm.tir.Call) -> Optional[Tuple[str, Optional[Tuple[int, int, int]]]]:
+    if not _is_wgmma_call(call):
+        return None
+    return _wgmma_call_kind(call) or "unknown", _wgmma_call_mnk(call)
+
+
 def _is_tma_call(call: tvm.tir.Call) -> bool:
     if not isinstance(call.op, tvm.ir.Op):
         return False
@@ -298,6 +349,64 @@ def _count_calls_with_static_loop_multiplier(stmt: tvm.tir.Stmt, pred) -> int:
 
 def _count_wgmma_ops_with_static_loop_multiplier(stmt: tvm.tir.Stmt) -> int:
     return _count_calls_with_static_loop_multiplier(stmt, _is_wgmma_call)
+
+
+def _collect_wgmma_mnks_with_static_loop_multiplier(stmt: tvm.tir.Stmt) -> Dict[Tuple[int, int, int], int]:
+    mnks: Dict[Tuple[int, int, int], int] = {}
+    loop_multiplier = 1
+
+    @tir.functor.visitor
+    class CollectVisitor(tir.PyStmtExprVisitor):
+        def visit_for_(self, op):
+            nonlocal loop_multiplier
+            extent = _static_positive_int(op.extent)
+            if extent is None:
+                super().visit_for_(op)
+                return
+
+            prev = loop_multiplier
+            loop_multiplier *= extent
+            super().visit_for_(op)
+            loop_multiplier = prev
+
+        def visit_call_(self, call):
+            mnk = _wgmma_call_mnk(call)
+            if mnk is not None:
+                mnks[mnk] = mnks.get(mnk, 0) + loop_multiplier
+            super().visit_call_(call)
+
+    CollectVisitor().visit_stmt(stmt)
+    return mnks
+
+
+def _collect_wgmma_descs_with_static_loop_multiplier(
+    stmt: tvm.tir.Stmt,
+) -> Dict[Tuple[str, Optional[Tuple[int, int, int]]], int]:
+    descs: Dict[Tuple[str, Optional[Tuple[int, int, int]]], int] = {}
+    loop_multiplier = 1
+
+    @tir.functor.visitor
+    class CollectVisitor(tir.PyStmtExprVisitor):
+        def visit_for_(self, op):
+            nonlocal loop_multiplier
+            extent = _static_positive_int(op.extent)
+            if extent is None:
+                super().visit_for_(op)
+                return
+
+            prev = loop_multiplier
+            loop_multiplier *= extent
+            super().visit_for_(op)
+            loop_multiplier = prev
+
+        def visit_call_(self, call):
+            desc = _wgmma_call_desc(call)
+            if desc is not None:
+                descs[desc] = descs.get(desc, 0) + loop_multiplier
+            super().visit_call_(call)
+
+    CollectVisitor().visit_stmt(stmt)
+    return descs
 
 
 def _count_tma_ops_with_static_loop_multiplier(stmt: tvm.tir.Stmt) -> int:
@@ -464,6 +573,69 @@ def _touches_external_non_shared_global(
             return True
     return False
 
+from heddle.scheduler.smt import ResourceType  # type: ignore
+class OpIssueAndLatencyTable :
+    
+    # 指令的发射延迟
+    @staticmethod
+    def get_issue_execute_cycle(opTy : ResourceType, desc_info : List) -> List[int, int] :  # issue, execute
+        if opTy is ResourceType.TensorCore :
+            '''
+            rs & ss diff :
+            SM90_64xNx16_F32F16F16_SS   M=64,N=64,K=16 elapsed_time: 2.87264ms 4.56277TFLOPS, latancy=32.0051
+            SM90_64xNx16_F32F16F16_SS   M=64,N=32,K=16 elapsed_time: 2.15971ms 3.03448TFLOPS, latancy=24.0035
+            SM90_64xNx16_F32F16F16_RS   M=64,N=32,K=16 elapsed_time: 1.45213ms 4.5131TFLOPS, latancy=16.0041
+            SM90_64xNx16_F32F16F16_SS   M=64,N=16,K=16 elapsed_time: 1.80304ms 1.81738TFLOPS, latancy=20.0044
+            SM90_64xNx16_F32F16F16_RS   M=64,N=16,K=16 elapsed_time: 1.18122ms 2.77409TFLOPS, latancy=13.0048
+            SM90_64xNx16_F32F16F16_SS   M=64,N=8,K=16 elapsed_time: 1.62624ms 1.00748TFLOPS, latancy=18.0046
+            SM90_64xNx16_F32F16F16_RS   M=64,N=8,K=16 elapsed_time: 1.18074ms 1.38761TFLOPS, latancy=13.005
+
+            rs & ss same :
+            SM90_64xNx16_F16F16F16_SS   M=64,N=256,K=16  elapsed_time: 11.4083ms 4.59568TFLOPS, latancy=128.003
+            SM90_64xNx8_F32TF32TF32_SS_TN   M=64,N=256,K=8  elapsed_time: 11.4115ms 2.29719TFLOPS, latancy=128.005
+            SM90_64xNx32_F32E4M3E4M3_SS_TN   M=64,N=256,K=32  elapsed_time: 11.4289ms 9.17481TFLOPS, latancy=128.005
+            SM90_64xNx16_F32F16F16_SS   M=64,N=256,K=16 elapsed_time: 11.4108ms 4.59467TFLOPS, latancy=128.005
+            SM90_64xNx16_F32F16F16_SS   M=64,N=128,K=16 elapsed_time: 5.71731ms 4.58509TFLOPS, latancy=64.0046
+            
+            该表格实际包含了issue + execute。真实 issue/execute 需求解：
+            设 m64n8k16 发射为I，执行为T: 
+            m64n8k16 -> I+T = 18 
+            m64n32k16 -> 4*I + T1 = 24    
+            m64n256k16  ->   32*I + T2 = 128  
+            m64n64k16 : 8*I+T3 = 32 
+            
+            通过两两比对，且假定 mnk 规模越大，T越久，I严格遵守正比关系，那么:
+            3*I + T1 - T = 3*I + (4*delta-1)*T  = 6  
+            31*I + T2-T = 31*I + (32*delta-1)*T = 110
+            7*I+T3 - T = 7*I+ (8*delta-1)*T = 14  
+            
+            差距过大，说明 I 之间存在比例关系， T也有比例关系
+            
+            '''
+            [mnk_key, kind] = desc_info
+            _table ={
+                                # ss_total,rs_total, issue_estimated
+                "m64n32k16" :   [24,  16 , 4] ,
+                "m64n16k16" :   [20,  13,  2],
+                "m64n8k16" :    [18,  13 , 1] ,
+                "m64n256k16"  : [128, 128, 32] ,
+                "m64n256k8"  :  [128, 128, 16] ,
+                "m64n256k32"  : [128, 128, 64] ,
+                "m64n256k16" :  [128, 128, 32] ,
+                "m64n128k16" :  [64 , 64, 16] ,
+                "m64n64k16" :   [32 , 32,  8] ,
+            }
+            row = _table.get(mnk_key)
+            return [row[2], row[kind] - row[2]]  # 执行周期需要减掉发射周期
+        
+        if opTy is ResourceType.TMA :
+            return [1, 280]
+        if opTy is ResourceType.ALU :
+            return [1,4]
+        if opTy is ResourceType.SFU :
+            return [1,18]
+
+
 
 def _detect_op_latency_and_resource(stmt: tvm.tir.Stmt) -> tuple:
     """Detect operation type and return (latency, ResourceType).
@@ -483,11 +655,39 @@ def _detect_op_latency_and_resource(stmt: tvm.tir.Stmt) -> tuple:
 
     wgmma_op_count = _count_wgmma_ops_with_static_loop_multiplier(stmt)
     if wgmma_op_count > 0:
-        return 27 * wgmma_op_count, ResourceType.TensorCore
+        idx = 0  # ss=0, rs = 1
+        mnk_key = ""
+        wgmma_descs = _collect_wgmma_descs_with_static_loop_multiplier(stmt)
+        if wgmma_descs:
+            desc_parts = []
+            for (kind, mnk), count in sorted(wgmma_descs.items()):
+                if mnk is None:
+                    desc_parts.append(f"{kind}:unknownx{count}")
+                else:
+                    m, n, k = mnk
+                    mnk_key = f"m{m}n{n}k{k}"
+                    desc_parts.append(f"{kind}:m{m}n{n}k{k}x{count}")
+                    if kind == 'rs':
+                        idx = 1
+                    elif kind == 'ss':
+                        idx = 0
+                    else:
+                        assert False, f"invalid kind detected - {kind}"
+            desc_str = ", ".join(desc_parts)
+        else:
+            desc_str = "unknown"
+        # print(f'[d] wgmma_op_count = {wgmma_op_count}, wgmma_desc = {desc_str}, stmt = {stmt.script()}' )
+        # print('--------------\n')
+        # 单个wgmma执行周期
+        [issue , execute] = OpIssueAndLatencyTable.get_issue_execute_cycle(ResourceType.TensorCore, [mnk_key,idx] )
+        # 循环：不能简单xN。 正确计算方式 = interval * (N-1) + Latency, 这里 interval 简化为等于issue_time
+        return issue * wgmma_op_count + execute, ResourceType.TensorCore
 
     tma_op_count = _count_tma_ops_with_static_loop_multiplier(stmt)
     if tma_op_count > 0:
-        return 20 * tma_op_count, ResourceType.TMA
+        [issue, execute] = OpIssueAndLatencyTable.get_issue_execute_cycle(ResourceType.TMA, [])
+        return  execute, ResourceType.TMA
+        # return 20 * tma_op_count, ResourceType.TMA
 
     op_names = _call_op_names(stmt)
     

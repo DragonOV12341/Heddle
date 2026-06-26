@@ -391,9 +391,10 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
     # duration 代表发射占用时长（Issue Cycle），单发射模型下统一为 1
     duration = { key : 1 for key in ops }
     
-    # ---------------------------------------------------------
-    # 【修改点 1】引入 latencies 字典，用于记录真实的计算/写回时延
-    # ---------------------------------------------------------
+    # 硬件发射槽位容量模型 
+    capacity = { "TMA": 255, "TC": 1, "ALU": 64, "SFU": 16 }
+    
+    # latencies - 指令执行耗时
     latencies = {} 
     rrt = {}
     estimated_total_latency = 0
@@ -402,23 +403,28 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         info = infos[idx]
         if info.is_wait_barrier:
             # mbarrier_wait 必须单独放一个 slot
-            rrt[info.idx] = [{"TMA": 1, "TC": 1, "ALU": 1, "SFU": 1 }]
+            rrt[info.idx] = [capacity]
             latencies[info.idx] = 1  # 屏障等待本身阻塞发射或紧邻同步，设为 1
             estimated_total_latency += 1
-        elif info.is_true_tma:
-            rrt[info.idx] = [{"TMA" : 1}]
-            # TMA 是异步指令，发射只需 1 周期，真实数据就绪依赖 barrier，此处发射层面设为 1
-            latencies[info.idx] = 1 
-            estimated_total_latency += 1
+        # elif info.is_true_tma:
+        #     rrt[info.idx] = [{"TMA" : 1}]
+        #     # TMA 是异步指令，发射只需 1 周期，真实数据就绪依赖 barrier，此处发射层面设为 1
+        #     latencies[info.idx] = 280
+        #     estimated_total_latency += 1
         else:
             latency, rty = _detect_op_latency_and_resource(info.stmt)
             rrt[info.idx] = [{rty.value : 1}]
-            latencies[info.idx] = latency  # 记录真实的硬件执行延迟（如 TC=16, ALU=4 等）
+            latencies[info.idx] = latency  # 记录真实的硬件执行延迟
             estimated_total_latency += latency
-    # 硬件发射槽位容量模型
-    capacity = {
-        "TMA": 1, "TC": 1, "ALU": 1, "SFU": 1 
-    }
+
+    
+    # capacity = {
+    #     "TMA": 1, "TC": 1, "ALU": 1, "SFU": 1 
+    # }
+    
+    # 运行时指令容量限制 - 运行中的指令不得超过 FU 个数。 TMA 另外考虑
+    fu_caps = {"TC": 1, "SFU": 16, "ALU": 64, "TMA": 255}
+
     print(f"-------- {latencies=}")
     
     def solve_for_I(I: int):
@@ -493,7 +499,8 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
 
                 if terms:
                     model.Add(sum(terms) <= cap)
-
+        # TODO : 运行中的指令，其所在FU不应超过 fu_caps的限制 （比如：ALU指令只能同时执行一个）
+        
         # Schedule length L = max(M[v] + duration[v]).
         # 注：如果你希望 L 代表全流水线完全排空（包含最后一条指令执行完）的长度，
         # 可以把这里的 duration[v] 替换为 latencies[v]。
@@ -1231,6 +1238,12 @@ def _solve_smt_joint_optimize(
         latency, _ = _detect_op_latency_and_resource(info.stmt)
         return max(int(latency), 1)
 
+    def _dependency_delay_for_info(info: _StmtInfo) -> int:
+        if getattr(info, "is_wait_barrier", False):
+            return 1
+        latency, _ = _detect_op_latency_and_resource(info.stmt)
+        return max(int(latency), 1)
+
     def _reservation_for_info(info: _StmtInfo, rty: ResourceType) -> List[Dict[ResourceType, int]]:
         # wait/try_wait barrier 会阻塞当前发射 warp；这里把它建模成
         # 占满所有 FU 的独占 issue slot，和 _solve_naive_modulo_sched 保持一致。
@@ -1294,6 +1307,7 @@ def _solve_smt_joint_optimize(
             node_by_idx[v].add_dependency(
                 node_by_idx[u],
                 distance=0,
+                delay=_dependency_delay_for_info(infos[u]),
             )
 
     # 跨迭代 hazard 与 _solve_naive_modulo_sched 保持一致：
@@ -1304,9 +1318,17 @@ def _solve_smt_joint_optimize(
         write_bufs = {wr.buffer.name for wr in info.writes}
         read_bufs = {rd.buffer.name for rd in info.reads}
         if write_bufs & read_bufs:
-            node_by_idx[idx].add_dependency(node_by_idx[idx], distance=1)
+            node_by_idx[idx].add_dependency(
+                node_by_idx[idx],
+                distance=1,
+                delay=_dependency_delay_for_info(info),
+            )
         if info.is_sync_top and info.is_sync_nested:
-            node_by_idx[idx].add_dependency(node_by_idx[idx], distance=1)
+            node_by_idx[idx].add_dependency(
+                node_by_idx[idx],
+                distance=1,
+                delay=_dependency_delay_for_info(info),
+            )
 
     capacity = {
         ResourceType.TMA: 1,
@@ -1383,6 +1405,9 @@ def _solve_smt_joint_optimize(
             optimized_M[idx] = int(base_M[idx])
 
     optimized_L = max((t + 1 for t in optimized_M.values()), default=0)
+    print(f'---{optimized_L=}')
+    print(f'---{base_I=}')
+    print(f'---{optimized_M=}')
 
     table = []
     for r in range(base_I):
@@ -2121,7 +2146,7 @@ def _transform_pipeline_loop(
             return None
 
         # Unwrap to SeqStmt
-        print('----- stmt :\n', stmt.script())
+        # print('----- stmt :\n', stmt.script())
 
         seq, local_buf_map = _unwrap_to_seqstmt(stmt.body)
         if seq is None or len(seq.seq) < 2:

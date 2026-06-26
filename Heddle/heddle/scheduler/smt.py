@@ -52,6 +52,7 @@ class OutputValue:
 @dataclass
 class EdgeInfo:
     blocking_sync: bool = False
+    delay: Optional[int] = None
 
 
 @dataclass
@@ -76,12 +77,14 @@ class OpNode:
     is_varialble_latency : bool = False
 
     def add_dependency(self, parent: "OpNode", distance: int = 0,
-                       blocking_sync: bool = False):
+                       blocking_sync: bool = False,
+                       delay: Optional[int] = None):
         self.parents.append(parent)
         parent.children.append(self)
         self.dependency_distance[parent.name] = distance
         self.edge_info[parent.name] = EdgeInfo(
             blocking_sync=blocking_sync,
+            delay=delay,
         )
 
 
@@ -486,8 +489,8 @@ class HeddleScheduler:
             for par in v_node.parents:
                 ui = idx[par.name]
                 delta = int(v_node.dependency_distance.get(par.name, 0))
-                base_delay = int(par.latency)
                 edge = v_node.edge_info.get(par.name)
+                base_delay = int(edge.delay) if edge and edge.delay is not None else int(par.latency)
 
                 spill_cost = max((o.spill_cost for o in par.outputs), default=0)
 
