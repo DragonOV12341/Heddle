@@ -391,7 +391,7 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
     # duration 代表发射占用时长（Issue Cycle），单发射模型下统一为 1
     duration = { key : 1 for key in ops }
     
-    # 硬件发射槽位容量模型 
+    # 硬件发射槽位容量模型 （TMA暂且认为无发射限制。其受带宽影响）
     capacity = { "TMA": 255, "TC": 1, "ALU": 64, "SFU": 16 }
     
     # latencies - 指令执行耗时
@@ -1336,12 +1336,18 @@ def _solve_smt_joint_optimize(
         ResourceType.ALU: 1,
         ResourceType.SFU: 1,
     }
+    fu_caps = {
+        ResourceType.TMA: 1,
+        ResourceType.TensorCore: 1,
+        ResourceType.ALU: 64,
+        ResourceType.SFU: 16,
+    }
     nwarps = _get_warpgroup_count_from_info()
     mod_sched_plan['num_warps'] = nwarps
     print(f'---- num_warps = {nwarps}')
     num_warps = max(1, int(mod_sched_plan.get("num_warps", 1)))
-    reg_limit = int(mod_sched_plan.get("reg_limit", 65536))
-    smem_limit = int(mod_sched_plan.get("smem_limit", 227 * 1024))
+    reg_limit = int(mod_sched_plan.get("reg_limit", 32* 240 * 4)) # ~255*90%*4 bytes per warp
+    smem_limit = int(mod_sched_plan.get("smem_limit", 48 * 1024))  # 48K bytes for CTA
 
     # SMT 优化器使用 naive plan 的基础窗口；如果 naive 的绝对调度时间
     # 比记录的 L 更宽，则补一点 slack，避免可行解被窗口截断。

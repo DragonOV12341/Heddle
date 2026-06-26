@@ -307,17 +307,17 @@ class HeddleScheduler:
             model.add(b == 1)
             return b
 
-        def _or_var(name: str, lits):
+        def _or_var(name: str, lits):  # 等价性约束 : b True <=> lit中最少有一个为True
             lits = list(lits)
             if not lits:
                 return _false_var(name)
             b = model.new_bool_var(name)
-            model.add_bool_or(lits).only_enforce_if(b)
+            model.add_bool_or(lits).only_enforce_if(b)  # b True => lit中最少有一个为True
             for lit in lits:
-                model.add_implication(lit, b)
+                model.add_implication(lit, b)  #  lit中有一个为True => b True
             return b
 
-        def _and_var(name: str, lits):
+        def _and_var(name: str, lits): # b True <=> lit中都为True, lit中有一个False b FAlse
             lits = list(lits)
             if not lits:
                 return _true_var(name)
@@ -352,7 +352,7 @@ class HeddleScheduler:
         # P4 的对称性破除会在变量定义之后添加。
 
         # ---- 决策变量 ------------------------------------------------------
-        op = {}
+        op = {}  # op[v] 是否在t时刻启动
         for v in range(N):
             for t in range(L):
                 op[(v, t)] = model.new_bool_var(f"op_v={v}_t={t}")
@@ -399,7 +399,7 @@ class HeddleScheduler:
                     s: model.new_bool_var(f"warp_start_v={v}_w={s}")
                     for s in start_slots
                 }
-                model.add_exactly_one(starts.values())
+                model.add_exactly_one(starts.values())  # op的 start warp唯一
                 for w in range(W):
                     covering_starts = [
                         starts[s]
@@ -425,7 +425,7 @@ class HeddleScheduler:
             for v in variable_latency_ops[i + 1:]:
                 for wu in range(W):
                     for wv in range(W):
-                        if wu // 4 != wv // 4:
+                        if wu // 4 != wv // 4:  # 如果两个 wgid (wu wv)不同，那么 u分到wu 和 v分到wv 不能同时发生 （可行域添加）
                             model.add_bool_or([
                                 warp[(u, wu)].negated(),
                                 warp[(v, wv)].negated(),
@@ -437,7 +437,7 @@ class HeddleScheduler:
             for v in non_variable_latency_ops:
                 for wu in range(W):
                     for wv in range(W):
-                        if wu // 4 == wv // 4:
+                        if wu // 4 == wv // 4:  # 如果 wu wv wgid 相同，u,v 其中一个为varLat op 则可行域为： not((u分到wu) and (v 分到wv)) 
                             model.add_bool_or([
                                 warp[(u, wu)].negated(),
                                 warp[(v, wv)].negated(),
@@ -446,7 +446,7 @@ class HeddleScheduler:
         # ---- 整数启动时间表达式 -------------------------------------------
         Tv = [model.new_int_var(0, L - 1, f"T_v={v}") for v in range(N)]
         for v in range(N):
-            model.add(Tv[v] == sum(t * op[(v, t)] for t in range(L)))
+            model.add(Tv[v] == sum(t * op[(v, t)] for t in range(L)))  # 启动时间唯一性
 
         # CP-SAT 的 interval/no_overlap 比手工枚举所有 (time, other-op)
         # 冲突子句紧凑得多。这里按需缓存“op v 在 warp w 上执行”的可选区间，
@@ -488,12 +488,14 @@ class HeddleScheduler:
             vi = idx[v_node.name]
             for par in v_node.parents:
                 ui = idx[par.name]
+                # uv的跨迭代依赖距离
                 delta = int(v_node.dependency_distance.get(par.name, 0))
                 edge = v_node.edge_info.get(par.name)
+                # uv延迟
                 base_delay = int(edge.delay) if edge and edge.delay is not None else int(par.latency)
-
+                # spill 代价
                 spill_cost = max((o.spill_cost for o in par.outputs), default=0)
-
+                # 如果 op有spill代价 && 可用W不止一个
                 if spill_cost > 0 and W > 1:
                     same_pairs = [
                         _and_var(f"same_pair_u={ui}_v={vi}_w={w}", [warp[(ui, w)], warp[(vi, w)]])
@@ -501,10 +503,13 @@ class HeddleScheduler:
                     ]
                     same_w = _or_var(f"same_w_u={ui}_v={vi}", same_pairs)
                     if self.disallow_spills:
+                        # 禁用spill时， uv只能在同warp内
                         model.add(same_w == 1)
                         model.add(Tv[vi] - Tv[ui] >= base_delay - delta * ii)
                     else:
+                        # 若 uv在同warp，正常计算 Tv[vi] - Tv[ui] 启动间隔
                         model.add(Tv[vi] - Tv[ui] >= base_delay - delta * ii).only_enforce_if(same_w)
+                        # 否则 启动间隔需要考虑 spill代价
                         model.add(
                             Tv[vi] - Tv[ui] >= base_delay + spill_cost - delta * ii
                         ).only_enforce_if(same_w.negated())
@@ -605,10 +610,10 @@ class HeddleScheduler:
                                 if (tp + l) % ii == t % ii:
                                     terms.append(c * op[(v, tp)])
                 if terms:
-                    model.add(sum(terms) <= int(cap))
+                    model.add(sum(terms) <= int(cap))  # 在L的任意时刻， op占用FU的数目不得超过上限(对 TC、ALU、TMA是否有意义？)
 
         # ---- 活跃区间、P1 incoming_live 和容量约束 ------------------------
-        all_outputs: list[tuple[int, OutputValue]] = []
+        all_outputs: list[tuple[int, OutputValue]] = []  #[(opId, output)]
         for v in range(N):
             for out in self.nodes[v].outputs:
                 all_outputs.append((v, out))
@@ -619,18 +624,18 @@ class HeddleScheduler:
         consumers_of: dict[int, list[tuple[int, int]]] = defaultdict(list)
         output_name_to_xi: dict[str, int] = {}
         for xi, (pv, oval) in enumerate(all_outputs):
-            output_name_to_xi[oval.name] = xi
+            output_name_to_xi[oval.name] = xi  # {outbuffer.name : opid}
 
         for v_node in self.nodes:
             vi = idx[v_node.name]
-            for par in v_node.parents:
+            for par in v_node.parents:  # 遍历每个parentOp (自己读写同一buffer这种自依赖 已经在 solve_joint 的准备阶段加入了)
                 delta = int(v_node.dependency_distance.get(par.name, 0))
                 for oval in par.outputs:
                     xi = output_name_to_xi.get(oval.name)
                     if xi is not None:
-                        consumers_of[xi].append((vi, delta))
+                        consumers_of[xi].append((vi, delta))  # {vi : (ui,delta)}
                         if delta > 0:
-                            loop_carried.add(xi)
+                            loop_carried.add(xi)  # opvi 有跨迭代依赖
 
         if all_outputs and self.reg_limit > 0:
             # live[xi, tau]：第 xi 个输出在第 0 轮迭代的 tau 时刻是否 live。
@@ -653,7 +658,7 @@ class HeddleScheduler:
                 producer_lat = int(self.nodes[producer_v].latency)
 
                 for tau in range(L):
-                    produced_by = _start_le_var(producer_v, tau)
+                    produced_by = _start_le_var(producer_v, tau)  # producer_v 是否在 tau时刻前启动
 
                     if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY:
                         if same_iter_consumers:
@@ -671,20 +676,24 @@ class HeddleScheduler:
                                     _start_le_var(cv, tau)
                                     for cv, _ in same_iter_consumers
                                 ]) if tau > 0 else _false_var(f"consumed_false_x={xi}_t={tau}")
+                            # 约束 1：如果 producer 还没启动 (produced_by=0)，则数据绝对不可能 live
                             model.add_bool_or([
-                                live[(xi, tau)].negated(),
-                                produced_by,
+                                live[(xi, tau)].negated(), 
+                                produced_by,  # producer_v 在 tau时刻后启动 与 xi在tau时刻 live 不可能同True
                             ])
+                            # 约束 2：如果所有消费者已经消费完 (all_consumed=1)，则数据绝对不可能 live
                             model.add_bool_or([
-                                live[(xi, tau)].negated(),
+                                live[(xi, tau)].negated(),  # 可行域为： not (live[xi,tau] && 消费者在tau时刻前启动 )
                                 all_consumed.negated(),
                             ])
+                            # 约束 3：如果 producer 已经启动，且消费者还没消费完，则数据【必须】是 live 的
                             model.add_bool_or([
                                 produced_by.negated(),
                                 all_consumed,
                                 live[(xi, tau)],
                             ])
                         else:
+                            # 无sameiterconsumer, live可以判False
                             model.add(live[(xi, tau)] == 0)
                     else:
                         model.add(live[(xi, tau)] == produced_by)
@@ -704,6 +713,69 @@ class HeddleScheduler:
                         else:
                             model.add(incoming_live[(xi, tau)] == 0)
 
+            # 在 steady-state modulo schedule 中，同一个逻辑输出可能同时有
+            # 多个迭代副本存活。例如观察窗口覆盖 i-1、i、i+1 时，三份
+            # output register 应该分别计入容量，而不是折叠成一个 incoming
+            # 布尔值。这里按迭代偏移 k 枚举窗口内可能重叠的副本：
+            #   producer instance starts at Tv[p] + k * ii
+            #   consumer with distance d starts at Tv[c] + (k + d) * ii
+            max_iter_overlap = (L - 1) // max(int(ii), 1)
+            iter_offsets = (
+                range(-max_iter_overlap, max_iter_overlap + 1)
+                if self.include_incoming_live else
+                range(0, 1)
+            )
+            iter_live = {}
+
+            def _iter_live_var(xi: int, iter_offset: int, tau: int):
+                key = (xi, iter_offset, tau)
+                if key in iter_live:
+                    return iter_live[key]
+
+                producer_v, oval = all_outputs[xi]
+                produced_by = _start_le_var(
+                    producer_v, tau - iter_offset * ii)
+
+                if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY:
+                    consumers = (
+                        consumers_of[xi] if self.include_incoming_live else
+                        [(cv, d) for cv, d in consumers_of[xi] if d == 0]
+                    )
+                    if not consumers:
+                        b = _false_var(
+                            f"iter_live_false_x={xi}_k={iter_offset}_t={tau}")
+                    else:
+                        producer_lat = int(self.nodes[producer_v].latency)
+                        consumed_terms = []
+                        for cv, d in consumers:
+                            consume_bound = tau - (iter_offset + d) * ii
+                            # Zero-latency values can be produced and consumed
+                            # in the same cycle, but they still occupy the
+                            # register during that cycle. Treat consumption as
+                            # complete only after the consumer's start cycle.
+                            if producer_lat == 0:
+                                consume_bound -= 1
+                            consumed_terms.append(
+                                _start_le_var(cv, consume_bound))
+                        all_consumed = _and_var(
+                            f"iter_consumed_x={xi}_k={iter_offset}_t={tau}",
+                            consumed_terms,
+                        )
+                        b = model.new_bool_var(
+                            f"iter_live_x={xi}_k={iter_offset}_t={tau}")
+                        model.add_implication(b, produced_by)
+                        model.add_implication(b, all_consumed.negated())
+                        model.add_bool_or([
+                            produced_by.negated(),
+                            all_consumed,
+                            b,
+                        ])
+                else:
+                    b = produced_by
+
+                iter_live[key] = b
+                return b
+
             # ---- 每个 warp、每个时间步的寄存器容量约束 --------------------
             for w in range(W):
                 for tau in range(L):
@@ -711,34 +783,28 @@ class HeddleScheduler:
                     for xi, (pv, oval) in enumerate(all_outputs):
                         if oval.storage != StorageKind.RMEM or oval.footprint_bytes <= 0:
                             continue
-                        # 同一轮迭代内的 live 值。
-                        live_on_warp = _and_var(
-                            f"live_on_warp_x={xi}_w={w}_t={tau}",
-                            [warp[(pv, w)], live[(xi, tau)]],
-                        )
-                        rmem_terms.append(
-                            oval.footprint_bytes * live_on_warp)
-                        # P1：跨迭代 live 值，计入 producer 所在 warp 的压力。
-                        if self.include_incoming_live and xi in loop_carried:
-                            incoming_on_warp = _and_var(
-                                f"ilive_on_warp_x={xi}_w={w}_t={tau}",
-                                [warp[(pv, w)], incoming_live[(xi, tau)]],
+                        for iter_offset in iter_offsets:
+                            copy_live = _iter_live_var(
+                                xi, iter_offset, tau)
+                            live_on_warp = _and_var(
+                                f"live_on_warp_x={xi}_k={iter_offset}_w={w}_t={tau}",
+                                [warp[(pv, w)], copy_live],
                             )
                             rmem_terms.append(
-                                oval.footprint_bytes * incoming_on_warp)
+                                oval.footprint_bytes * live_on_warp)
                     if rmem_terms:
                         model.add(sum(rmem_terms) <= self.reg_limit)
 
-            # ---- SMEM 容量约束（全局统计，也包含 incoming_live） ----------
+            # ---- SMEM 容量约束（全局统计，也按重叠迭代副本累加） ----------
             for tau in range(L):
                 smem_terms = []
                 for xi, (pv, oval) in enumerate(all_outputs):
                     if oval.storage != StorageKind.SMEM or oval.footprint_bytes <= 0:
                         continue
-                    smem_terms.append(oval.footprint_bytes * live[(xi, tau)])
-                    if self.include_incoming_live and xi in loop_carried:
+                    for iter_offset in iter_offsets:
                         smem_terms.append(
-                            oval.footprint_bytes * incoming_live[(xi, tau)])
+                            oval.footprint_bytes *
+                            _iter_live_var(xi, iter_offset, tau))
                 if smem_terms:
                     model.add(sum(smem_terms) <= self.smem_limit)
 
@@ -783,11 +849,12 @@ class HeddleScheduler:
                         if oval.storage != StorageKind.RMEM:
                             continue
                         owned = bool(solver.value(warp[(pv, w)]))
-                        is_live = bool(solver.value(live[(xi, tau)]))
-                        is_incoming = (self.include_incoming_live and xi in loop_carried and
-                                       bool(solver.value(incoming_live[(xi, tau)])))
-                        if owned and (is_live or is_incoming):
-                            total += oval.footprint_bytes
+                        if not owned:
+                            continue
+                        for iter_offset in iter_offsets:
+                            live_var = iter_live.get((xi, iter_offset, tau))
+                            if live_var is not None and bool(solver.value(live_var)):
+                                total += oval.footprint_bytes
                     peak = max(peak, total)
                 reg_peak[w] = peak
 
@@ -806,15 +873,19 @@ class HeddleScheduler:
     def _ensure_reservations(self):
         for n in self.nodes:
             if not n.reservation:
-                n.reservation = [{n.resource_type: 1} for _ in range(max(int(n.latency), 0))]
+                n.reservation = [{n.resource_type: 1} for _ in range(max(int(n.latency), 0))]  # [{ALU: 1}, {ALU: 1}, {ALU: 1}]
 
     def _fold_reservations(self, ii: int) -> list[dict[int, dict[ResourceType, int]]]:
         expanded: list[dict[int, dict[ResourceType, int]]] = []
         for n in self.nodes:
+            # 1. 为当前节点初始化一个大小为 ii 的空折叠表（周期从 0 到 ii-1）
             tbl: dict[int, dict[ResourceType, int]] = {l: {} for l in range(ii)}
+            # 2. 遍历该节点在原始时间线（j）上的资源占用
             for j, per_cycle in enumerate(n.reservation):
                 l = j % ii
+                # 3. 将资源合并到对应的模周期槽位中
+                #  假如 原始占用：[{ALU: 1}, {ALU: 1}, {ALU: 1}] ， ii=2时，则折叠为： [{ALU: 2}, {ALU: 1}] 
                 for r, cnt in per_cycle.items():
-                    tbl[l][r] = int(tbl[l].get(r, 0)) + int(cnt)
+                    tbl[l][r] = int(tbl[l].get(r, 0)) + int(cnt)  
             expanded.append(tbl)
         return expanded

@@ -352,6 +352,25 @@ class TestCPSatResultIntegrity:
 # SMT (Z3) _solve_phase_b — warp constraint verification
 # ======================================================================
 
+class TestSMTModuloRegMultiplicity:
+    """Verify CP-SAT Phase B counts overlapping iteration copies."""
+
+    def test_loop_carried_output_counts_each_live_iteration_copy(self):
+        specs = [
+            ("A", "ALU", 1, [("A", 3)], [("oA", "RMEM", 60, 0)]),
+        ]
+
+        too_tight = _make_smt_nodes(
+            specs, num_warps=1, reg_limit=179, timeout_ms=5000)
+        assert too_tight._solve_phase_b(ii=1, L=3, optimize=False) is None
+
+        just_enough = _make_smt_nodes(
+            specs, num_warps=1, reg_limit=180, timeout_ms=5000)
+        result = just_enough._solve_phase_b(ii=1, L=3, optimize=False)
+        assert result is not None
+        assert result["reg_peak"][0] == 180
+
+
 @pytest.mark.skipif(not _has_z3(), reason="z3-solver not installed")
 class TestSMTWarpAssignment:
 
