@@ -54,6 +54,17 @@ unit_mapping = {
     'SFU': [8, 9, ]
 }
 
+# warpgroupId - 运行的ops
+wgid_ops = {
+    0 : [], 1 : [], 2 : []
+}
+
+for i, (op_name, op_warp) in enumerate(warp_assign.items()) :
+    wgid = op_warp // 4
+    wgid_ops[wgid].append(op_desc[i])
+
+print(wgid_ops)
+
 # 绘图派生参数。后续标注里的 II、迭代窗口、单迭代 latency 都从这里取，
 # 避免换一组调度结果时还要手动改图中文字里的数字。
 prev_iteration_offset = 0
@@ -172,7 +183,7 @@ for op, start, end, stage in plot_items:
     rect = patches.Rectangle(
         (cx_start, y_pos - box_height / 2), 
         c_width, box_height, 
-        linewidth=1.5, edgecolor=colors['edge'], facecolor=colors['face'], zorder=3
+        linewidth=1.5, edgecolor=colors['edge'], facecolor=colors['face'], zorder=3, alpha=0.5
     )
     ax.add_patch(rect)
     
@@ -181,7 +192,7 @@ for op, start, end, stage in plot_items:
     label = f"{desc} [{stage_labels[stage]}]"
     ax.text(
         cx_start + c_width / 2, y_pos, label, 
-        color='white', ha='center', va='center', fontsize=8, zorder=4, fontweight='bold'
+        color='white', ha='center', va='center', fontsize=8, zorder=4, fontweight='bold', alpha=0.8
     )
 
 # ----------------- 5. 辅助网格和单元边界线 -----------------
