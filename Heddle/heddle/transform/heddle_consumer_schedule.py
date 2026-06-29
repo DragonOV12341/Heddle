@@ -54,6 +54,7 @@ from heddle.transform.auto_tl_pipeline_smt import (
     _collect_func_alloc_buffers,
     _collect_rw_regions,
     _detect_op_latency_and_resource,
+    _detect_wgmma_issue_cycles,
     _estimate_buffer_footprint_bytes,
     _extract_num_threads,
     _is_shared,
@@ -413,7 +414,12 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         #     estimated_total_latency += 1
         else:
             latency, rty = _detect_op_latency_and_resource(info.stmt)
-            rrt[info.idx] = [{rty.value : 1}]
+            if info.is_wgmma:
+                issue_cycles = _detect_wgmma_issue_cycles(info.stmt)
+                duration[info.idx] = issue_cycles
+                rrt[info.idx] = [{"TC": 1} for _ in range(issue_cycles)]
+            else:
+                rrt[info.idx] = [{rty.value : 1}]
             latencies[info.idx] = latency  # 记录真实的硬件执行延迟
             estimated_total_latency += latency
 
@@ -459,23 +465,14 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
 
         model = cp_model.CpModel()
 
-        # x[v,t] = whether op v is scheduled at absolute modulo-schedule time t.
-        x = {}
-        for v in ops:
-            for t in range(H - duration[v] + 1):
-                x[v, t] = model.NewBoolVar(f"x_{v}_{t}")
-
-        # Each op is scheduled exactly once.
-        for v in ops:
-            model.AddExactlyOne(x[v, t] for t in range(H - duration[v] + 1))
-
         # M[v] = scheduled time of op v (发射槽位时间戳).
+        # 这里直接使用 IntVar 表达一次出现的位置。旧实现为每个
+        # (op, absolute_time) 建 BoolVar；WGMMA issue duration 展开后会导致
+        # H * duration * I 级别的资源约束爆炸。
         M = {}
         for v in ops:
-            M[v] = model.NewIntVar(0, H, f"M_{v}")
-            model.Add(
-                M[v] == sum(t * x[v, t] for t in range(H - duration[v] + 1))
-            )
+            latest_start = max(0, H - duration[v])
+            M[v] = model.NewIntVar(0, latest_start, f"M_{v}")
 
         # Symmetry breaking
         model.Add(M[ops[0]] == 0)
@@ -486,19 +483,37 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
             model.Add(M[v] - M[u] + delta * I >= d)
 
         # Modular resource capacity constraints.
-        # 确保同一个发射周期内，发射的某种指令数量不超过硬件单元容量
-        for r in range(I):
-            for f, cap in capacity.items():
-                terms = []
-                for v in ops:
-                    for t in range(H - duration[v] + 1):
-                        for c in range(duration[v]):
-                            usage = rrt[v][c].get(f, 0)
-                            if usage and (t + c) % I == r:
-                                terms.append(usage * x[v, t])
+        # 当前真正紧的资源是 TC(cap=1)：WGMMA 会连续占用多个 TC issue
+        # slot，wait barrier 也占一个 TC slot。对 cap=1 的资源，用
+        # “相位区间在模 I 环上不重叠”表达，避免逐时间点枚举 Bool。
+        phase = {}
+        for v in ops:
+            phase[v] = model.NewIntVar(0, I - 1, f"phase_{v}")
+            model.AddModuloEquality(phase[v], M[v], I)
 
-                if terms:
-                    model.Add(sum(terms) <= cap)
+        tc_ops = [
+            v for v in ops
+            if any(per_cycle.get("TC", 0) for per_cycle in rrt[v])
+        ]
+        for pos, u in enumerate(tc_ops):
+            du = duration[u]
+            if du > I:
+                return None
+            for v in tc_ops[pos + 1:]:
+                dv = duration[v]
+                if dv > I or du + dv > I:
+                    return None
+
+                # delta_uv = (phase[v] - phase[u]) mod I.
+                # OR-Tools 的 modulo 约束对负 dividend 不友好；phase 差值
+                # 加上 I 后等价且非负。
+                # 两个环形区间 [u, u+du) 与 [v, v+dv) 不重叠，当且仅当
+                # v 的相位落在 u 结束之后、且 v 结束不跨过下一轮的 u：
+                #   du <= delta_uv <= I - dv
+                delta_uv = model.NewIntVar(0, I - 1, f"delta_{u}_{v}")
+                model.AddModuloEquality(delta_uv, phase[v] - phase[u] + I, I)
+                model.Add(delta_uv >= du)
+                model.Add(delta_uv <= I - dv)
         # TODO : 运行中的指令，其所在FU不应超过 fu_caps的限制 （比如：ALU指令只能同时执行一个）
         
         # Schedule length L = max(M[v] + duration[v]).
@@ -614,253 +629,6 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
     else:
         print('ans none')
     return results
-
-# def _solve_naive_modulo_sched( op_deps : Dict[int, List[int]], infos : List[_StmtInfo], op_indices : List[int]) -> List[Dict]:
-#     from ortools.sat.python import cp_model
-#     print('enter _solve_naive_modulo_sched',flush=True)
-        
-#     ops : List[int] = list(op_indices)
-#     if not ops:
-#         return None
-
-#     latency_of: Dict[int, int] = {}
-#     resource_of: Dict[int, str] = {}
-#     estimated_total_cycles = 0
-#     for idx in ops:
-#         info = infos[idx]
-#         latency, rty = _detect_op_latency_and_resource(info.stmt)
-#         estimated_total_cycles += latency
-        
-#         latency_of[idx] = max(int(latency), 1)
-#         resource_of[idx] = getattr(rty, "value", str(rty))
-
-#     def _critical_path_upper_bound() -> int:
-#         """Return the single-iteration DAG critical path length in cycles."""
-#         ops_set = set(ops)
-#         succs: Dict[int, List[int]] = {idx: [] for idx in ops}
-#         indegree: Dict[int, int] = {idx: 0 for idx in ops}
-
-#         for v, deps in op_deps.items():
-#             if v not in ops_set:
-#                 continue
-#             for u in deps:
-#                 if u not in ops_set or u == v:
-#                     continue
-#                 succs[u].append(v)
-#                 indegree[v] += 1
-
-#         ready = [idx for idx in ops if indegree[idx] == 0]
-#         finish_time: Dict[int, int] = {idx: latency_of[idx] for idx in ops}
-#         visited = 0
-
-#         while ready:
-#             u = ready.pop(0)
-#             visited += 1
-#             for v in succs[u]:
-#                 finish_time[v] = max(
-#                     finish_time[v], finish_time[u] + latency_of[v]
-#                 )
-#                 indegree[v] -= 1
-#                 if indegree[v] == 0:
-#                     ready.append(v)
-
-#         if visited != len(ops):
-#             # Keep the solver robust if an unexpected intra-iteration cycle
-#             # appears in op_deps; the serial latency bound is conservative.
-#             return max(1, estimated_total_cycles)
-
-#         return max(1, max(finish_time.values(), default=1))
-
-#     def _resource_pressure_upper_bound() -> int:
-#         per_resource: Dict[str, int] = {"TMA": 0, "TC": 0, "ALU": 0, "SFU": 0}
-#         for idx in ops:
-#             info = infos[idx]
-#             if info.is_wait_barrier:
-#                 for key in per_resource:
-#                     per_resource[key] += 1
-#             elif info.is_true_tma:
-#                 per_resource["TMA"] += 1
-#             else:
-#                 resource = resource_of[idx]
-#                 per_resource[resource] = per_resource.get(resource, 0) + 1
-#         return max(1, max(per_resource.values(), default=1))
-        
-#     def solve_for_I(I: int, H: Optional[int] = None):
-
-#         if H is None:
-#             # duration is issue occupancy, while latency_of is dependency
-#             # delay.  The absolute search window must be large enough for
-#             # long dependency chains even though each op occupies one issue
-#             # slot in the resource table.
-#             H = max(8, len(ops) + 1, sum(latency_of.values()) + 1)
-
-#         duration = { key : 1 for key in ops }
-
-#         # RRT[v][c][resource] = resource usage at local cycle c of op v.
-
-#         rrt = {}
-#         for idx in ops:
-#             info = infos[idx]
-#             if info.is_wait_barrier :
-#                 # mbarrier_wait 必须单独放一个slot，不能和其他op一起发射（wait会阻塞warp）
-#                 rrt[info.idx] = [{"TMA": 1, "TC": 1, "ALU": 1, "SFU": 1 }]
-#             elif info.is_true_tma :
-#                 rrt[info.idx] = [{"TMA" : 1}]
-#             else:
-#                 rrt[info.idx] = [{resource_of[idx] : 1}]
-        
-#         # 使用 issue-slot 模型。
-#         capacity = {
-#             "TMA": 1, "TC": 1, "ALU": 1, "SFU": 1 
-#         }
-        
-#         reg_limit = 65536  # 32-bit regs per SM
-#         shm_limit = 227 * 1024  # per CTA max
-        
-        
-#         # Edges: (producer, consumer, latency d, iteration distance δ)
-#         # 依赖关系需要根据 tilelang IR 得到
-#         edges = []
-#         for v, deps in op_deps.items() :
-#             if v not in ops:
-#                 continue
-#             for u in deps :
-#                 if u not in ops:
-#                     continue
-#                 edges.append((u, v, latency_of[u], 0))
-#             # 跨循环依赖关系: 如果读写同一buffer 则自己存在跨循环依赖
-#             write_buf_names = set()
-#             read_buf_names = set()
-#             for buf in infos[v].writes :
-#                 write_buf_names.add(buf.buffer.name)
-#             for buf in infos[v].reads :
-#                 read_buf_names.add(buf.buffer.name)
-#             intersect = write_buf_names & read_buf_names
-#             if intersect :
-#                 edges.append((v, v, latency_of[v], 1))
-#             if infos[v].is_sync_top and infos[v].is_sync_nested :
-#                 edges.append((v, v, latency_of[v], 1))
-
-#         model = cp_model.CpModel()
-
-#         # x[v,t] = whether op v is scheduled at absolute modulo-schedule time t.
-#         x = {}
-#         for v in ops:
-#             for t in range(H - duration[v] + 1):
-#                 x[v, t] = model.NewBoolVar(f"x_{v}_{t}")
-
-#         # Each op is scheduled exactly once.
-#         for v in ops:
-#             model.AddExactlyOne(x[v, t] for t in range(H - duration[v] + 1))
-
-#         # M[v] = scheduled time of op v.
-#         M = {}
-#         for v in ops:
-#             M[v] = model.NewIntVar(0, H, f"M_{v}")
-#             model.Add(
-#                 M[v] == sum(t * x[v, t] for t in range(H - duration[v] + 1))
-#             )
-
-#         # Symmetry breaking: shift the whole schedule so the first consumer starts at 0.
-#         # Without this, equivalent shifted schedules may also be found.
-#         model.Add(M[ops[0]] == 0)
-#         # Dependency constraints:
-#         # M[v] + i*I >= M[u] + (i-δ)*I + d
-#         # => M[v] - M[u] + δ*I >= d
-#         for u, v, d, delta in edges:
-#             model.Add(M[v] - M[u] + delta * I >= d)
-
-#         # Modular resource capacity constraints.
-#         for r in range(I):
-#             for f, cap in capacity.items():
-#                 terms = []
-#                 for v in ops:
-#                     for t in range(H - duration[v] + 1):
-#                         for c in range(duration[v]):
-#                             usage = rrt[v][c].get(f, 0)
-#                             if usage and (t + c) % I == r:
-#                                 terms.append(usage * x[v, t])
-
-#                 if terms:
-#                     model.Add(sum(terms) <= cap)
-
-#         # Schedule length L = max(M[v] + duration[v]).
-#         end = {}
-#         for v in ops:
-#             end[v] = model.NewIntVar(0, H + duration[v], f"end_{v}")
-#             model.Add(end[v] == M[v] + duration[v])
-
-#         L = model.NewIntVar(0, H + max(duration.values()), "L")
-#         model.AddMaxEquality(L, [end[v] for v in ops])
-
-#         BIG = 100
-#         model.Minimize(BIG * L - sum(M[v] for v in ops))
-
-#         solver = cp_model.CpSolver()
-#         solver.parameters.max_time_in_seconds = 5
-#         status = solver.Solve(model)
-
-#         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-#             return None
-
-#         result = {
-#             "I": I,
-#             "L": solver.Value(L),
-#             "M": {v: solver.Value(M[v]) for v in ops},
-#         }
-
-#         # Build modular RRT table for printing.
-#         table = []
-#         for r in range(I):
-#             row = {"slot": f"{r} mod {I}"}
-#             for f in capacity:
-#                 row[f] = []
-#             for v in ops:
-#                 t = result["M"][v]
-#                 for c in range(duration[v]):
-#                     slot = (t + c) % I
-#                     if slot == r:
-#                         for f in capacity:
-#                             if rrt[v][c].get(f, 0):
-#                                 row[f].append(v)
-#             table.append(row)
-
-#         result["modular_rrt"] = table
-#         return result
-
-#     def solve_min_I(max_I: int = 6) -> List:
-#         # 从小到大寻找。如果可行，就直接输出I
-#         # 多个IL时，且 I<L 时，都返回。I==L 的情况无跨循环交叠，但可作为fallback备选（性能不太差）
-#         rets = []
-#         for I in range(1, max_I + 1):
-#             ans = solve_for_I(I)
-#             if ans is not None and ans["I"] < ans["L"]:
-#                 rets.append(ans)
-#                 break
-#         return rets
-
-#     results = None
-#     try:
-#         results = solve_min_I(
-#             max(_critical_path_upper_bound(), _resource_pressure_upper_bound())
-#         )
-#     except Exception as e :
-#         print(e, flush=True)
-#         return None
-#     print('solve done')
-#     if results is not None :
-#         print('ans not None')
-#         for ans in results :
-#             print("I =", ans["I"], flush=True)
-#             print("L =", ans["L"], flush=True)
-#             print("M =", ans["M"], flush=True)
-#             print("Modular RRT:")
-#             for row in ans["modular_rrt"]:
-#                 print(row)
-#     else:
-#         print('ans none')
-#     return results
-
 
 def _topo_sort_with_priority(
     consumer_indices: List[int],
@@ -1254,6 +1022,9 @@ def _solve_smt_joint_optimize(
                 ResourceType.ALU: 1,
                 ResourceType.SFU: 1,
             }]
+        if getattr(info, "is_wgmma", False):
+            issue_cycles = _detect_wgmma_issue_cycles(info.stmt)
+            return [{ResourceType.TensorCore: 1} for _ in range(issue_cycles)]
         return [{rty: 1}]
 
     nodes: List[OpNode] = []
@@ -1323,45 +1094,68 @@ def _solve_smt_joint_optimize(
                 distance=1,
                 delay=_dependency_delay_for_info(info),
             )
-        if info.is_sync_top and info.is_sync_nested:
+        if info.is_wait_barrier :
             node_by_idx[idx].add_dependency(
                 node_by_idx[idx],
                 distance=1,
                 delay=_dependency_delay_for_info(info),
             )
-
+        # 一致性约束 : op[v,0,t] => op[v,i,t+i*II]  应用于所有op。不再限制 自读写 & sync语义
+        # 关键点：op[v,0,t] => op[v,i,t+i*II] 这种“相位一致性”在当前 joint SMT 表达里已经由“每个 op 一个 Tv[v]，并固定 ii=base_I”隐含表示了；它不是 v -> v, distance=1, delay=latency 这种依赖边。后者表达的是“下一轮同一个 op 必须等上一轮这个 op 的结果/资源 hazard 结束”，只应该用于真实 loop-carried hazard，比如自读写 buffer 或 sync-like 语义。
+        #  node_by_idx[idx].add_dependency(
+        #     node_by_idx[idx],
+        #     distance=1,
+        #     delay=_dependency_delay_for_info(info),
+        # )
+        
     capacity = {
         ResourceType.TMA: 1,
         ResourceType.TensorCore: 1,
         ResourceType.ALU: 1,
         ResourceType.SFU: 1,
     }
-    fu_caps = {
-        ResourceType.TMA: 1,
-        ResourceType.TensorCore: 1,
-        ResourceType.ALU: 64,
-        ResourceType.SFU: 16,
-    }
+
     nwarps = _get_warpgroup_count_from_info()
     mod_sched_plan['num_warps'] = nwarps
     print(f'---- num_warps = {nwarps}')
     num_warps = max(1, int(mod_sched_plan.get("num_warps", 1)))
-    reg_limit = int(mod_sched_plan.get("reg_limit", 32* 240 * 4)) # ~255*90%*4 bytes per warp
-    smem_limit = int(mod_sched_plan.get("smem_limit", 48 * 1024))  # 48K bytes for CTA
+    reg_limit = int(mod_sched_plan.get("reg_limit", 32* 240 * 4)) # 单个线程 255个 f32 寄存器；每个warp内需*32，阈值设置略低于 255
+    smem_limit = int(mod_sched_plan.get("smem_limit", 227 * 1024))  # h100 : 227 Kbytes for CTA
+    smem_output_floor = sum(
+        out.footprint_bytes
+        for node in nodes
+        for out in node.outputs
+        if out.storage == StorageKind.SMEM and out.footprint_bytes > 0
+    )
+    if smem_output_floor > smem_limit:
+        print(
+            f"---- SHM 到达 smem_limit 限制（未考虑复用的简单求和）: {smem_limit} -> {smem_output_floor}",
+            flush=True,
+        )
+        smem_limit = smem_output_floor
+        print(f"--- 调整 smem_limit 为 {smem_limit}")
 
     # SMT 优化器使用 naive plan 的基础窗口；如果 naive 的绝对调度时间
     # 比记录的 L 更宽，则补一点 slack，避免可行解被窗口截断。
     base_max_time = max((int(base_M.get(v, 0)) for v in ops), default=0)
     window = max(base_L, base_max_time + 1, base_I)
 
-    def _run_joint_solver(*, solve_window: int, optimize: bool):
+    def _run_joint_solver(
+        *, solve_window: int, optimize: bool,
+        solve_reg_limit: int, solve_smem_limit: int,
+    ):
         solver = HeddleScheduler(
             nodes,
             fu_caps=capacity,
-            reg_limit=reg_limit,
-            smem_limit=smem_limit,
+            reg_limit=solve_reg_limit,
+            smem_limit=solve_smem_limit,
             num_warps=num_warps,
             timeout_ms=int(mod_sched_plan.get("timeout_ms", 15000)),
+            start_hints={
+                f"s{idx}": int(t)
+                for idx, t in base_M.items()
+                if idx in node_by_idx
+            },
         )
         return solver.schedule_joint(
             min_ii=base_I,
@@ -1375,28 +1169,86 @@ def _solve_smt_joint_optimize(
         if candidate not in candidate_windows:
             candidate_windows.append(candidate)
 
+    reg_limit_candidates = []
+    for candidate in (reg_limit, reg_limit * 4, 10**9):
+        if candidate > 0 and candidate not in reg_limit_candidates:
+            reg_limit_candidates.append(candidate)
+
+    smem_limit_candidates = []
+    for candidate in (smem_limit, smem_limit * 2, 233472):
+        if candidate > 0 and candidate not in smem_limit_candidates:
+            smem_limit_candidates.append(candidate)
+
     sol = None
+    solved_with_optimize = False
+    used_reg_limit = reg_limit
+    used_smem_limit = smem_limit
     for solve_window in candidate_windows:
-        sol = _run_joint_solver(
-            solve_window=solve_window,
-            optimize=True,
-        )
+        for solve_reg_limit in reg_limit_candidates:
+            for solve_smem_limit in smem_limit_candidates:
+                used_reg_limit = solve_reg_limit
+                used_smem_limit = solve_smem_limit
+                sol = _run_joint_solver(
+                    solve_window=solve_window,
+                    optimize=False,
+                    solve_reg_limit=solve_reg_limit,
+                    solve_smem_limit=solve_smem_limit,
+                )
+                if sol is not None:
+                    break
+                if solve_reg_limit != reg_limit or solve_smem_limit != smem_limit:
+                    print(
+                        f"---- SMT feasibility failed at window={solve_window}, "
+                        f"reg_limit={solve_reg_limit}, smem_limit={solve_smem_limit}",
+                        flush=True,
+                    )
+            if sol is not None:
+                break
         if sol is not None:
             break
 
     if sol is None:
-        print("---- SMT optimize failed; retry feasibility", flush=True)
-    #     for solve_window in candidate_windows:
-    #         sol = _run_joint_solver(
-    #             solve_window=solve_window,
-    #             optimize=False,
-    #         )
-    #         if sol is not None:
-    #             break
+        print("---- SMT feasibility failed; retry optimize", flush=True)
+        for solve_window in candidate_windows:
+            for solve_reg_limit in reg_limit_candidates:
+                for solve_smem_limit in smem_limit_candidates:
+                    used_reg_limit = solve_reg_limit
+                    used_smem_limit = solve_smem_limit
+                    sol = _run_joint_solver(
+                        solve_window=solve_window,
+                        optimize=True,
+                        solve_reg_limit=solve_reg_limit,
+                        solve_smem_limit=solve_smem_limit,
+                    )
+                    if sol is not None:
+                        solved_with_optimize = True
+                        break
+                    if solve_reg_limit != reg_limit or solve_smem_limit != smem_limit:
+                        print(
+                            f"---- SMT optimize failed at window={solve_window}, "
+                            f"reg_limit={solve_reg_limit}, smem_limit={solve_smem_limit}",
+                            flush=True,
+                        )
+                if sol is not None:
+                    break
+            if sol is not None:
+                break
     if sol is None:
         fallback = dict(mod_sched_plan)
         fallback.setdefault("status", "SMT_UNSAT")
         return fallback
+    if used_reg_limit != reg_limit:
+        print(
+            f"---- SMT joint succeeded with relaxed reg_limit={used_reg_limit} "
+            f"(original={reg_limit})",
+            flush=True,
+        )
+    if used_smem_limit != smem_limit:
+        print(
+            f"---- SMT joint succeeded with relaxed smem_limit={used_smem_limit} "
+            f"(original={smem_limit})",
+            flush=True,
+        )
 
     schedule = sol.get("schedule", {})
     warp_assign = sol.get("warp_assign", {})
@@ -1410,7 +1262,14 @@ def _solve_smt_joint_optimize(
         if idx not in optimized_M and idx in base_M:
             optimized_M[idx] = int(base_M[idx])
 
-    optimized_L = max((t + 1 for t in optimized_M.values()), default=0)
+    optimized_L = max(
+        (
+            t + max(len(node_by_idx[idx].reservation), 1)
+            for idx, t in optimized_M.items()
+            if idx in node_by_idx
+        ),
+        default=0,
+    )
     print(f'---{optimized_L=}')
     print(f'---{base_I=}')
     print(f'---{optimized_M=}')
@@ -1423,17 +1282,15 @@ def _solve_smt_joint_optimize(
         modified=False
         for idx in ops:
             t = optimized_M.get(idx)
-            if t is None or t % base_I != r:
+            if t is None or idx not in node_by_idx:
                 continue
-            info = infos[idx]
-            if getattr(info, "is_wait_barrier", False):
-                for f in ("TMA", "TC", "ALU", "SFU"):
-                    row[f].append(idx)
-                    modified=True
-                continue
-            rty = _resource_for_info(info).value
-            row[rty].append(idx)
-            modified=True
+            for c, per_cycle in enumerate(node_by_idx[idx].reservation):
+                if (t + c) % base_I != r:
+                    continue
+                for rty, used in per_cycle.items():
+                    if int(used):
+                        row[rty.value].append(idx)
+                        modified=True
         if modified:
             table.append(row)
 
@@ -1442,7 +1299,7 @@ def _solve_smt_joint_optimize(
         "I": base_I,
         "L": optimized_L,
         "M": optimized_M,
-        "status": "SMT_OPTIMIZED",
+        "status": "SMT_OPTIMIZED" if solved_with_optimize else "SMT_FEASIBLE",
         "window": int(sol.get("window", window)),
         "warp_assign": {
             int(name[1:]): int(w)
@@ -2392,7 +2249,7 @@ def _transform_pipeline_loop(
         # Policy: run Phase B if (a) explicitly enabled, or (b) ≥3 WGMMA
         # consumer ops detected (complex dependency → heuristic may produce
         # FU conflicts that only joint solve can resolve).
-        print("---- start smt solving -----")
+        print("---- [原始路径] start smt solving -----")
         n_tc_ops = len(consumer_wgmma_indices)
         auto_phase_b = (n_tc_ops >= 3) and (len(consumer_indices) >= 6)
         run_phase_b = use_phase_b or auto_phase_b or consumer_num_warps > 1

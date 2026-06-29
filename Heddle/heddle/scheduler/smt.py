@@ -156,6 +156,7 @@ class HeddleScheduler:
         disallow_spills: bool = False,
         use_spill_concurrency: bool = True,
         include_incoming_live: bool = True,
+        start_hints: Optional[Dict[str, int]] = None,
     ):
         self.nodes = nodes
         self.fu_caps = fu_caps or {
@@ -169,6 +170,7 @@ class HeddleScheduler:
         self.disallow_spills = disallow_spills
         self.use_spill_concurrency = use_spill_concurrency
         self.include_incoming_live = include_incoming_live
+        self.start_hints = start_hints or {}
 
     # ------------------------------------------------------------------ #
     # Phase A  (unchanged API)
@@ -287,7 +289,7 @@ class HeddleScheduler:
 
     def _solve_phase_b(self, ii: int, L: int, *, optimize: bool = True) -> Optional[Dict[str, object]]:
         from ortools.sat.python import cp_model
-
+        print(f"----- HeddleSCheduler: {self.reg_limit=} bytes, {self.smem_limit=} bytes, {self.num_warps=}")
         self._ensure_reservations()
         N = len(self.nodes)
         idx = {n.name: i for i, n in enumerate(self.nodes)}
@@ -352,11 +354,7 @@ class HeddleScheduler:
         # P4 的对称性破除会在变量定义之后添加。
 
         # ---- 决策变量 ------------------------------------------------------
-        op = {}  # op[v] 是否在t时刻启动
-        for v in range(N):
-            for t in range(L):
-                op[(v, t)] = model.new_bool_var(f"op_v={v}_t={t}")
-
+        Tv = [model.new_int_var(0, L - 1, f"T_v={v}") for v in range(N)]
         warp = {}
         for v in range(N):
             for w in range(W):
@@ -367,10 +365,6 @@ class HeddleScheduler:
             bool(self.nodes[v].is_varialble_latency)
             for v in range(N)
         ]
-
-        # ---- 唯一启动时间 --------------------------------------------------
-        for v in range(N):
-            model.add_exactly_one(op[(v, t)] for t in range(L))
 
         # ---- warp 分配（支持多 warp op 和可复制 op） -----------------------
         for v in range(N):
@@ -443,10 +437,14 @@ class HeddleScheduler:
                                 warp[(v, wv)].negated(),
                             ])
         
-        # ---- 整数启动时间表达式 -------------------------------------------
-        Tv = [model.new_int_var(0, L - 1, f"T_v={v}") for v in range(N)]
-        for v in range(N):
-            model.add(Tv[v] == sum(t * op[(v, t)] for t in range(L)))  # 启动时间唯一性
+        for v, node in enumerate(self.nodes):
+            hint_t = self.start_hints.get(node.name)
+            if hint_t is None:
+                continue
+            hint_t = int(hint_t)
+            if hint_t < 0 or hint_t >= L:
+                continue
+            model.add_hint(Tv[v], hint_t)
 
         # CP-SAT 的 interval/no_overlap 比手工枚举所有 (time, other-op)
         # 冲突子句紧凑得多。这里按需缓存“op v 在 warp w 上执行”的可选区间，
@@ -598,19 +596,83 @@ class HeddleScheduler:
                                 model.add_no_overlap([spill_interval, _op_interval(other, w_dst)])
 
         # ---- FU 容量约束 ---------------------------------------------------
+        # 对 cap=1 且 reservation 为连续区间的资源，用相位区间不重叠表达。
+        # 这避免 WGMMA 多拍 issue 展开后在 (L * ii * L) 枚举里制造海量
+        # Bool/linear 项。其它更复杂的资源形状继续走旧的逐槽容量约束。
+        phase = [model.new_int_var(0, ii - 1, f"phase_v={v}") for v in range(N)]
+        for v in range(N):
+            model.add_modulo_equality(phase[v], Tv[v], ii)
+
+        phase_eq_cache = {}
+
+        def _phase_eq_var(v: int, p: int):
+            p = int(p) % ii
+            key = (v, p)
+            if key in phase_eq_cache:
+                return phase_eq_cache[key]
+            b = model.new_bool_var(f"phase_eq_v={v}_p={p}")
+            model.add(phase[v] == p).only_enforce_if(b)
+            model.add(phase[v] != p).only_enforce_if(b.negated())
+            phase_eq_cache[key] = b
+            return b
+
+        interval_mode_resources: set[ResourceType] = set()
+        resource_spans: dict[ResourceType, list[tuple[int, int, int]]] = {}
+        for r, cap in self.fu_caps.items():
+            if int(cap) != 1:
+                continue
+            spans: list[tuple[int, int, int]] = []
+            ok = True
+            for v, node in enumerate(self.nodes):
+                used_offsets = [
+                    j for j, per_cycle in enumerate(node.reservation)
+                    if int(per_cycle.get(r, 0)) > 0
+                ]
+                if not used_offsets:
+                    continue
+                if any(int(node.reservation[j].get(r, 0)) != 1 for j in used_offsets):
+                    ok = False
+                    break
+                first = min(used_offsets)
+                last = max(used_offsets)
+                if used_offsets != list(range(first, last + 1)):
+                    ok = False
+                    break
+                span = last - first + 1
+                if span > ii:
+                    return None
+                spans.append((v, first, span))
+            if ok and spans:
+                interval_mode_resources.add(r)
+                resource_spans[r] = spans
+
+        for r, spans in resource_spans.items():
+            for i, (u, off_u, dur_u) in enumerate(spans):
+                for v, off_v, dur_v in spans[i + 1:]:
+                    if dur_u + dur_v > ii:
+                        return None
+                    delta_uv = model.new_int_var(0, ii - 1, f"fu_delta_{r.value}_u={u}_v={v}")
+                    model.add_modulo_equality(
+                        delta_uv,
+                        phase[v] + off_v - phase[u] - off_u + ii,
+                        ii,
+                    )
+                    model.add(delta_uv >= dur_u)
+                    model.add(delta_uv <= ii - dur_v)
+
         expanded = self._fold_reservations(ii)
-        for t in range(L):
-            for r, cap in self.fu_caps.items():
+        for r, cap in self.fu_caps.items():
+            if r in interval_mode_resources:
+                continue
+            for q in range(ii):
                 terms = []
                 for v in range(N):
                     for l in range(ii):
                         c = int(expanded[v][l].get(r, 0))
                         if c:
-                            for tp in range(L):
-                                if (tp + l) % ii == t % ii:
-                                    terms.append(c * op[(v, tp)])
+                            terms.append(c * _phase_eq_var(v, q - l))
                 if terms:
-                    model.add(sum(terms) <= int(cap))  # 在L的任意时刻， op占用FU的数目不得超过上限(对 TC、ALU、TMA是否有意义？)
+                    model.add(sum(terms) <= int(cap))  # 每个 modulo 相位上的 FU 使用量不得超过上限。
 
         # ---- 活跃区间、P1 incoming_live 和容量约束 ------------------------
         all_outputs: list[tuple[int, OutputValue]] = []  #[(opId, output)]
@@ -637,7 +699,14 @@ class HeddleScheduler:
                         if delta > 0:
                             loop_carried.add(xi)  # opvi 有跨迭代依赖
 
-        if all_outputs and self.reg_limit > 0:
+        # feasibility 阶段先只求一个满足依赖/warp/FU 的联合排布，避免把
+        # RMEM/SMEM 活跃区间网格也放进首轮模型。需要峰值/容量优化时再在
+        # optimize=True 的模型里展开这部分。
+        track_liveness = bool(optimize and all_outputs and self.reg_limit > 0)
+        iter_offsets = range(0, 1)
+        iter_live = {}
+
+        if track_liveness:
             # live[xi, tau]：第 xi 个输出在第 0 轮迭代的 tau 时刻是否 live。
             live = {}
             for xi in range(len(all_outputs)):
@@ -725,8 +794,6 @@ class HeddleScheduler:
                 if self.include_incoming_live else
                 range(0, 1)
             )
-            iter_live = {}
-
             def _iter_live_var(xi: int, iter_offset: int, tau: int):
                 key = (xi, iter_offset, tau)
                 if key in iter_live:
@@ -795,16 +862,21 @@ class HeddleScheduler:
                     if rmem_terms:
                         model.add(sum(rmem_terms) <= self.reg_limit)
 
-            # ---- SMEM 容量约束（全局统计，也按重叠迭代副本累加） ----------
+            # ---- SMEM 容量约束（全局统计） -------------------------------
+            # SMEM footprint 表示 shared buffer allocation 的大小。这个
+            # allocation 已经包含 pipeline stage / double-buffer 空间，
+            # 不能像 RMEM value 一样按重叠迭代副本重复累加。
             for tau in range(L):
                 smem_terms = []
                 for xi, (pv, oval) in enumerate(all_outputs):
                     if oval.storage != StorageKind.SMEM or oval.footprint_bytes <= 0:
                         continue
-                    for iter_offset in iter_offsets:
-                        smem_terms.append(
-                            oval.footprint_bytes *
-                            _iter_live_var(xi, iter_offset, tau))
+                    any_copy_live = _or_var(
+                        f"smem_live_x={xi}_t={tau}",
+                        [_iter_live_var(xi, iter_offset, tau)
+                         for iter_offset in iter_offsets],
+                    )
+                    smem_terms.append(oval.footprint_bytes * any_copy_live)
                 if smem_terms:
                     model.add(sum(smem_terms) <= self.smem_limit)
 
@@ -825,12 +897,10 @@ class HeddleScheduler:
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             return None
 
-        schedule = {}
-        for v in range(N):
-            for t in range(L):
-                if solver.value(op[(v, t)]):
-                    schedule[self.nodes[v].name] = t
-                    break
+        schedule = {
+            self.nodes[v].name: int(solver.value(Tv[v]))
+            for v in range(N)
+        }
 
         warp_assign = {}
         for v in range(N):
@@ -840,7 +910,7 @@ class HeddleScheduler:
                     break
 
         reg_peak: Dict[int, int] = {}
-        if all_outputs and self.reg_limit > 0:
+        if track_liveness:
             for w in range(W):
                 peak = 0
                 for tau in range(L):

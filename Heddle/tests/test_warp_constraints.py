@@ -370,6 +370,17 @@ class TestSMTModuloRegMultiplicity:
         assert result is not None
         assert result["reg_peak"][0] == 180
 
+    def test_smem_allocation_is_not_multiplied_by_iteration_copies(self):
+        specs = [
+            ("S", "ALU", 1, [("S", 3)], [("buf", "SMEM", 32768, 0)]),
+        ]
+
+        sched = _make_smt_nodes(
+            specs, num_warps=1, reg_limit=1024, timeout_ms=5000)
+        sched.smem_limit = 32768
+        result = sched._solve_phase_b(ii=1, L=3, optimize=False)
+        assert result is not None
+
 
 @pytest.mark.skipif(not _has_z3(), reason="z3-solver not installed")
 class TestSMTWarpAssignment:

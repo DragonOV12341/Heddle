@@ -636,6 +636,32 @@ class OpIssueAndLatencyTable :
             return [1,18]
 
 
+def _detect_wgmma_issue_cycles(stmt: tvm.tir.Stmt) -> int:
+    """Return the summed TensorCore issue occupancy for WGMMA calls."""
+    wgmma_descs = _collect_wgmma_descs_with_static_loop_multiplier(stmt)
+    if not wgmma_descs:
+        return max(_count_wgmma_ops_with_static_loop_multiplier(stmt), 1)
+
+    issue_cycles = 0
+    for (kind, mnk), count in wgmma_descs.items():
+        if mnk is None:
+            issue_cycles += int(count)
+            continue
+        m, n, k = mnk
+        mnk_key = f"m{m}n{n}k{k}"
+        if kind == "rs":
+            kind_idx = 1
+        elif kind == "ss":
+            kind_idx = 0
+        else:
+            assert False, f"invalid kind detected - {kind}"
+        issue, _ = OpIssueAndLatencyTable.get_issue_execute_cycle(
+            ResourceType.TensorCore, [mnk_key, kind_idx]
+        )
+        issue_cycles += int(issue) * int(count)
+    return max(issue_cycles, 1)
+
+
 
 def _detect_op_latency_and_resource(stmt: tvm.tir.Stmt) -> tuple:
     """Detect operation type and return (latency, ResourceType).
@@ -681,7 +707,7 @@ def _detect_op_latency_and_resource(stmt: tvm.tir.Stmt) -> tuple:
         # 单个wgmma执行周期
         [issue , execute] = OpIssueAndLatencyTable.get_issue_execute_cycle(ResourceType.TensorCore, [mnk_key,idx] )
         # 循环：不能简单xN。 正确计算方式 = interval * (N-1) + Latency, 这里 interval 简化为等于issue_time
-        return issue * wgmma_op_count + execute, ResourceType.TensorCore
+        return _detect_wgmma_issue_cycles(stmt) + execute, ResourceType.TensorCore
 
     tma_op_count = _count_tma_ops_with_static_loop_multiplier(stmt)
     if tma_op_count > 0:
