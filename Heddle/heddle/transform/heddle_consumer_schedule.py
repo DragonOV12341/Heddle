@@ -58,6 +58,7 @@ from heddle.transform.auto_tl_pipeline_smt import (
     _estimate_buffer_footprint_bytes,
     _extract_num_threads,
     _is_shared,
+    SFU_ISSUE_CYCLES,
     _StmtInfo,
     _unwrap_to_seqstmt,
 )
@@ -383,6 +384,7 @@ def _build_consumer_dep_graph(
 
 def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtInfo'], op_indices: List[int]) -> List[Dict]:
     from ortools.sat.python import cp_model
+    from heddle.scheduler.smt import ResourceType
     print('enter _solve_naive_modulo_sched', flush=True)
     
     ops: List[int] = list(op_indices)
@@ -399,6 +401,12 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
     latencies = {} 
     rrt = {}
     estimated_total_latency = 0
+
+    def _issue_delay_for_self_edge(idx: int) -> int:
+        # 跨迭代 self hazard 在这里表达的是发射/顺序间隔。
+        # 如果对这类边使用完整数据就绪 latency，会强行要求
+        # I >= latency，导致后续 joint SMT refine 根本没有机会运行。
+        return max(int(duration.get(idx, 1)), 1)
     
     for idx in ops:
         info = infos[idx]
@@ -413,13 +421,18 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         #     latencies[info.idx] = 280
         #     estimated_total_latency += 1
         else:
-            latency, rty = _detect_op_latency_and_resource(info.stmt)
             if info.is_wgmma:
                 issue_cycles = _detect_wgmma_issue_cycles(info.stmt)
                 duration[info.idx] = issue_cycles
                 rrt[info.idx] = [{"TC": 1} for _ in range(issue_cycles)]
+                latency = issue_cycles
             else:
-                rrt[info.idx] = [{rty.value : 1}]
+                latency, rty = _detect_op_latency_and_resource(info.stmt)
+                if rty is ResourceType.SFU:
+                    duration[info.idx] = SFU_ISSUE_CYCLES
+                    rrt[info.idx] = [{"SFU": 1} for _ in range(SFU_ISSUE_CYCLES)]
+                else:
+                    rrt[info.idx] = [{rty.value : 1}]
             latencies[info.idx] = latency  # 记录真实的硬件执行延迟
             estimated_total_latency += latency
 
@@ -432,6 +445,7 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
     fu_caps = {"TC": 1, "SFU": 16, "ALU": 64, "TMA": 255}
 
     print(f"-------- {latencies=}")
+    print(f"-------- {duration=}", flush=True)
     
     def solve_for_I(I: int):
         # ---------------------------------------------------------
@@ -458,10 +472,9 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
                 read_buf_names.add(buf.buffer.name)
             intersect = write_buf_names & read_buf_names
             if intersect:
-                # 跨循环依赖同样需要等待当前算子自身的真实时延结束
-                edges.append((v, v, latencies[v], 1))
+                edges.append((v, v, _issue_delay_for_self_edge(v), 1))
             if infos[v].is_sync_top and infos[v].is_sync_nested:
-                edges.append((v, v, latencies[v], 1))
+                edges.append((v, v, _issue_delay_for_self_edge(v), 1))
 
         model = cp_model.CpModel()
 
@@ -483,37 +496,40 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
             model.Add(M[v] - M[u] + delta * I >= d)
 
         # Modular resource capacity constraints.
-        # 当前真正紧的资源是 TC(cap=1)：WGMMA 会连续占用多个 TC issue
-        # slot，wait barrier 也占一个 TC slot。对 cap=1 的资源，用
-        # “相位区间在模 I 环上不重叠”表达，避免逐时间点枚举 Bool。
+        # 对 cap=1 且 reservation 连续的 issue 资源，用“相位区间在
+        # 模 I 环上不重叠”表达，避免逐时间点枚举 Bool。WGMMA 和 SFU
+        # 都会连续占用多个 issue slot。
         phase = {}
         for v in ops:
             phase[v] = model.NewIntVar(0, I - 1, f"phase_{v}")
             model.AddModuloEquality(phase[v], M[v], I)
 
-        tc_ops = [
-            v for v in ops
-            if any(per_cycle.get("TC", 0) for per_cycle in rrt[v])
-        ]
-        for pos, u in enumerate(tc_ops):
-            du = duration[u]
-            if du > I:
-                return None
-            for v in tc_ops[pos + 1:]:
-                dv = duration[v]
-                if dv > I or du + dv > I:
+        for resource_name, cap in capacity.items():
+            if int(cap) != 1:
+                continue
+            resource_ops = [
+                v for v in ops
+                if any(per_cycle.get(resource_name, 0) for per_cycle in rrt[v])
+            ]
+            for pos, u in enumerate(resource_ops):
+                du = duration[u]
+                if du > I:
                     return None
+                for v in resource_ops[pos + 1:]:
+                    dv = duration[v]
+                    if dv > I or du + dv > I:
+                        return None
 
-                # delta_uv = (phase[v] - phase[u]) mod I.
-                # OR-Tools 的 modulo 约束对负 dividend 不友好；phase 差值
-                # 加上 I 后等价且非负。
-                # 两个环形区间 [u, u+du) 与 [v, v+dv) 不重叠，当且仅当
-                # v 的相位落在 u 结束之后、且 v 结束不跨过下一轮的 u：
-                #   du <= delta_uv <= I - dv
-                delta_uv = model.NewIntVar(0, I - 1, f"delta_{u}_{v}")
-                model.AddModuloEquality(delta_uv, phase[v] - phase[u] + I, I)
-                model.Add(delta_uv >= du)
-                model.Add(delta_uv <= I - dv)
+                    # delta_uv = (phase[v] - phase[u]) mod I.
+                    # OR-Tools 的 modulo 约束对负 dividend 不友好；phase 差值
+                    # 加上 I 后等价且非负。
+                    # 两个环形区间 [u, u+du) 与 [v, v+dv) 不重叠，当且仅当
+                    # v 的相位落在 u 结束之后、且 v 结束不跨过下一轮的 u：
+                    #   du <= delta_uv <= I - dv
+                    delta_uv = model.NewIntVar(0, I - 1, f"delta_{resource_name}_{u}_{v}")
+                    model.AddModuloEquality(delta_uv, phase[v] - phase[u] + I, I)
+                    model.Add(delta_uv >= du)
+                    model.Add(delta_uv <= I - dv)
         # TODO : 运行中的指令，其所在FU不应超过 fu_caps的限制 （比如：ALU指令只能同时执行一个）
         
         # Schedule length L = max(M[v] + duration[v]).
@@ -611,10 +627,10 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
 
     results = None
     try:
-        results = solve_min_I(estimated_total_latency)
+        results = solve_min_I(max(estimated_total_latency, 1))
     except Exception as e:
         print(e, flush=True)
-        return None
+        results = []
         
     print('solve done')
     if results is not None:
@@ -1025,6 +1041,8 @@ def _solve_smt_joint_optimize(
         if getattr(info, "is_wgmma", False):
             issue_cycles = _detect_wgmma_issue_cycles(info.stmt)
             return [{ResourceType.TensorCore: 1} for _ in range(issue_cycles)]
+        if rty is ResourceType.SFU:
+            return [{ResourceType.SFU: 1} for _ in range(SFU_ISSUE_CYCLES)]
         return [{rty: 1}]
 
     nodes: List[OpNode] = []

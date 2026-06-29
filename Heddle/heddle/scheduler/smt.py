@@ -29,6 +29,9 @@ class ResourceType(enum.Enum):
     SFU = "SFU"
 
 
+SFU_ISSUE_CYCLES = 8
+
+
 class StorageKind(enum.Enum):
     RMEM = "RMEM"
     SMEM = "SMEM"
@@ -943,7 +946,12 @@ class HeddleScheduler:
     def _ensure_reservations(self):
         for n in self.nodes:
             if not n.reservation:
-                n.reservation = [{n.resource_type: 1} for _ in range(max(int(n.latency), 0))]  # [{ALU: 1}, {ALU: 1}, {ALU: 1}]
+                issue_cycles = (
+                    SFU_ISSUE_CYCLES
+                    if n.resource_type is ResourceType.SFU
+                    else max(int(n.latency), 0)
+                )
+                n.reservation = [{n.resource_type: 1} for _ in range(issue_cycles)]  # [{ALU: 1}, {ALU: 1}, {ALU: 1}]
 
     def _fold_reservations(self, ii: int) -> list[dict[int, dict[ResourceType, int]]]:
         expanded: list[dict[int, dict[ResourceType, int]]] = []

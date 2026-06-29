@@ -12,6 +12,8 @@ from tvm import tir
 import tilelang
 from tilelang import tvm as tvm
 
+SFU_ISSUE_CYCLES = 8
+
 if TYPE_CHECKING:
     try:
         from heddle.scheduler.smt import OpNode, ResourceType  # type: ignore
@@ -633,7 +635,7 @@ class OpIssueAndLatencyTable :
         if opTy is ResourceType.ALU :
             return [1,4]
         if opTy is ResourceType.SFU :
-            return [1,18]
+            return [SFU_ISSUE_CYCLES, 18]
 
 
 def _detect_wgmma_issue_cycles(stmt: tvm.tir.Stmt) -> int:
