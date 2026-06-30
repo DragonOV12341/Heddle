@@ -396,7 +396,7 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
     
     # 硬件发射槽位容量模型 （TMA暂且认为无发射限制。其受带宽影响）
     # H100 有4个SM，每个SM上有 1 tensorcore 1TMA  16
-    capacity = { "TMA": 255, "TC": 1, "ALU": 64, "SFU": 16 }
+    capacity = { "TMA": 255, "TC": 1, "ALU": 64, "SFU": 16, "BARRIER": 1 }
     
     # latencies - 指令执行耗时
     latencies = {} 
@@ -412,15 +412,11 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
     for idx in ops:
         info = infos[idx]
         if info.is_wait_barrier:
-            # mbarrier_wait 必须单独放一个 slot
-            rrt[info.idx] = [capacity]
+            # mbarrier_wait 使用一个独立同步 issue slot；它不能和任意
+            # 其它 op 同槽发射，但不能伪装成占满所有 FU。
+            rrt[info.idx] = [{"BARRIER": 1}]
             latencies[info.idx] = 1  # 屏障等待本身阻塞发射或紧邻同步，设为 1
             estimated_total_latency += 1
-        # elif info.is_true_tma:
-        #     rrt[info.idx] = [{"TMA" : 1}]
-        #     # TMA 是异步指令，发射只需 1 周期，真实数据就绪依赖 barrier，此处发射层面设为 1
-        #     latencies[info.idx] = 280
-        #     estimated_total_latency += 1
         else:
             if info.is_wgmma:
                 issue_cycles = _detect_wgmma_issue_cycles(info.stmt)
@@ -441,7 +437,7 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
     # }
     
     # 运行时指令容量限制 - 运行中的指令不得超过 FU 个数。 TMA 另外考虑
-    fu_caps = {"TC": 1, "SFU": 16, "ALU": 64, "TMA": 255}
+    # fu_caps = {"TC": 1, "SFU": 16, "ALU": 64, "TMA": 255}
 
     print(f"-------- {latencies=}")
     print(f"-------- {duration=}", flush=True)
@@ -503,6 +499,21 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
             phase[v] = model.NewIntVar(0, I - 1, f"phase_{v}")
             model.AddModuloEquality(phase[v], M[v], I)
 
+        def _add_modular_no_overlap(u: int, v: int, tag: str) -> bool:
+            du = duration[u]
+            dv = duration[v]
+            if du > I or dv > I or du + dv > I:
+                return False
+
+            # delta_uv = (phase[v] - phase[u]) mod I.
+            # 两个环形 issue interval [u, u+du) 与 [v, v+dv) 不重叠：
+            #   du <= delta_uv <= I - dv
+            delta_uv = model.NewIntVar(0, I - 1, f"delta_{tag}_{u}_{v}")
+            model.AddModuloEquality(delta_uv, phase[v] - phase[u] + I, I)
+            model.Add(delta_uv >= du)
+            model.Add(delta_uv <= I - dv)
+            return True
+
         for resource_name, cap in capacity.items():
             if int(cap) != 1:
                 continue
@@ -519,17 +530,28 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
                     if dv > I or du + dv > I:
                         return None
 
-                    # delta_uv = (phase[v] - phase[u]) mod I.
-                    # OR-Tools 的 modulo 约束对负 dividend 不友好；phase 差值
-                    # 加上 I 后等价且非负。
-                    # 两个环形区间 [u, u+du) 与 [v, v+dv) 不重叠，当且仅当
-                    # v 的相位落在 u 结束之后、且 v 结束不跨过下一轮的 u：
-                    #   du <= delta_uv <= I - dv
-                    delta_uv = model.NewIntVar(0, I - 1, f"delta_{resource_name}_{u}_{v}")
-                    model.AddModuloEquality(delta_uv, phase[v] - phase[u] + I, I)
-                    model.Add(delta_uv >= du)
-                    model.Add(delta_uv <= I - dv)
-        # TODO : 运行中的指令，其所在FU不应超过 fu_caps的限制 （比如：ALU指令只能同时执行一个）
+                    if not _add_modular_no_overlap(u, v, resource_name):
+                        return None
+
+        # Barrier issue slot exclusivity.
+        # wait/try_wait barrier 必须单独占一个 modulo issue slot：同一个
+        # phase 上不能有任何其它 op 的 issue interval 覆盖它。这个约束
+        # 只表达发射槽独占，不再通过占满 TMA/TC/ALU/SFU 来间接实现。
+        barrier_ops = [
+            v for v in ops
+            if getattr(infos[v], "is_wait_barrier", False)
+        ]
+        barrier_exclusive_pairs = set()
+        for b in barrier_ops:
+            for v in ops:
+                if v == b:
+                    continue
+                u0, v0 = (b, v) if b < v else (v, b)
+                if (u0, v0) in barrier_exclusive_pairs:
+                    continue
+                barrier_exclusive_pairs.add((u0, v0))
+                if not _add_modular_no_overlap(u0, v0, "barrier_slot"):
+                    return None
         
         # Schedule length L = max(M[v] + duration[v]).
         # 注：如果你希望 L 代表全流水线完全排空（包含最后一条指令执行完）的长度，
