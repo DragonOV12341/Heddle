@@ -160,6 +160,7 @@ class HeddleScheduler:
         disallow_spills: bool = False,
         use_spill_concurrency: bool = True,
         include_incoming_live: bool = True,
+        enable_liveness: bool = True,
         start_hints: Optional[Dict[str, int]] = None,
     ):
         self.nodes = nodes
@@ -175,6 +176,7 @@ class HeddleScheduler:
         self.disallow_spills = disallow_spills
         self.use_spill_concurrency = use_spill_concurrency
         self.include_incoming_live = include_incoming_live
+        self.enable_liveness = enable_liveness
         self.start_hints = start_hints or {}
 
     # ------------------------------------------------------------------ #
@@ -781,7 +783,7 @@ class HeddleScheduler:
         # feasibility 阶段先只求一个满足依赖/warp/FU 的联合排布，避免把
         # RMEM/SMEM 活跃区间网格也放进首轮模型。需要峰值/容量优化时再在
         # optimize=True 的模型里展开这部分。
-        track_liveness = bool(optimize and all_outputs and self.reg_limit > 0)
+        track_liveness = bool(self.enable_liveness and optimize and all_outputs and self.reg_limit > 0)
         iter_offsets = range(0, 1)
         iter_live = {}
 
@@ -961,8 +963,13 @@ class HeddleScheduler:
 
         # ---- 优化目标：偏好更紧凑的调度 -------------------------------
         if optimize:
-            mx = model.new_int_var(0, L - 1, "max_T")
-            model.add_max_equality(mx, Tv)
+            end_times = []
+            for v, node in enumerate(self.nodes):
+                end_v = model.new_int_var(0, L - 1 + max(len(node.reservation), 1), f"end_T_v={v}")
+                model.add(end_v == Tv[v] + max(len(node.reservation), 1))
+                end_times.append(end_v)
+            mx = model.new_int_var(0, L - 1 + max((max(len(n.reservation), 1) for n in self.nodes), default=1), "max_end_T")
+            model.add_max_equality(mx, end_times)
             model.minimize(L * N * mx + sum(Tv))
 
         # ---- 求解 ---------------------------------------------------------

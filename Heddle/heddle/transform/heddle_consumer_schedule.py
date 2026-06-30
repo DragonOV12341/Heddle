@@ -1176,6 +1176,7 @@ def _solve_smt_joint_optimize(
     def _run_joint_solver(
         *, solve_window: int, optimize: bool,
         solve_reg_limit: int, solve_smem_limit: int,
+        enable_liveness: bool = True,
     ):
         solver = HeddleScheduler(
             nodes,
@@ -1184,6 +1185,7 @@ def _solve_smt_joint_optimize(
             smem_limit=solve_smem_limit,
             num_warps=num_warps,
             timeout_ms=int(mod_sched_plan.get("timeout_ms", 15000)),
+            enable_liveness=enable_liveness,
             start_hints={
                 f"s{idx}": int(t)
                 for idx, t in base_M.items()
@@ -1196,6 +1198,123 @@ def _solve_smt_joint_optimize(
             window=solve_window,
             optimize=optimize,
         )
+
+    def _selected_warps_for_node(node: OpNode, first_warp: int) -> List[int]:
+        if node.replicable or node.warp_count <= 1:
+            return [first_warp]
+        return [
+            w for w in range(first_warp, first_warp + max(int(node.warp_count), 1))
+            if 0 <= w < num_warps
+        ]
+
+    def _check_fixed_liveness(
+        schedule: Dict[str, int],
+        warp_assign: Dict[str, int],
+        *,
+        check_L: int,
+        check_reg_limit: int,
+        check_smem_limit: int,
+    ) -> Tuple[bool, Dict[str, object]]:
+        fixed_M = {
+            idx: int(schedule[f"s{idx}"])
+            for idx in ops
+            if f"s{idx}" in schedule
+        }
+        if len(fixed_M) != len(ops):
+            missing = [idx for idx in ops if idx not in fixed_M]
+            return False, {"reason": f"missing schedule for {missing}"}
+
+        fixed_warps = {
+            idx: _selected_warps_for_node(node_by_idx[idx], int(warp_assign.get(f"s{idx}", 0)))
+            for idx in ops
+            if idx in node_by_idx
+        }
+
+        all_outputs: List[Tuple[int, OutputValue]] = []
+        output_name_to_xi: Dict[str, int] = {}
+        for idx in ops:
+            node = node_by_idx[idx]
+            for out in node.outputs:
+                output_name_to_xi[out.name] = len(all_outputs)
+                all_outputs.append((idx, out))
+
+        consumers_of: Dict[int, List[Tuple[int, int]]] = {}
+        for v_node in nodes:
+            vi = int(v_node.name[1:])
+            for par in v_node.parents:
+                ui = int(par.name[1:])
+                delta = int(v_node.dependency_distance.get(par.name, 0))
+                for oval in par.outputs:
+                    xi = output_name_to_xi.get(oval.name)
+                    if xi is not None:
+                        consumers_of.setdefault(xi, []).append((vi, delta))
+
+        max_iter_overlap = (max(int(check_L), 1) - 1) // max(int(base_I), 1)
+        iter_offsets = range(-max_iter_overlap, max_iter_overlap + 1)
+
+        def _copy_live(xi: int, iter_offset: int, tau: int) -> bool:
+            producer_idx, oval = all_outputs[xi]
+            if fixed_M[producer_idx] + iter_offset * base_I > tau:
+                return False
+            if oval.lifetime != LifetimeSemantic.DEAD_ON_ENTRY:
+                return True
+            consumers = consumers_of.get(xi, [])
+            if not consumers:
+                return False
+            producer_lat = int(node_by_idx[producer_idx].latency)
+            for consumer_idx, distance in consumers:
+                consume_time = fixed_M[consumer_idx] + (iter_offset + distance) * base_I
+                if producer_lat == 0:
+                    consume_time += 1
+                if consume_time > tau:
+                    return True
+            return False
+
+        reg_peak: Dict[int, int] = {w: 0 for w in range(num_warps)}
+        smem_peak = 0
+        for tau in range(max(int(check_L), 0)):
+            smem_total = 0
+            smem_live_seen: Set[int] = set()
+            reg_total: Dict[int, int] = {w: 0 for w in range(num_warps)}
+            for xi, (producer_idx, oval) in enumerate(all_outputs):
+                if oval.footprint_bytes <= 0:
+                    continue
+                live_any_copy = False
+                for iter_offset in iter_offsets:
+                    if not _copy_live(xi, iter_offset, tau):
+                        continue
+                    live_any_copy = True
+                    if oval.storage == StorageKind.RMEM:
+                        for w in fixed_warps.get(producer_idx, [0]):
+                            reg_total[w] = reg_total.get(w, 0) + int(oval.footprint_bytes)
+                if oval.storage == StorageKind.SMEM and live_any_copy and xi not in smem_live_seen:
+                    smem_total += int(oval.footprint_bytes)
+                    smem_live_seen.add(xi)
+
+            for w, total in reg_total.items():
+                if total > reg_peak.get(w, 0):
+                    reg_peak[w] = total
+                if check_reg_limit > 0 and total > check_reg_limit:
+                    return False, {
+                        "reason": "reg_limit",
+                        "warp": w,
+                        "tau": tau,
+                        "usage": total,
+                        "limit": check_reg_limit,
+                        "reg_peak": reg_peak,
+                    }
+            smem_peak = max(smem_peak, smem_total)
+            if check_smem_limit > 0 and smem_total > check_smem_limit:
+                return False, {
+                    "reason": "smem_limit",
+                    "tau": tau,
+                    "usage": smem_total,
+                    "limit": check_smem_limit,
+                    "reg_peak": reg_peak,
+                    "smem_peak": smem_peak,
+                }
+
+        return True, {"reg_peak": reg_peak, "smem_peak": smem_peak}
 
     candidate_windows = []
     for candidate in (window, window + base_I, window + 2 * base_I):
@@ -1216,6 +1335,8 @@ def _solve_smt_joint_optimize(
     solved_with_optimize = False
     used_reg_limit = reg_limit
     used_smem_limit = smem_limit
+    feasible_window = None
+    liveness_info: Dict[str, object] = {}
     for solve_window in candidate_windows:
         for solve_reg_limit in reg_limit_candidates:
             for solve_smem_limit in smem_limit_candidates:
@@ -1228,6 +1349,7 @@ def _solve_smt_joint_optimize(
                     solve_smem_limit=solve_smem_limit,
                 )
                 if sol is not None:
+                    feasible_window = solve_window
                     break
                 if solve_reg_limit != reg_limit or solve_smem_limit != smem_limit:
                     print(
@@ -1240,8 +1362,58 @@ def _solve_smt_joint_optimize(
         if sol is not None:
             break
 
+    if sol is not None and feasible_window is not None:
+        feasible_sol = sol
+        opt_sol = _run_joint_solver(
+            solve_window=feasible_window,
+            optimize=True,
+            solve_reg_limit=used_reg_limit,
+            solve_smem_limit=used_smem_limit,
+            enable_liveness=False,
+        )
+        if opt_sol is not None:
+            opt_schedule = opt_sol.get("schedule", {})
+            opt_warp_assign = opt_sol.get("warp_assign", {})
+            opt_M = {
+                idx: int(opt_schedule[f"s{idx}"])
+                for idx in ops
+                if f"s{idx}" in opt_schedule and idx in node_by_idx
+            }
+            opt_L = max(
+                (
+                    t + max(len(node_by_idx[idx].reservation), 1)
+                    for idx, t in opt_M.items()
+                ),
+                default=feasible_window,
+            )
+            live_ok, live_info = _check_fixed_liveness(
+                opt_schedule,
+                opt_warp_assign,
+                check_L=opt_L,
+                check_reg_limit=used_reg_limit,
+                check_smem_limit=used_smem_limit,
+            )
+            if live_ok:
+                print(f"--- [0] SMT Optimize success !")
+                print(f"--- [0] SMT liveness check success: {live_info}", flush=True)
+                sol = opt_sol
+                liveness_info = live_info
+                solved_with_optimize = True
+            else:
+                print(
+                    f"---- [0] SMT liveness check failed for optimized solution: {live_info}; "
+                    "using feasibility solution",
+                    flush=True,
+                )
+                sol = feasible_sol
+        else:
+            print(
+                "---- SMT optimize failed; using feasibility solution",
+                flush=True,
+            )
+
     if sol is None:
-        print("---- SMT feasibility failed; retry optimize", flush=True)
+        print("---- SMT feasibility failed; start retry optimize", flush=True)
         for solve_window in candidate_windows:
             for solve_reg_limit in reg_limit_candidates:
                 for solve_smem_limit in smem_limit_candidates:
@@ -1252,6 +1424,7 @@ def _solve_smt_joint_optimize(
                         optimize=True,
                         solve_reg_limit=solve_reg_limit,
                         solve_smem_limit=solve_smem_limit,
+                        enable_liveness=False,
                     )
                     if sol is not None:
                         solved_with_optimize = True
@@ -1267,9 +1440,45 @@ def _solve_smt_joint_optimize(
             if sol is not None:
                 break
     if sol is None:
+        print('--- Retry failed. Fallback to naive sched plan')
         fallback = dict(mod_sched_plan)
         fallback.setdefault("status", "SMT_UNSAT")
         return fallback
+
+    if not liveness_info:
+        sol_schedule = sol.get("schedule", {})
+        sol_warp_assign = sol.get("warp_assign", {})
+        sol_M = {
+            idx: int(sol_schedule[f"s{idx}"])
+            for idx in ops
+            if f"s{idx}" in sol_schedule and idx in node_by_idx
+        }
+        sol_L = max(
+            (
+                t + max(len(node_by_idx[idx].reservation), 1)
+                for idx, t in sol_M.items()
+            ),
+            default=window,
+        )
+        live_ok, live_info = _check_fixed_liveness(
+            sol_schedule,
+            sol_warp_assign,
+            check_L=sol_L,
+            check_reg_limit=used_reg_limit,
+            check_smem_limit=used_smem_limit,
+        )
+        if live_ok:
+            print(f"--- SMT liveness check success: {live_info}", flush=True)
+            liveness_info = live_info
+        else:
+            print(f"---- SMT liveness check failed: {live_info}", flush=True)
+            if solved_with_optimize:
+                fallback = dict(mod_sched_plan)
+                fallback.setdefault("status", "SMT_LIVENESS_FAIL")
+                fallback["liveness_info"] = live_info
+                return fallback
+            liveness_info = live_info
+
     if used_reg_limit != reg_limit:
         print(
             f"---- SMT joint succeeded with relaxed reg_limit={used_reg_limit} "
@@ -1339,7 +1548,8 @@ def _solve_smt_joint_optimize(
             for name, w in warp_assign.items()
             if isinstance(name, str) and name.startswith("s") and name[1:].isdigit()
         },
-        "reg_peak": sol.get("reg_peak", {}),
+        "reg_peak": liveness_info.get("reg_peak", sol.get("reg_peak", {})),
+        "smem_peak": liveness_info.get("smem_peak"),
         "modular_rrt": table,
         "ordering": [idx for idx, _ in sorted(optimized_M.items(), key=lambda item: (item[1], item[0]))],
     })
