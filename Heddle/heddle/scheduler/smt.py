@@ -27,6 +27,7 @@ class ResourceType(enum.Enum):
     TensorCore = "TC"
     ALU = "ALU"
     SFU = "SFU"
+    Barrier = "BARRIER"
 
 
 SFU_ISSUE_CYCLES = 8
@@ -165,6 +166,7 @@ class HeddleScheduler:
         self.fu_caps = fu_caps or {
             ResourceType.TMA: 1, ResourceType.TensorCore: 1,
             ResourceType.ALU: 1, ResourceType.SFU: 1,
+            ResourceType.Barrier: 1,
         }
         self.reg_limit = reg_limit
         self.smem_limit = smem_limit
@@ -370,11 +372,14 @@ class HeddleScheduler:
         ]
 
         # ---- warp 分配（支持多 warp op 和可复制 op） -----------------------
+        issue_warp = {}
         for v in range(N):
             nd = self.nodes[v]
             wc = max(nd.warp_count, 1)
             if nd.replicable or wc == 1:
                 model.add_exactly_one(warp[(v, w)] for w in range(W))
+                for w in range(W):
+                    issue_warp[(v, w)] = warp[(v, w)]
             else:
                 if wc > W:
                     return None
@@ -397,6 +402,10 @@ class HeddleScheduler:
                     for s in start_slots
                 }
                 model.add_exactly_one(starts.values())  # op的 start warp唯一
+                for w in range(W):
+                    issue_warp[(v, w)] = starts.get(
+                        w, _false_var(f"issue_warp_false_v={v}_w={w}")
+                    )
                 for w in range(W):
                     covering_starts = [
                         starts[s]
@@ -619,6 +628,38 @@ class HeddleScheduler:
             phase_eq_cache[key] = b
             return b
 
+        # Hopper 每个 warpgroup 内的同号 warp 共享一个 subcore issue 槽：
+        # subcoreId = warpId % 4。同 subcore 上的两个 op 不能在同一个
+        # modulo issue interval 内重叠；不同 subcore 的 warp 组合不加限制。
+        issue_spans = [
+            (v, 0, max(len(node.reservation), 1))
+            for v, node in enumerate(self.nodes)
+        ]
+        for i, (u, off_u, dur_u) in enumerate(issue_spans):
+            for v, off_v, dur_v in issue_spans[i + 1:]:
+                for wu in range(W):
+                    for wv in range(W):
+                        if wu % 4 != wv % 4:
+                            continue
+                        same_subcore = _and_var(
+                            f"same_subcore_u={u}_v={v}_wu={wu}_wv={wv}",
+                            [issue_warp[(u, wu)], issue_warp[(v, wv)]],
+                        )
+                        if dur_u + dur_v > ii:
+                            model.add(same_subcore == 0)
+                            continue
+                        delta_uv = model.new_int_var(
+                            0, ii - 1,
+                            f"subcore_delta_u={u}_v={v}_wu={wu}_wv={wv}",
+                        )
+                        model.add_modulo_equality(
+                            delta_uv,
+                            phase[v] + off_v - phase[u] - off_u + ii,
+                            ii,
+                        )
+                        model.add(delta_uv >= dur_u).only_enforce_if(same_subcore)
+                        model.add(delta_uv <= ii - dur_v).only_enforce_if(same_subcore)
+
         interval_mode_resources: set[ResourceType] = set()
         resource_spans: dict[ResourceType, list[tuple[int, int, int]]] = {}
         for r, cap in self.fu_caps.items():
@@ -662,6 +703,41 @@ class HeddleScheduler:
                     )
                     model.add(delta_uv >= dur_u)
                     model.add(delta_uv <= ii - dur_v)
+
+        # Barrier issue 槽互斥。
+        # wait/try_wait barrier 使用专门的同步 issue 槽：它不能和其它
+        # op 的 issue interval 共享同一个 modulo 槽。
+        # 这里刻意和 FU 容量分开建模，避免把 barrier 误看成同时消耗
+        # TMA/TC/ALU/SFU 资源。
+        barrier_spans = resource_spans.get(ResourceType.Barrier, [])
+        if barrier_spans:
+            full_issue_spans = [
+                (v, 0, max(len(node.reservation), 1))
+                for v, node in enumerate(self.nodes)
+            ]
+            barrier_pairs: set[tuple[int, int]] = set()
+            for b, off_b, dur_b in barrier_spans:
+                for v, off_v, dur_v in full_issue_spans:
+                    if v == b:
+                        continue
+                    u0, off_u0, dur_u0 = (b, off_b, dur_b)
+                    v0, off_v0, dur_v0 = (v, off_v, dur_v)
+                    key = (u0, v0) if u0 < v0 else (v0, u0)
+                    if key in barrier_pairs:
+                        continue
+                    barrier_pairs.add(key)
+                    if dur_u0 + dur_v0 > ii:
+                        return None
+                    delta_uv = model.new_int_var(
+                        0, ii - 1, f"barrier_delta_u={u0}_v={v0}"
+                    )
+                    model.add_modulo_equality(
+                        delta_uv,
+                        phase[v0] + off_v0 - phase[u0] - off_u0 + ii,
+                        ii,
+                    )
+                    model.add(delta_uv >= dur_u0)
+                    model.add(delta_uv <= ii - dur_v0)
 
         expanded = self._fold_reservations(ii)
         for r, cap in self.fu_caps.items():

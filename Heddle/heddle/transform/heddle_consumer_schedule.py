@@ -395,7 +395,7 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
     duration = { key : 1 for key in ops }
     
     # 硬件发射槽位容量模型 （TMA暂且认为无发射限制。其受带宽影响）
-    # H100 有4个SM，每个SM上有 1 tensorcore 1TMA  16
+    # H100 一个SM有4个subcore，每个SM上有: 1TMA, 4Tensorcore(但在实际使用时，其需要4个warp协作，一般需要跨subcore), 故总体建模为1个；
     capacity = { "TMA": 255, "TC": 1, "ALU": 64, "SFU": 16, "BARRIER": 1 }
     
     # latencies - 指令执行耗时
@@ -431,13 +431,6 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
             latencies[info.idx] = latency  # 记录 op总体的 issue+execute 延迟
             estimated_total_latency += latency
 
-    
-    # capacity = {
-    #     "TMA": 1, "TC": 1, "ALU": 1, "SFU": 1 
-    # }
-    
-    # 运行时指令容量限制 - 运行中的指令不得超过 FU 个数。 TMA 另外考虑
-    # fu_caps = {"TC": 1, "SFU": 16, "ALU": 64, "TMA": 255}
 
     print(f"-------- {latencies=}")
     print(f"-------- {duration=}", flush=True)
@@ -1011,12 +1004,15 @@ def _solve_smt_joint_optimize(
         "TC": ResourceType.TensorCore,
         "ALU": ResourceType.ALU,
         "SFU": ResourceType.SFU,
+        "BARRIER": ResourceType.Barrier,
     }
+    # TC指令为跨subcore协作指令，无法多发射；其他指令，如果 subcoreId = warpId % 4 相同，则不能多发射，否则可以同时发射
     capacity = {
         ResourceType.TMA: 255,
         ResourceType.TensorCore: 1,
         ResourceType.ALU: 64,
         ResourceType.SFU: 16,
+        ResourceType.Barrier: 1,
     }
     
     def _get_warpgroup_count_from_info() :
@@ -1033,6 +1029,8 @@ def _solve_smt_joint_optimize(
         return  warps['tma'] +warps['wgmma_consumer'] +warps['alu_consumer']
     
     def _resource_for_info(info: _StmtInfo) -> ResourceType:
+        if getattr(info, "is_wait_barrier", False):
+            return ResourceType.Barrier
         if getattr(info, "is_true_tma", False):
             return ResourceType.TMA
         _, rty = _detect_op_latency_and_resource(info.stmt)
@@ -1067,12 +1065,7 @@ def _solve_smt_joint_optimize(
         # 一个同步 issue slot。不要按 ALU/SFU 总容量填满，否则长 SFU/ALU
         # reservation 折叠到整个 II 时，会把所有 wait barrier 都判成不可行。
         if getattr(info, "is_wait_barrier", False):
-            return [{
-                ResourceType.TMA: 1,
-                ResourceType.TensorCore: 1,
-                ResourceType.ALU: 1,
-                ResourceType.SFU: 1,
-            }]
+            return [{ResourceType.Barrier: 1}]
         if getattr(info, "is_wgmma", False):
             issue_cycles = _detect_wgmma_issue_cycles(info.stmt)
             return [{ResourceType.TensorCore: 1} for _ in range(issue_cycles)]
