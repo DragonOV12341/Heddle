@@ -18,18 +18,17 @@ import numpy as np
 #     8: 25, 9: 25, 10: 3, 11: 1, 12: 1, 13: 1, 14: 1, 15: 1, 16: 216
 # }
 
-num_warps = 12
 
-
-
-warp_assign={'s0': 9, 's1': 1, 's2': 3, 's3': 4, 's4': 1, 's5': 0, 's6': 4, 's7': 3, 's8': 0, 's9': 2, 's10': 7, 's11': 1, 's12': 1, 's13': 7, 's14': 11, 's15': 2, 's16': 4}
-optimized_L=1523
+warp_assign={'s0': 2, 's1': 6, 's2': 5, 's3': 6, 's4': 6, 's5': 4, 's6': 5, 's7': 5, 's8': 5, 's9': 7, 's10': 5, 's11': 4, 's12': 5, 's13': 5, 's14': 2, 's15': 5, 's16': 4}
+optimized_L=1567
 base_I=514
-optimized_M={0: 0, 1: 282, 2: 781, 3: 775, 4: 563, 5: 631, 6: 783, 7: 789, 8: 1113, 9: 797, 10: 1513, 11: 1181, 12: 1519, 13: 1327, 14: 2, 15: 795, 16: 1395}
-# ========================================
-latencies={0: 282, 1: 1, 2: 8, 3: 8, 4: 68, 5: 152, 6: 6, 7: 8, 8: 50, 9: 530, 10: 6, 11: 132, 12: 8, 13: 68, 14: 282, 15: 1, 16: 176}
-duration={0: 2, 1: 1, 2: 4, 3: 4, 4: 64, 5: 128, 6: 4, 7: 4, 8: 32, 9: 512, 10: 4, 11: 128, 12: 4, 13: 64, 14: 2, 15: 1, 16: 128}
+optimized_M={0: 0, 1: 282, 2: 209, 3: 209, 4: 6, 5: 283, 6: 509, 7: 701, 8: 1027, 9: 797, 10: 1513, 11: 1097, 12: 1519, 13: 1327, 14: 2, 15: 795, 16: 1439}
 
+# ========================================
+# 执行+发射延迟
+latencies={0: 282, 1: 1, 2: 8, 3: 8, 4: 68, 5: 152, 6: 6, 7: 8, 8: 50, 9: 530, 10: 6, 11: 132, 12: 8, 13: 68, 14: 282, 15: 1, 16: 176}
+# 发射延迟
+duration={0: 2, 1: 1, 2: 4, 3: 4, 4: 64, 5: 128, 6: 4, 7: 4, 8: 32, 9: 512, 10: 4, 11: 128, 12: 4, 13: 64, 14: 2, 15: 1, 16: 128}
 op_desc = {
     0 : 'async_copy Ks',
     1 : 'wait Ks',
@@ -57,14 +56,13 @@ unit_mapping = {
     'SFU': [8, 9, ]
 }
 
-# warpgroupId - 运行的ops
-wgid_ops = {
-    0 : [], 1 : [], 2 : []
-}
+# warpgroupId - 运行的ops。warp_assign 里 sN 的 warpId 通过 warpId // 4 映射到 warpgroup。
+op_wgid = {int(op_name[1:]): op_warp // 4 for op_name, op_warp in warp_assign.items()}
+active_wgids = sorted(set(op_wgid.values()))
+wgid_ops = {wgid: [] for wgid in active_wgids}
 
-for i, (op_name, op_warp) in enumerate(warp_assign.items()) :
-    wgid = op_warp // 4
-    wgid_ops[wgid].append(op_desc[i])
+for op, wgid in sorted(op_wgid.items()):
+    wgid_ops[wgid].append(op_desc[op])
 
 print(wgid_ops)
 
@@ -172,16 +170,24 @@ ax.set_facecolor('#121212')
 fig.patch.set_facecolor('#121212')
 
 box_height = 0.55
-issue_alpha = 0.55
+issue_alpha = 0.8
 color_palette = {
     prev_iteration_stage: {'face': '#5c3d2e', 'edge': '#ba7a5f'},  # 迭代 I-1 [i-1] -> 深棕
     curr_iteration_stage: {'face': '#1f4e5b', 'edge': '#3a889e'},  # 迭代 I [i]     -> 深青
     next_iteration_stage: {'face': '#3f4f2f', 'edge': '#8aaa5e'},  # 迭代 I+1 [i+1] -> 深绿
 }
+wg_hatches = {
+    0: '///',
+    1: '...',
+    2: 'xxx',
+    3: '\\\\\\',
+}
 
 for op, start, end, issue_end, stage in plot_items:
     y_pos = op_y_pos[op] # 确保同一 op 在同一行
     
+    # 保留事件点压缩坐标，让短 op 仍有可读空间；坐标标签继续显示真实 hardware cycle。
+    # end = start + latencies[op] 表示发射+执行，issue_end = start + duration[op] 表示发射段。
     cx_start = time_to_coord[start]
     cx_end = time_to_coord[end]
     cx_issue_end = time_to_coord[issue_end]
@@ -189,21 +195,31 @@ for op, start, end, issue_end, stage in plot_items:
     issue_width = cx_issue_end - cx_start
     
     colors = color_palette[stage]
+    wgid = op_wgid[op]
+    hatch = wg_hatches.get(wgid, '---')
     
-    # 外层半透明矩形表示 ready-time latency；内层亮条表示 issue-slot duration。
+    # 浅色整段表示总延迟 L = issue + execute；深色前段表示 issue duration。
     rect = patches.Rectangle(
-        (cx_start, y_pos - box_height / 2), 
+        (cx_start, y_pos - box_height / 2),
         c_width, box_height, 
-        linewidth=1.5, edgecolor=colors['edge'], facecolor=colors['face'], zorder=3, alpha=0.32
+        linewidth=1.5, edgecolor=colors['edge'], facecolor=colors['edge'], zorder=3, alpha=0.28
     )
     ax.add_patch(rect)
 
     issue_rect = patches.Rectangle(
         (cx_start, y_pos - box_height / 2),
         issue_width, box_height,
-        linewidth=0, edgecolor='none', facecolor=colors['edge'], zorder=4, alpha=issue_alpha
+        linewidth=0, edgecolor='none', facecolor=colors['face'], zorder=4, alpha=issue_alpha
     )
     ax.add_patch(issue_rect)
+
+    # 纹理只表达 warpgroup，不改变 iteration 颜色语义。
+    hatch_rect = patches.Rectangle(
+        (cx_start, y_pos - box_height / 2),
+        c_width, box_height,
+        linewidth=0, edgecolor='#d8d8d8', facecolor='none', hatch=hatch, zorder=4.5, alpha=0.48
+    )
+    ax.add_patch(hatch_rect)
     
     # 【核心恢复】将完整的算子指令描述 (desc) 加上迭代标签写进滑块内
     desc = op_desc[op]
@@ -290,9 +306,21 @@ legend_patches = [
     patches.Patch(facecolor=color_palette[prev_iteration_stage]['face'], edgecolor=color_palette[prev_iteration_stage]['edge'], label=f"Iteration I-1 [{stage_labels[prev_iteration_stage]}] Blocks"),
     patches.Patch(facecolor=color_palette[curr_iteration_stage]['face'], edgecolor=color_palette[curr_iteration_stage]['edge'], label=f"Iteration I [{stage_labels[curr_iteration_stage]}] Blocks"),
     patches.Patch(facecolor=color_palette[next_iteration_stage]['face'], edgecolor=color_palette[next_iteration_stage]['edge'], label=f"Iteration I+1 [{stage_labels[next_iteration_stage]}] Blocks"),
-    patches.Patch(facecolor='#aaaaaa', edgecolor='none', alpha=issue_alpha, label='Bright segment = issue duration (d); full segment = execution latency (L)')
+    patches.Patch(facecolor='#666666', edgecolor='none', alpha=issue_alpha, label='Dark segment = issue duration (d); light remainder = execution')
 ]
-ax.legend(handles=legend_patches, loc='upper right', facecolor='#1A1A1A', edgecolor='#444444', fontsize=10)
+iteration_legend = ax.legend(handles=legend_patches, loc='upper right', facecolor='#1A1A1A', edgecolor='#444444', fontsize=10)
+ax.add_artist(iteration_legend)
+
+wg_legend_patches = [
+    patches.Patch(
+        facecolor='#555555',
+        edgecolor='#d8d8d8',
+        hatch=wg_hatches.get(wgid, '---'),
+        label=f"WG{wgid}: warpId // 4 == {wgid}",
+    )
+    for wgid in active_wgids
+]
+ax.legend(handles=wg_legend_patches, loc='upper right', bbox_to_anchor=(1.0, 0.82), facecolor='#1A1A1A', edgecolor='#444444', fontsize=10)
 
 plt.tight_layout()
 

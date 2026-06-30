@@ -958,7 +958,11 @@ def _compute_buffer_span_priorities(
     return adjusted
 
 def _solve_smt_joint_optimize(
-    op_deps : Dict[int, List[int]], infos : List[_StmtInfo], all_indices : List[int], mod_sched_plan : Dict
+    op_deps : Dict[int, List[int]],
+    infos : List[_StmtInfo],
+    all_indices : List[int],
+    mod_sched_plan : Dict,
+    kernel_num_threads: int = 128,
 ):
     '''
     参照 _phase_b_consumer_ordering 实现 SMT 求解 optimized 模调度方案.
@@ -1014,19 +1018,6 @@ def _solve_smt_joint_optimize(
         ResourceType.SFU: 16,
         ResourceType.Barrier: 1,
     }
-    
-    def _get_warpgroup_count_from_info() :
-        warps = {
-            "tma" : 0,
-            "wgmma_consumer" : 0,
-            "alu_consumer" : 4  # 暂且认为 ALU consumer 使用一个warpgroup
-        }
-        for info in infos :
-            if info.is_wgmma :
-                warps["wgmma_consumer"] = 4
-            if info.is_true_tma :
-                warps["tma"] = 4  # tma copy global->shm 暂且认为是 wg级别的？
-        return  warps['tma'] +warps['wgmma_consumer'] +warps['alu_consumer']
     
     def _resource_for_info(info: _StmtInfo) -> ResourceType:
         if getattr(info, "is_wait_barrier", False):
@@ -1153,9 +1144,13 @@ def _solve_smt_joint_optimize(
         #     delay=_dependency_delay_for_info(info),
         # )
         
-    nwarps = _get_warpgroup_count_from_info()
+    try:
+        kernel_num_threads = int(kernel_num_threads)
+    except (TypeError, ValueError):
+        kernel_num_threads = 128
+    nwarps = max(1, (max(kernel_num_threads, 1) + 31) // 32) * 2
     mod_sched_plan['num_warps'] = nwarps
-    print(f'---- num_warps = {nwarps}')
+    print(f'---- num_warps (考虑PCWS 乘以2后) = {nwarps} (from threadIdx.x extent {kernel_num_threads})')
     num_warps = max(1, int(mod_sched_plan.get("num_warps", 1)))
     reg_limit = int(mod_sched_plan.get("reg_limit", 32* 240 * 4)) # 单个线程 255个 f32 寄存器；每个warp内需*32，阈值设置略低于 255
     smem_limit = int(mod_sched_plan.get("smem_limit", 227 * 1024))  # h100 : 227 Kbytes for CTA
@@ -2278,7 +2273,13 @@ def _transform_pipeline_loop(
         # ---- TWill : step 2 求解联合优化问题： 基础模调度M + warp_spec
         for plan in mod_sched_plans :
             print('----start  _solve_smt_joint_optimize', flush=True)
-            optimized =  _solve_smt_joint_optimize(deps_all, infos_list, all_indices, plan)
+            optimized =  _solve_smt_joint_optimize(
+                deps_all,
+                infos_list,
+                all_indices,
+                plan,
+                kernel_num_threads=func_num_threads,
+            )
             if optimized and optimized['modular_rrt'] is not None :
                 for row in optimized['modular_rrt'] :
                     print(row)
