@@ -54,11 +54,11 @@ from heddle.transform.auto_tl_pipeline_smt import (
     _collect_func_alloc_buffers,
     _collect_rw_regions,
     _detect_op_latency_and_resource,
+    _detect_op_issue_cycles,
     _detect_wgmma_issue_cycles,
     _estimate_buffer_footprint_bytes,
     _extract_num_threads,
     _is_shared,
-    SFU_ISSUE_CYCLES,
     _StmtInfo,
     _unwrap_to_seqstmt,
 )
@@ -395,6 +395,7 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
     duration = { key : 1 for key in ops }
     
     # 硬件发射槽位容量模型 （TMA暂且认为无发射限制。其受带宽影响）
+    # H100 有4个SM，每个SM上有 1 tensorcore 1TMA  16
     capacity = { "TMA": 255, "TC": 1, "ALU": 64, "SFU": 16 }
     
     # latencies - 指令执行耗时
@@ -423,17 +424,15 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         else:
             if info.is_wgmma:
                 issue_cycles = _detect_wgmma_issue_cycles(info.stmt)
-                duration[info.idx] = issue_cycles
+                duration[info.idx] = issue_cycles  # 指令发射所占的时钟周期
                 rrt[info.idx] = [{"TC": 1} for _ in range(issue_cycles)]
-                latency = issue_cycles
+                latency, _ = _detect_op_latency_and_resource(info.stmt)
             else:
                 latency, rty = _detect_op_latency_and_resource(info.stmt)
-                if rty is ResourceType.SFU:
-                    duration[info.idx] = SFU_ISSUE_CYCLES
-                    rrt[info.idx] = [{"SFU": 1} for _ in range(SFU_ISSUE_CYCLES)]
-                else:
-                    rrt[info.idx] = [{rty.value : 1}]
-            latencies[info.idx] = latency  # 记录真实的硬件执行延迟
+                issue_cycles = _detect_op_issue_cycles(info.stmt)
+                duration[info.idx] = issue_cycles  # 指令发射所占的时钟周期
+                rrt[info.idx] = [{rty.value : 1} for _ in range(issue_cycles)]  # 展开 rrt为 issue 周期数对应的表
+            latencies[info.idx] = latency  # 记录 op总体的 issue+execute 延迟
             estimated_total_latency += latency
 
     
@@ -991,6 +990,12 @@ def _solve_smt_joint_optimize(
         "ALU": ResourceType.ALU,
         "SFU": ResourceType.SFU,
     }
+    capacity = {
+        ResourceType.TMA: 255,
+        ResourceType.TensorCore: 1,
+        ResourceType.ALU: 64,
+        ResourceType.SFU: 16,
+    }
     
     def _get_warpgroup_count_from_info() :
         warps = {
@@ -1028,9 +1033,17 @@ def _solve_smt_joint_optimize(
         latency, _ = _detect_op_latency_and_resource(info.stmt)
         return max(int(latency), 1)
 
+    def _issue_delay_for_self_edge(info: _StmtInfo) -> int:
+        if getattr(info, "is_wait_barrier", False):
+            return 1
+        if getattr(info, "is_wgmma", False):
+            return max(int(_detect_wgmma_issue_cycles(info.stmt)), 1)
+        return max(int(_detect_op_issue_cycles(info.stmt)), 1)
+
     def _reservation_for_info(info: _StmtInfo, rty: ResourceType) -> List[Dict[ResourceType, int]]:
         # wait/try_wait barrier 会阻塞当前发射 warp；这里把它建模成
-        # 占满所有 FU 的独占 issue slot，和 _solve_naive_modulo_sched 保持一致。
+        # 一个同步 issue slot。不要按 ALU/SFU 总容量填满，否则长 SFU/ALU
+        # reservation 折叠到整个 II 时，会把所有 wait barrier 都判成不可行。
         if getattr(info, "is_wait_barrier", False):
             return [{
                 ResourceType.TMA: 1,
@@ -1041,9 +1054,8 @@ def _solve_smt_joint_optimize(
         if getattr(info, "is_wgmma", False):
             issue_cycles = _detect_wgmma_issue_cycles(info.stmt)
             return [{ResourceType.TensorCore: 1} for _ in range(issue_cycles)]
-        if rty is ResourceType.SFU:
-            return [{ResourceType.SFU: 1} for _ in range(SFU_ISSUE_CYCLES)]
-        return [{rty: 1}]
+        issue_cycles = _detect_op_issue_cycles(info.stmt)
+        return [{rty: 1} for _ in range(max(int(issue_cycles), 1))]
 
     nodes: List[OpNode] = []
     node_by_idx: Dict[int, OpNode] = {}
@@ -1110,13 +1122,13 @@ def _solve_smt_joint_optimize(
             node_by_idx[idx].add_dependency(
                 node_by_idx[idx],
                 distance=1,
-                delay=_dependency_delay_for_info(info),
+                delay=_issue_delay_for_self_edge(info),
             )
         if info.is_wait_barrier :
             node_by_idx[idx].add_dependency(
                 node_by_idx[idx],
                 distance=1,
-                delay=_dependency_delay_for_info(info),
+                delay=_issue_delay_for_self_edge(info),
             )
         # 一致性约束 : op[v,0,t] => op[v,i,t+i*II]  应用于所有op。不再限制 自读写 & sync语义
         # 关键点：op[v,0,t] => op[v,i,t+i*II] 这种“相位一致性”在当前 joint SMT 表达里已经由“每个 op 一个 Tv[v]，并固定 ii=base_I”隐含表示了；它不是 v -> v, distance=1, delay=latency 这种依赖边。后者表达的是“下一轮同一个 op 必须等上一轮这个 op 的结果/资源 hazard 结束”，只应该用于真实 loop-carried hazard，比如自读写 buffer 或 sync-like 语义。
@@ -1126,13 +1138,6 @@ def _solve_smt_joint_optimize(
         #     delay=_dependency_delay_for_info(info),
         # )
         
-    capacity = {
-        ResourceType.TMA: 1,
-        ResourceType.TensorCore: 1,
-        ResourceType.ALU: 1,
-        ResourceType.SFU: 1,
-    }
-
     nwarps = _get_warpgroup_count_from_info()
     mod_sched_plan['num_warps'] = nwarps
     print(f'---- num_warps = {nwarps}')

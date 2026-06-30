@@ -349,6 +349,40 @@ def _count_calls_with_static_loop_multiplier(stmt: tvm.tir.Stmt, pred) -> int:
     return count
 
 
+def _count_stmt_ops_with_static_loop_multiplier(stmt: tvm.tir.Stmt, pred) -> int:
+    count = 0
+    loop_multiplier = 1
+
+    @tir.functor.visitor
+    class CountVisitor(tir.PyStmtExprVisitor):
+        def visit_for_(self, op):
+            nonlocal loop_multiplier
+            extent = _static_positive_int(op.extent)
+            if extent is None:
+                super().visit_for_(op)
+                return
+
+            prev = loop_multiplier
+            loop_multiplier *= extent
+            super().visit_for_(op)
+            loop_multiplier = prev
+
+        def visit_buffer_store_(self, op):
+            nonlocal count
+            if pred(op):
+                count += loop_multiplier
+            super().visit_buffer_store_(op)
+
+        def visit_evaluate_(self, op):
+            nonlocal count
+            if pred(op):
+                count += loop_multiplier
+            super().visit_evaluate_(op)
+
+    CountVisitor().visit_stmt(stmt)
+    return count
+
+
 def _count_wgmma_ops_with_static_loop_multiplier(stmt: tvm.tir.Stmt) -> int:
     return _count_calls_with_static_loop_multiplier(stmt, _is_wgmma_call)
 
@@ -414,6 +448,15 @@ def _collect_wgmma_descs_with_static_loop_multiplier(
 def _count_tma_ops_with_static_loop_multiplier(stmt: tvm.tir.Stmt) -> int:
     count = _count_calls_with_static_loop_multiplier(stmt, _is_tma_call)
     return count
+
+
+def _op_total_latency(issue_cycles: int, execute_cycles: int) -> int:
+    return max(int(issue_cycles), 1) + max(int(execute_cycles), 0)
+
+# 循环次数 * 单次issue的时钟周期
+def _op_issue_cycles(op_ty: "ResourceType", count: int, desc_info: Optional[List] = None) -> int:
+    issue, _ = OpIssueAndLatencyTable.get_issue_execute_cycle(op_ty, desc_info or [])
+    return max(int(issue) * int(count), 1)
 
 
 def _is_sync_like(stmt: tvm.tir.Stmt, *, nested: bool) -> bool:
@@ -660,11 +703,93 @@ def _detect_wgmma_issue_cycles(stmt: tvm.tir.Stmt) -> int:
         issue, _ = OpIssueAndLatencyTable.get_issue_execute_cycle(
             ResourceType.TensorCore, [mnk_key, kind_idx]
         )
-        issue_cycles += int(issue) * int(count)
+        issue_cycles += int(issue) * int(count)  # issue 时钟周期
     return max(issue_cycles, 1)
 
 
+def _detect_op_issue_cycles(stmt: tvm.tir.Stmt) -> int:
+    """Return issue-slot occupancy after expanding static outer loops."""
+    try:
+        from heddle.scheduler.smt import ResourceType  # type: ignore
+    except Exception:  # pragma: no cover
+        from heddle.scheduler.smt import ResourceType  # type: ignore
 
+    if _count_wgmma_ops_with_static_loop_multiplier(stmt) > 0:
+        return _detect_wgmma_issue_cycles(stmt)
+    
+    # tma_op_count ： 循环次数 
+    tma_op_count = _count_tma_ops_with_static_loop_multiplier(stmt)
+    if tma_op_count > 0:
+        return _op_issue_cycles(ResourceType.TMA, tma_op_count)
+
+    op_names = _call_op_names(stmt)
+
+    ptx_mma_ops = {"tl.ptx_mma", "tl.ptx_mma_sp", "tl.ptx_mma_sm70"}
+    if op_names & ptx_mma_ops:
+        # Legacy ptx_mma nodes here do not carry a parsed TensorCore shape,
+        # so there is no safe table key. Keep the existing one-slot fallback.
+        return max(
+            _count_calls_with_static_loop_multiplier(
+                stmt,
+                lambda call: isinstance(call.op, tvm.ir.Op) and call.op.name in ptx_mma_ops,
+            ),
+            1,
+        )
+
+    if any(n.startswith("tl.ptx_ldmatrix") for n in op_names):
+        count = _count_calls_with_static_loop_multiplier(
+            stmt,
+            lambda call: isinstance(call.op, tvm.ir.Op)
+            and call.op.name.startswith("tl.ptx_ldmatrix"),
+        )
+        return _op_issue_cycles(ResourceType.ALU, count)
+
+    reduce_ops = {"tl.tl_reduce", "tl.reduce_max", "tl.reduce_sum"}
+    if op_names & reduce_ops:
+        count = _count_calls_with_static_loop_multiplier(
+            stmt,
+            lambda call: isinstance(call.op, tvm.ir.Op) and call.op.name in reduce_ops,
+        )
+        return _op_issue_cycles(ResourceType.ALU, count)
+
+    if any(n.startswith("extern:") and "reduce" in n.lower() for n in op_names):
+        count = _count_calls_with_static_loop_multiplier(
+            stmt,
+            lambda call: (
+                isinstance(call.op, tvm.ir.Op)
+                and call.op.name == "tir.call_extern"
+                and call.args
+                and isinstance(call.args[0], tvm.tir.StringImm)
+                and "reduce" in call.args[0].value.lower()
+            ),
+        )
+        return _op_issue_cycles(ResourceType.ALU, count)
+
+    sfu_ops = {"tir.exp2", "tir.rsqrt", "tir.log2", "tir.exp", "tir.log", "tir.sqrt", "tir.tanh", "tir.sigmoid"}
+    if op_names & sfu_ops:
+        count = _count_calls_with_static_loop_multiplier(
+            stmt,
+            lambda call: isinstance(call.op, tvm.ir.Op) and call.op.name in sfu_ops,
+        )
+        return _op_issue_cycles(ResourceType.SFU, count)
+
+    copy_fill_ops = {"tl.tl_copy", "tl.tl_fill"}
+    if op_names & copy_fill_ops:
+        count = _count_calls_with_static_loop_multiplier(
+            stmt,
+            lambda call: isinstance(call.op, tvm.ir.Op) and call.op.name in copy_fill_ops,
+        )
+        return _op_issue_cycles(ResourceType.ALU, count)
+
+    alu_stmt_count = _count_stmt_ops_with_static_loop_multiplier(
+        stmt,
+        lambda op: True,
+    )
+    return _op_issue_cycles(ResourceType.ALU, alu_stmt_count)
+
+
+# op的 发射+执行 时钟周期
+# 这里的op ： 指内部的基础op + 外围for循环构成的整体。 如for循环包裹的wgmma或tma或ALU、SFU指令，视为一个整体来参加调度规划求解
 def _detect_op_latency_and_resource(stmt: tvm.tir.Stmt) -> tuple:
     """Detect operation type and return (latency, ResourceType).
 
@@ -709,12 +834,12 @@ def _detect_op_latency_and_resource(stmt: tvm.tir.Stmt) -> tuple:
         # 单个wgmma执行周期
         [issue , execute] = OpIssueAndLatencyTable.get_issue_execute_cycle(ResourceType.TensorCore, [mnk_key,idx] )
         # 循环：不能简单xN。 正确计算方式 = interval * (N-1) + Latency, 这里 interval 简化为等于issue_time
-        return _detect_wgmma_issue_cycles(stmt) + execute, ResourceType.TensorCore
+        return _op_total_latency(_detect_wgmma_issue_cycles(stmt), execute), ResourceType.TensorCore
 
     tma_op_count = _count_tma_ops_with_static_loop_multiplier(stmt)
     if tma_op_count > 0:
         [issue, execute] = OpIssueAndLatencyTable.get_issue_execute_cycle(ResourceType.TMA, [])
-        return  execute, ResourceType.TMA
+        return _op_total_latency(issue * tma_op_count, execute), ResourceType.TMA
         # return 20 * tma_op_count, ResourceType.TMA
 
     op_names = _call_op_names(stmt)
@@ -722,31 +847,33 @@ def _detect_op_latency_and_resource(stmt: tvm.tir.Stmt) -> tuple:
     # Check for legacy PTX MMA (non-WGMMA, ~8 cycles on Hopper)
     ptx_mma_ops = {"tl.ptx_mma", "tl.ptx_mma_sp", "tl.ptx_mma_sm70"}
     if op_names & ptx_mma_ops:
-        return 8, ResourceType.TensorCore
+        return _op_total_latency(_detect_op_issue_cycles(stmt), 7), ResourceType.TensorCore
 
     # Check for ldmatrix (shared memory → register, ~1 cycle ALU)
     if any(n.startswith("tl.ptx_ldmatrix") for n in op_names):
-        return 1, ResourceType.ALU
+        return _op_total_latency(_detect_op_issue_cycles(stmt), 0), ResourceType.ALU
     
     # Check for Reduce operations
     if ("tl.tl_reduce" in op_names) or ("tl.reduce_max" in op_names) or ("tl.reduce_sum" in op_names):
-        return 3, ResourceType.ALU
+        return _op_total_latency(_detect_op_issue_cycles(stmt), 2), ResourceType.ALU
     
     for n in op_names:
         if n.startswith("extern:") and "reduce" in n.lower():
-            return 3, ResourceType.ALU
+            return _op_total_latency(_detect_op_issue_cycles(stmt), 2), ResourceType.ALU
     
     # Check for SFU operations (exp2, rsqrt, log2, etc.)
     sfu_ops = {"tir.exp2", "tir.rsqrt", "tir.log2", "tir.exp", "tir.log", "tir.sqrt", "tir.tanh", "tir.sigmoid"}
     if op_names & sfu_ops:
-        return 25, ResourceType.SFU
+        _, execute = OpIssueAndLatencyTable.get_issue_execute_cycle(ResourceType.SFU, [])
+        return _op_total_latency(_detect_op_issue_cycles(stmt), execute), ResourceType.SFU
     
     # Check for copy/fill operations
     if ("tl.tl_copy" in op_names) or ("tl.tl_fill" in op_names):
-        return 1, ResourceType.ALU
+        return _op_total_latency(_detect_op_issue_cycles(stmt), 0), ResourceType.ALU
     
     # Default: ALU with latency 1
-    return 1, ResourceType.ALU
+    issue, execute = OpIssueAndLatencyTable.get_issue_execute_cycle(ResourceType.ALU, [])
+    return _op_total_latency(_detect_op_issue_cycles(stmt) * issue, execute), ResourceType.ALU
 
 
 def _extract_num_threads(func: tvm.tir.PrimFunc) -> int:
@@ -1001,9 +1128,11 @@ def _schedule_with_smt(
 
         if use_precise_latency:
             latency, rty = _detect_op_latency_and_resource(info.stmt)
+            issue_cycles = _detect_op_issue_cycles(info.stmt)
         else:
             rty = ResourceType.ALU
             latency = 1
+            issue_cycles = 1
 
         if debug:
             op_names = _call_op_names(info.stmt)
@@ -1025,7 +1154,14 @@ def _schedule_with_smt(
                 footprint_bytes=fp,
             ))
 
-        n = OpNode(name=f"s{info.idx}", resource_type=rty, latency=latency, outputs=outputs)
+        reservation = [{rty: 1} for _ in range(max(int(issue_cycles), 1))]
+        n = OpNode(
+            name=f"s{info.idx}",
+            resource_type=rty,
+            latency=latency,
+            outputs=outputs,
+            reservation=reservation,
+        )
         nodes.append(n)
         idx_to_node[info.idx] = n
 
@@ -1187,10 +1323,12 @@ def _build_group_schedule_nodes(
                 continue
             if use_precise_latency:
                 latency, rty = _detect_op_latency_and_resource(info.stmt)
+                issue_cycles = _detect_op_issue_cycles(info.stmt)
             else:
                 latency, rty = 1, ResourceType.ALU
+                issue_cycles = 1
             lat = max(int(latency), 1)
-            reservation.extend([{rty: 1} for _ in range(lat)])
+            reservation.extend([{rty: 1} for _ in range(max(int(issue_cycles), 1))])
             total_latency += lat
 
         if not reservation:
