@@ -1337,6 +1337,7 @@ def _solve_smt_joint_optimize(
     used_smem_limit = smem_limit
     feasible_window = None
     liveness_info: Dict[str, object] = {}
+    # 1.先求可行解
     for solve_window in candidate_windows:
         for solve_reg_limit in reg_limit_candidates:
             for solve_smem_limit in smem_limit_candidates:
@@ -1361,7 +1362,7 @@ def _solve_smt_joint_optimize(
                 break
         if sol is not None:
             break
-
+    # 2.若1成功，开启optimize求最优解。不启用liveliness约束
     if sol is not None and feasible_window is not None:
         feasible_sol = sol
         opt_sol = _run_joint_solver(
@@ -1371,6 +1372,7 @@ def _solve_smt_joint_optimize(
             solve_smem_limit=used_smem_limit,
             enable_liveness=False,
         )
+        # 如果2成功，检查结果的liveliness、内存约束
         if opt_sol is not None:
             opt_schedule = opt_sol.get("schedule", {})
             opt_warp_assign = opt_sol.get("warp_assign", {})
@@ -1400,6 +1402,7 @@ def _solve_smt_joint_optimize(
                 liveness_info = live_info
                 solved_with_optimize = True
             else:
+                # 校验失败，fallback到可行解
                 print(
                     f"---- [0] SMT liveness check failed for optimized solution: {live_info}; "
                     "using feasibility solution",
@@ -1411,7 +1414,7 @@ def _solve_smt_joint_optimize(
                 "---- SMT optimize failed; using feasibility solution",
                 flush=True,
             )
-
+    # 如果1失败，重试optimize 求解
     if sol is None:
         print("---- SMT feasibility failed; start retry optimize", flush=True)
         for solve_window in candidate_windows:
@@ -1439,12 +1442,14 @@ def _solve_smt_joint_optimize(
                     break
             if sol is not None:
                 break
+    # 12都失败，表明联合求解失败。采用naive 模调度方案
     if sol is None:
         print('--- Retry failed. Fallback to naive sched plan')
         fallback = dict(mod_sched_plan)
         fallback.setdefault("status", "SMT_UNSAT")
         return fallback
-
+    
+    # 如果未收集到liveliness信息，构造之并检查
     if not liveness_info:
         sol_schedule = sol.get("schedule", {})
         sol_warp_assign = sol.get("warp_assign", {})
