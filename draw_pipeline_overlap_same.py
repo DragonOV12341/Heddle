@@ -1,8 +1,67 @@
+import os
+
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+from matplotlib import font_manager
 import numpy as np
 
 # ----------------- 1. 原始数据与配置 -----------------
+
+def configure_chinese_font():
+    """Prefer a CJK-capable font so Chinese text in op_desc can render."""
+    font_path_candidates = []
+    env_font_path = os.environ.get('CJK_FONT_PATH')
+    if env_font_path:
+        font_path_candidates.append(env_font_path)
+    font_path_candidates.extend([
+        os.path.join(os.path.dirname(__file__), 'fonts', filename)
+        for filename in (
+            'NotoSansCJK-Regular.ttc',
+            'NotoSansCJKsc-Regular.otf',
+            'SourceHanSansSC-Regular.otf',
+            'SourceHanSansCN-Regular.otf',
+            'WenQuanYiMicroHei.ttf',
+            'SimHei.ttf',
+        )
+    ])
+
+    for font_path in font_path_candidates:
+        if os.path.exists(font_path):
+            font_manager.fontManager.addfont(font_path)
+            selected_font = font_manager.FontProperties(fname=font_path).get_name()
+            plt.rcParams['font.sans-serif'] = [selected_font, 'DejaVu Sans']
+            plt.rcParams['font.family'] = 'sans-serif'
+            plt.rcParams['axes.unicode_minus'] = False
+            print(f"Using CJK font: {selected_font} ({font_path})")
+            return
+
+    font_candidates = [
+        'Noto Sans CJK SC',
+        'Noto Sans CJK JP',
+        'Source Han Sans SC',
+        'Source Han Sans CN',
+        'WenQuanYi Micro Hei',
+        'WenQuanYi Zen Hei',
+        'Microsoft YaHei',
+        'SimHei',
+        'Arial Unicode MS',
+    ]
+    installed_fonts = {font.name for font in font_manager.fontManager.ttflist}
+    selected_font = next((font for font in font_candidates if font in installed_fonts), None)
+    if selected_font is None:
+        print(
+            "Warning: no CJK font found. Chinese text in op_desc may render as boxes. "
+            "Install a font such as Noto Sans CJK SC, set CJK_FONT_PATH, "
+            "or put a supported font file under ./fonts/."
+        )
+        return
+
+    plt.rcParams['font.sans-serif'] = [selected_font, 'DejaVu Sans']
+    plt.rcParams['font.family'] = 'sans-serif'
+    plt.rcParams['axes.unicode_minus'] = False
+
+
+configure_chinese_font()
 
 warp_assign={'s0': 7, 's1': 2, 's2': 1, 's3': 1, 's4': 3, 's5': 0, 's6': 0, 's7': 0, 's8': 3, 's9': 2, 's10': 1, 's11': 3, 's12': 1, 's13': 0, 's14': 7, 's15': 1, 's16': 0}
 optimized_L=1523
@@ -15,23 +74,25 @@ latencies={0: 282, 1: 1, 2: 8, 3: 8, 4: 68, 5: 152, 6: 6, 7: 8, 8: 50, 9: 530, 1
 # 发射延迟
 duration={0: 2, 1: 1, 2: 4, 3: 4, 4: 64, 5: 128, 6: 4, 7: 4, 8: 32, 9: 512, 10: 4, 11: 128, 12: 4, 13: 64, 14: 2, 15: 1, 16: 128}
 op_desc = {
-    0 : 'async_copy Ks',
-    1 : 'wait Ks',
-    2 : 'smp = sm',
-    3 : 'clear sm',
-    4 : 'clear acc_s',
-    5 : 'wgmmaQK',
-    6 : 'sm = reduce_max QK',
-    7 : 'sm = max(sm, smp)',
-    8 : 'ss = exp2(smp, sm)',
-    9 : 'acc_s = exp2(acc_s, sm)',
-    10 : 'ssum = acc_s / ssum',
-    11 : 'acc_o = f11(acc_o, ss)',
-    12 : 'ls = f12(ls, ss, ssum)',
-    13 : 'acc_s_c = cast(acc_s)',
-    14 : 'async_copy Vs',
-    15 : 'wait Vs',
-    16 : 'acc_s_o += wgmmaPV',
+    0 : "async_copy Ks" ,
+    1 : "wait Ks" ,
+    2 : "smp = sm" ,
+    3 : "clear sm" ,
+    4 : "clear acc_s" ,
+    5 : "acc_s = wgmmaQK" ,
+    6 : "sm = reduce_max(acc_s)" ,
+    7 : "sm = max(sm, smp)  // update global max" ,
+    8 : "ss = exp2(smp - sm) // get scale" ,
+    9 : "acc_s = exp2(acc_s - sm)  // softmax's exp" ,
+    10 : "ssum = reduce_sum(acc_s ) // softmax's sumexp" ,
+    11 : "acc_o =  acc_o * ss // rescale last PV" ,
+    12 : "ls=ls * ss + ssum // accumulate sumexp" ,
+    13 : "acc_s_c = castf32tof16(acc_s)" ,
+    14 : "async_copy Vs" ,
+    15 : "wait Vs" ,
+    16 : "acc_o += wgmma(acc_s_c, V)" ,
+    # acc_o = acc_o / ls
+    # copy acc_o to Output
 }
 
 unit_mapping = {
