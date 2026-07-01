@@ -41,14 +41,15 @@ def _has_z3():
 
 
 def _make_smt_nodes(specs, *, num_warps=1, reg_limit=240, timeout_ms=5000,
-                    fu_caps=None):
+                    fu_caps=None, smem_allocations=None):
     """Build an SMT HeddleScheduler from a lightweight spec list.
 
     Each spec: (name, resource_type_str, latency, deps, outputs, kwargs)
     deps: [(parent_name, distance, blocking_sync?)]
-    outputs: [(name, storage_str, footprint, spill_cost)]
+    outputs: [(name, storage_str, footprint, spill_cost[, buffer_name[, lifetime]])]
     """
     from heddle.scheduler.smt import (
+        LifetimeSemantic,
         HeddleScheduler, OpNode, OutputValue, ResourceType as SRT,
         StorageKind as SSK,
     )
@@ -62,10 +63,18 @@ def _make_smt_nodes(specs, *, num_warps=1, reg_limit=240, timeout_ms=5000,
         deps = spec[3] if len(spec) > 3 else []
         outs = spec[4] if len(spec) > 4 else []
         kw = spec[5] if len(spec) > 5 else {}
-        ov_list = [
-            OutputValue(n, _sk.get(s, SSK.RMEM), fp, sc)
-            for n, s, fp, sc in outs
-        ]
+        ov_list = []
+        for out in outs:
+            n, s, fp, sc = out[:4]
+            buffer_name = out[4] if len(out) > 4 else None
+            lifetime = (
+                LifetimeSemantic[out[5]]
+                if len(out) > 5 else LifetimeSemantic.DEAD_ON_ENTRY
+            )
+            ov_list.append(
+                OutputValue(n, _sk.get(s, SSK.RMEM), fp, sc,
+                            lifetime=lifetime, buffer_name=buffer_name)
+            )
         nd = OpNode(name, _rt[rt], lat, outputs=ov_list, **kw)
         node_map[name] = nd
         nodes.append(nd)
@@ -84,7 +93,7 @@ def _make_smt_nodes(specs, *, num_warps=1, reg_limit=240, timeout_ms=5000,
     caps = fu_caps or {SRT.TMA: 1, SRT.TensorCore: 1, SRT.ALU: 2, SRT.SFU: 1}
     return HeddleScheduler(
         nodes, fu_caps=caps, reg_limit=reg_limit, num_warps=num_warps,
-        timeout_ms=timeout_ms,
+        timeout_ms=timeout_ms, smem_allocations=smem_allocations,
     )
 
 
@@ -370,6 +379,18 @@ class TestSMTModuloRegMultiplicity:
         assert result is not None
         assert result["reg_peak"][0] == 180
 
+    def test_rmem_allocation_is_grouped_by_buffer_name(self):
+        specs = [
+            ("A", "ALU", 1, [], [("A_buf", "RMEM", 60, 0, "frag", "DEAD_ON_EXIT")]),
+            ("B", "ALU", 1, [], [("B_buf", "RMEM", 60, 0, "frag", "DEAD_ON_EXIT")]),
+        ]
+
+        sched = _make_smt_nodes(
+            specs, num_warps=1, reg_limit=60, timeout_ms=5000)
+        result = sched._solve_phase_b(ii=2, L=4, optimize=True)
+        assert result is not None
+        assert result["reg_peak"][0] == 60
+
     def test_smem_allocation_is_not_multiplied_by_iteration_copies(self):
         specs = [
             ("S", "ALU", 1, [("S", 3)], [("buf", "SMEM", 32768, 0)]),
@@ -380,6 +401,37 @@ class TestSMTModuloRegMultiplicity:
         sched.smem_limit = 32768
         result = sched._solve_phase_b(ii=1, L=3, optimize=False)
         assert result is not None
+
+    def test_smem_allocation_is_grouped_by_buffer_name(self):
+        specs = [
+            ("A", "ALU", 1, [], [("A_buf", "SMEM", 32768, 0, "buf", "DEAD_ON_EXIT")]),
+            ("B", "ALU", 1, [], [("B_buf", "SMEM", 32768, 0, "buf", "DEAD_ON_EXIT")]),
+        ]
+
+        sched = _make_smt_nodes(
+            specs, num_warps=2, reg_limit=1024, timeout_ms=5000)
+        sched.smem_limit = 32768
+        result = sched._solve_phase_b(ii=1, L=3, optimize=False)
+        assert result is not None
+
+    def test_smem_input_allocation_counts_without_output(self):
+        specs = [
+            ("A", "ALU", 1, [], []),
+        ]
+
+        fits = _make_smt_nodes(
+            specs, num_warps=1, reg_limit=1024, timeout_ms=5000,
+            smem_allocations={"input_buf": 32768},
+        )
+        fits.smem_limit = 32768
+        assert fits._solve_phase_b(ii=1, L=3, optimize=False) is not None
+
+        too_tight = _make_smt_nodes(
+            specs, num_warps=1, reg_limit=1024, timeout_ms=5000,
+            smem_allocations={"input_buf": 32768},
+        )
+        too_tight.smem_limit = 32767
+        assert too_tight._solve_phase_b(ii=1, L=3, optimize=False) is None
 
 
 class TestSMTSubcoreIssueExclusion:

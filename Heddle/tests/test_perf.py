@@ -88,13 +88,14 @@ def test_gemm():
 
 
 def test_fa_fwd():
-    print("\n=== FlashAttention FWD (B=4 H=32 T=4096 D=128) ===")
     B, H, Tseq, D = 1, 32, 4096, 128
+    print(f"\n=== FlashAttention FWD ({B=} {H=} {Tseq=} {D=}) ===")
     bM, bN, stages, threads = 128, 64, 2, 128
     scale = (1.0 / D) ** 0.5 * 1.44269504
     shape = [B, Tseq, H, D]
     flops = 4.0 * B * H * Tseq * Tseq * D
-
+    
+    rets = []
     for mode_name, pc in [
         ("Baseline", {}),
         ("Heddle", {
@@ -169,10 +170,13 @@ def test_fa_fwd():
             ms = bench(lambda: compiled(Q, K, V))
             tflops = flops / ms / 1e9
             print(f"  {mode_name:<12}: {tflops:>6.0f} TFLOPS  {ms:.3f} ms")
+            rets.append( compiled(Q,K,V) )
         except Exception as e:
             print(f"  {mode_name:<12}: FAIL — {str(e)[:]}")
-
-
+    assert len(rets) == 2
+    isEqual = torch.allclose(rets[0], rets[1], atol=1e-2, rtol=1e-2)
+    print(f"{isEqual=}")
+    
 if __name__ == "__main__":
     # test_gemm()
     test_fa_fwd()

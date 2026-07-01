@@ -653,9 +653,9 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
             print("I =", ans["I"], flush=True)
             print("L =", ans["L"], flush=True)
             print("M =", ans["M"], flush=True)
-            print("Modular RRT:")
-            for row in ans["modular_rrt"]:
-                print(row)
+            # print("Modular RRT:")
+            # for row in ans["modular_rrt"]:
+            #     print(row)
     else:
         print('ans none')
     return results
@@ -1078,6 +1078,7 @@ def _solve_smt_joint_optimize(
                 storage=storage,
                 footprint_bytes=footprint,
                 lifetime=LifetimeSemantic.DEAD_ON_ENTRY,
+                buffer_name=wr.buffer.name,
             ))
         
         need_warpgroup = info.is_wgmma
@@ -1154,18 +1155,27 @@ def _solve_smt_joint_optimize(
     num_warps = max(1, int(mod_sched_plan.get("num_warps", 1)))
     reg_limit = int(mod_sched_plan.get("reg_limit", 32* 240 * 4)) # 单个线程 255个 f32 寄存器；每个warp内需*32，阈值设置略低于 255
     smem_limit = int(mod_sched_plan.get("smem_limit", 227 * 1024))  # h100 : 227 Kbytes for CTA
-    smem_output_floor = sum(
-        out.footprint_bytes
-        for node in nodes
-        for out in node.outputs
-        if out.storage == StorageKind.SMEM and out.footprint_bytes > 0
-    )
-    if smem_output_floor > smem_limit:
+    smem_allocations_by_buffer: Dict[str, int] = {}
+    for idx in ops:
+        info = infos[idx]
+        for region in list(info.reads) + list(info.writes):
+            if not _is_shared(region.buffer):
+                continue
+            footprint = _estimate_buffer_footprint_bytes(region.buffer)
+            if footprint <= 0:
+                continue
+            buffer_key = region.buffer.name
+            smem_allocations_by_buffer[buffer_key] = max(
+                smem_allocations_by_buffer.get(buffer_key, 0),
+                int(footprint),
+            )
+    smem_allocation_floor = sum(smem_allocations_by_buffer.values())
+    if smem_allocation_floor > smem_limit:
         print(
-            f"---- SHM 到达 smem_limit 限制（未考虑复用的简单求和）: {smem_limit} -> {smem_output_floor}",
+            f"---- SHM 到达 smem_limit 限制（按 input/output bufferName 聚合）: {smem_limit} -> {smem_allocation_floor}",
             flush=True,
         )
-        smem_limit = smem_output_floor
+        smem_limit = smem_allocation_floor
         print(f"--- 调整 smem_limit 为 {smem_limit}")
 
     # SMT 优化器使用 naive plan 的基础窗口；如果 naive 的绝对调度时间
@@ -1191,6 +1201,7 @@ def _solve_smt_joint_optimize(
                 for idx, t in base_M.items()
                 if idx in node_by_idx
             },
+            smem_allocations=smem_allocations_by_buffer,
         )
         return solver.schedule_joint(
             min_ii=base_I,
@@ -1272,10 +1283,16 @@ def _solve_smt_joint_optimize(
 
         reg_peak: Dict[int, int] = {w: 0 for w in range(num_warps)}
         smem_peak = 0
+        static_smem_total = sum(
+            int(footprint)
+            for footprint in smem_allocations_by_buffer.values()
+            if int(footprint) > 0
+        )
         for tau in range(max(int(check_L), 0)):
-            smem_total = 0
-            smem_live_seen: Set[int] = set()
-            reg_total: Dict[int, int] = {w: 0 for w in range(num_warps)}
+            smem_live_bytes: Dict[str, int] = {}
+            reg_live_bytes: Dict[int, Dict[str, int]] = {
+                w: {} for w in range(num_warps)
+            }
             for xi, (producer_idx, oval) in enumerate(all_outputs):
                 if oval.footprint_bytes <= 0:
                     continue
@@ -1285,12 +1302,26 @@ def _solve_smt_joint_optimize(
                         continue
                     live_any_copy = True
                     if oval.storage == StorageKind.RMEM:
+                        buffer_key = oval.rmem_buffer_key()
                         for w in fixed_warps.get(producer_idx, [0]):
-                            reg_total[w] = reg_total.get(w, 0) + int(oval.footprint_bytes)
-                if oval.storage == StorageKind.SMEM and live_any_copy and xi not in smem_live_seen:
-                    smem_total += int(oval.footprint_bytes)
-                    smem_live_seen.add(xi)
+                            reg_live_bytes.setdefault(w, {})
+                            reg_live_bytes[w][buffer_key] = max(
+                                reg_live_bytes[w].get(buffer_key, 0),
+                                int(oval.footprint_bytes),
+                            )
+                if oval.storage == StorageKind.SMEM and live_any_copy:
+                    buffer_key = oval.smem_buffer_key()
+                    if buffer_key in smem_allocations_by_buffer:
+                        continue
+                    smem_live_bytes[buffer_key] = max(
+                        smem_live_bytes.get(buffer_key, 0),
+                        int(oval.footprint_bytes),
+                    )
 
+            reg_total: Dict[int, int] = {
+                w: sum(bytes_by_buffer.values())
+                for w, bytes_by_buffer in reg_live_bytes.items()
+            }
             for w, total in reg_total.items():
                 if total > reg_peak.get(w, 0):
                     reg_peak[w] = total
@@ -1303,6 +1334,7 @@ def _solve_smt_joint_optimize(
                         "limit": check_reg_limit,
                         "reg_peak": reg_peak,
                     }
+            smem_total = static_smem_total + sum(smem_live_bytes.values())
             smem_peak = max(smem_peak, smem_total)
             if check_smem_limit > 0 and smem_total > check_smem_limit:
                 return False, {
@@ -1524,7 +1556,7 @@ def _solve_smt_joint_optimize(
     table = []
     for r in range(base_I):
         row = {"slot": f"{r} mod {base_I}"}
-        for f in ("TMA", "TC", "ALU", "SFU"):
+        for f in ("TMA", "TC", "ALU", "SFU", "BARRIER"):
             row[f] = []
         modified=False
         for idx in ops:
@@ -1536,7 +1568,7 @@ def _solve_smt_joint_optimize(
                     continue
                 for rty, used in per_cycle.items():
                     if int(used):
-                        row[rty.value].append(idx)
+                        row.setdefault(rty.value, []).append(idx)
                         modified=True
         if modified:
             table.append(row)
@@ -1740,6 +1772,7 @@ def _extract_barrier_hints(
     consumer_ordering: List[int],
     times_b: Dict[str, int],
     *,
+    stage_offsets: Optional[Dict[int, int]] = None,
     use_precise_latency: bool = False,
     debug: bool = False,
 ) -> PhaseB_PCWS_Hint:
@@ -1847,7 +1880,7 @@ def _extract_barrier_hints(
     return PhaseB_PCWS_Hint(
         consumer_ordering=consumer_ordering,
         barrier_hints=hints,
-        stage_offsets={},  # Stage offsets require cross-stage Z3 extension
+        stage_offsets=dict(stage_offsets or {}),
     )
 
 
@@ -1859,6 +1892,7 @@ def _reorder_loop_body(
     seq: tvm.tir.SeqStmt,
     infos: List[_StmtInfo],
     new_consumer_order: List[int],
+    full_stmt_order: Optional[List[int]] = None,
 ) -> tvm.tir.SeqStmt:
     """Reconstruct the SeqStmt with producers hoisted and consumers reordered.
 
@@ -1877,6 +1911,23 @@ def _reorder_loop_body(
     with the full consumer compute window, instead of stalling behind the
     serial WGMMA chain.
     """
+    if full_stmt_order is not None:
+        seen: Set[int] = set()
+        new_stmts: List[tvm.tir.Stmt] = []
+        for idx in full_stmt_order:
+            if 0 <= idx < len(seq.seq) and idx not in seen:
+                new_stmts.append(seq.seq[idx])
+                seen.add(idx)
+        for info in infos:
+            idx = info.idx
+            if 0 <= idx < len(seq.seq) and idx not in seen:
+                new_stmts.append(seq.seq[idx])
+                seen.add(idx)
+        for idx, stmt in enumerate(seq.seq):
+            if idx not in seen:
+                new_stmts.append(stmt)
+        return tvm.tir.SeqStmt(new_stmts)
+
     producer_indices = [info.idx for info in infos if info.is_producer]
     consumer_set = set(new_consumer_order)
 
@@ -2486,6 +2537,130 @@ def _transform_pipeline_loop(
         # ---- TWill : step 1 求解基础模调度M
         mod_sched_plans = _solve_naive_modulo_sched(deps_all, infos_list, all_indices)
         # ---- TWill : step 2 求解联合优化问题： 基础模调度M + warp_spec
+        joint_phase_b_result = None
+        joint_phase_b_source = None
+
+        def _loop_num_stages() -> int:
+            annotations = stmt.annotations or {}
+            value = annotations.get("num_stages")
+            try:
+                return int(value)
+            except Exception:
+                try:
+                    return int(value.value)
+                except Exception:
+                    return 0
+
+        def _derive_joint_num_stages(optimized: Dict) -> int:
+            try:
+                base_I = int(optimized.get("I", 0))
+                window_L = int(optimized.get("L", optimized.get("window", 0)))
+            except (TypeError, ValueError):
+                return 0
+            if base_I <= 0 or window_L <= 0:
+                return 0
+            return max(1, (window_L + base_I - 1) // base_I)
+
+        def _derive_joint_stage_offsets(
+            opt_M: Dict[int, int],
+            base_I: int,
+            joint_order: List[int],
+            num_stages: int,
+        ) -> Dict[int, int]:
+            if base_I <= 0:
+                return {}
+
+            compact_index = {ci: pos for pos, ci in enumerate(joint_order)}
+            offsets: Dict[int, int] = {}
+            skipped: Dict[int, int] = {}
+
+            for ci in consumer_indices:
+                info = infos_list[ci]
+                # Only shared-buffer readers need rewritten ring-buffer stage
+                # expressions. Pure register/local ops may be scheduled late
+                # without changing which producer iteration they consume.
+                if not any(_is_shared(rd.buffer) for rd in info.reads):
+                    continue
+                offset = -(int(opt_M[ci]) // base_I)
+                if offset == 0:
+                    continue
+                if num_stages > 0 and abs(offset) >= num_stages:
+                    skipped[ci] = offset
+                    continue
+                offsets[compact_index[ci]] = offset
+
+            if debug and offsets:
+                print(f"[Heddle] Derived joint stage offsets for PCWS: {offsets}",
+                      file=sys.stderr, flush=True)
+            if debug and skipped:
+                print(
+                    f"[Heddle] Skipped unsupported joint stage offsets "
+                    f"(num_stages={num_stages}): {skipped}",
+                    file=sys.stderr, flush=True,
+                )
+            return offsets
+
+        def _joint_result_to_phase_b_result(optimized: Dict) -> Optional[Tuple[List[int], Dict[str, int], Dict[str, int], Dict[int, int], List[int], int]]:
+            opt_M = optimized.get("M") or {}
+            if not opt_M:
+                return None
+
+            missing_times = [ci for ci in consumer_indices if ci not in opt_M]
+            if missing_times:
+                if debug:
+                    print(
+                        f"[Heddle] Joint SMT result missing consumer times for {missing_times}; "
+                        "falling back to original Phase B",
+                        file=sys.stderr, flush=True,
+                    )
+                return None
+
+            joint_full_order = sorted(
+                [idx for idx in all_indices if idx in opt_M],
+                key=lambda idx: (int(opt_M[idx]), idx),
+            )
+            joint_order = [idx for idx in joint_full_order if idx in set(consumer_indices)]
+            joint_times = {f"s{ci}": int(opt_M[ci]) for ci in consumer_indices}
+            try:
+                base_I = int(optimized.get("I", 0))
+            except (TypeError, ValueError):
+                base_I = 0
+            joint_num_stages = _derive_joint_num_stages(optimized)
+            if joint_num_stages <= 0:
+                joint_num_stages = _loop_num_stages()
+            joint_stage_offsets = _derive_joint_stage_offsets(
+                opt_M, base_I, joint_order, joint_num_stages)
+
+            opt_warps = optimized.get("warp_assign") or {}
+            joint_warps: Dict[str, int] = {}
+            if opt_warps:
+                missing_warps = [ci for ci in consumer_indices if ci not in opt_warps]
+                if missing_warps:
+                    if debug:
+                        print(
+                            f"[Heddle] Joint SMT result missing consumer warp assigns for {missing_warps}; "
+                            "using ordering/barrier hints without per-op dispatch",
+                            file=sys.stderr, flush=True,
+                        )
+                else:
+                    # The joint solver assigns logical warp ids. FineGrainedWS
+                    # per-op dispatch expects compact 128-thread warp-group ids.
+                    raw_groups = {ci: max(0, int(opt_warps[ci]) // 4) for ci in consumer_indices}
+                    group_remap = {g: pos for pos, g in enumerate(sorted(set(raw_groups.values())))}
+                    joint_warps = {
+                        f"s{ci}": group_remap[raw_groups[ci]]
+                        for ci in consumer_indices
+                    }
+
+            return (
+                joint_order,
+                joint_times,
+                joint_warps,
+                joint_stage_offsets,
+                joint_full_order,
+                joint_num_stages,
+            )
+
         for plan in mod_sched_plans :
             print('----start  _solve_smt_joint_optimize', flush=True)
             optimized =  _solve_smt_joint_optimize(
@@ -2495,9 +2670,17 @@ def _transform_pipeline_loop(
                 plan,
                 kernel_num_threads=func_num_threads,
             )
-            if optimized and optimized['modular_rrt'] is not None :
-                for row in optimized['modular_rrt'] :
-                    print(row)
+            if optimized is not None:
+                print(f'---{optimized=}',flush=True)
+            # if optimized and optimized['modular_rrt'] is not None :
+            #     for row in optimized['modular_rrt'] :
+            #         print(row)
+            if optimized and optimized.get("status") in ("SMT_OPTIMIZED", "SMT_FEASIBLE"):
+                candidate_phase_b_result = _joint_result_to_phase_b_result(optimized)
+                if candidate_phase_b_result is not None:
+                    if joint_phase_b_result is None or int(optimized.get("L", 10**18)) < int(joint_phase_b_source.get("L", 10**18)):
+                        joint_phase_b_result = candidate_phase_b_result
+                        joint_phase_b_source = optimized
 
         # ── Phase B: SMT-based joint ordering ──
         # Policy: run Phase B if (a) explicitly enabled, or (b) ≥3 WGMMA
@@ -2507,6 +2690,8 @@ def _transform_pipeline_loop(
         n_tc_ops = len(consumer_wgmma_indices)
         auto_phase_b = (n_tc_ops >= 3) and (len(consumer_indices) >= 6)
         run_phase_b = use_phase_b or auto_phase_b or consumer_num_warps > 1
+        if joint_phase_b_result is not None:
+            run_phase_b = True
 
         if run_phase_b:
             # Adaptive timeout: 500ms base + 100ms per consumer node
@@ -2518,16 +2703,40 @@ def _transform_pipeline_loop(
 
             import time as _time
             _pb_t0 = _time.perf_counter()
-            phase_b_result = _phase_b_consumer_ordering(
-                infos_list, consumer_indices, deps,
-                use_precise_latency=use_precise_latency,
-                num_warps=consumer_num_warps,
-                timeout_ms=adaptive_timeout,
-                debug=debug,
-            )
+            if joint_phase_b_result is not None:
+                phase_b_result = joint_phase_b_result
+                print(
+                    f"[Heddle] Using joint SMT schedule for PCWS lowering "
+                    f"(status={joint_phase_b_source.get('status')}, "
+                    f"L={joint_phase_b_source.get('L')}, I={joint_phase_b_source.get('I')})",
+                    file=sys.stderr, flush=True,
+                )
+            else:
+                phase_b_result = _phase_b_consumer_ordering(
+                    infos_list, consumer_indices, deps,
+                    use_precise_latency=use_precise_latency,
+                    num_warps=consumer_num_warps,
+                    timeout_ms=adaptive_timeout,
+                    debug=debug,
+                )
             _pb_elapsed = (_time.perf_counter() - _pb_t0) * 1000
+            phase_b_stage_offsets: Dict[int, int] = {}
+            phase_b_full_order: Optional[List[int]] = None
+            phase_b_num_stages: int = 0
             if phase_b_result is not None:
-                phase_b_order, phase_b_times, phase_b_warps = phase_b_result
+                if len(phase_b_result) == 6:
+                    (
+                        phase_b_order,
+                        phase_b_times,
+                        phase_b_warps,
+                        phase_b_stage_offsets,
+                        phase_b_full_order,
+                        phase_b_num_stages,
+                    ) = phase_b_result
+                elif len(phase_b_result) == 4:
+                    phase_b_order, phase_b_times, phase_b_warps, phase_b_stage_offsets = phase_b_result
+                else:
+                    phase_b_order, phase_b_times, phase_b_warps = phase_b_result
             else:
                 phase_b_order, phase_b_times, phase_b_warps = None, {}, {}
 
@@ -2557,13 +2766,12 @@ def _transform_pipeline_loop(
                       file=sys.stderr, flush=True)
             if phase_b_order is not None:
                 order_changed = (phase_b_order != consumer_indices)
-                if debug:
-                    if order_changed:
-                        print(f"[Heddle] Using Phase B ordering: {consumer_indices} -> {phase_b_order}",
-                              file=sys.stderr, flush=True)
-                    else:
-                        print(f"[Heddle] Phase B ordering unchanged, but extracting barrier hints",
-                              file=sys.stderr, flush=True)
+                if order_changed:
+                    print(f"[Heddle] Using Phase B ordering: {consumer_indices} -> {phase_b_order}",
+                            file=sys.stderr, flush=True)
+                else:
+                    print(f"[Heddle] Phase B ordering unchanged, but extracting barrier hints",
+                            file=sys.stderr, flush=True)
 
                 # Extract barrier hints from Phase B schedule times.
                 # Hints are valuable even when the ordering is unchanged,
@@ -2573,6 +2781,7 @@ def _transform_pipeline_loop(
                     pcws_hint = _extract_barrier_hints(
                         infos_list, consumer_indices, phase_b_order,
                         phase_b_times,
+                        stage_offsets=phase_b_stage_offsets,
                         use_precise_latency=use_precise_latency,
                         debug=debug,
                     )
@@ -2582,8 +2791,17 @@ def _transform_pipeline_loop(
                               file=sys.stderr, flush=True)
 
                 # Build new loop body (reordered or original)
-                if order_changed:
-                    new_seq = _reorder_loop_body(seq, infos_list, phase_b_order)
+                full_order_changed = (
+                    phase_b_full_order is not None
+                    and phase_b_full_order != [info.idx for info in infos_list]
+                )
+                if order_changed or full_order_changed:
+                    new_seq = _reorder_loop_body(
+                        seq,
+                        infos_list,
+                        phase_b_order,
+                        full_stmt_order=phase_b_full_order,
+                    )
                     new_body = _rewrap_body(stmt.body, seq, new_seq)
                     changed[0] = True
                 else:
@@ -2594,6 +2812,24 @@ def _transform_pipeline_loop(
                 # the ordering is unchanged.
                 new_annotations = dict(stmt.annotations) if stmt.annotations else {}
                 annotations_changed = False
+                if phase_b_num_stages > 0:
+                    old_num_stages = new_annotations.get("num_stages")
+                    try:
+                        old_num_stages_int = int(old_num_stages)
+                    except Exception:
+                        try:
+                            old_num_stages_int = int(old_num_stages.value)
+                        except Exception:
+                            old_num_stages_int = None
+                    if old_num_stages_int != phase_b_num_stages:
+                        new_annotations["num_stages"] = phase_b_num_stages
+                        annotations_changed = True
+                        print(
+                            f"[Heddle] Replacing num_stages: "
+                            f"{old_num_stages_int} -> {phase_b_num_stages}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
 
                 # Auto-inject dual-consumer annotation when pattern detected
                 if not phase_b_warps and len(consumer_wgmma_indices) >= 2 and has_non_tc_gap:
@@ -2839,8 +3075,24 @@ def _rewrap_body(
 ) -> tvm.tir.Stmt:
     """Re-wrap the new SeqStmt with the original Block/BlockRealize/Let/Attr layers."""
     # Walk the original body to find the old SeqStmt, then substitute
-    def _substitute(node):
+    replaced = [False]
+
+    def _matches_old_seq(node) -> bool:
         if node is old_seq:
+            return True
+        try:
+            if hasattr(node, "same_as") and node.same_as(old_seq):
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(tvm.ir.structural_equal(node, old_seq))
+        except Exception:
+            return False
+
+    def _substitute(node):
+        if _matches_old_seq(node):
+            replaced[0] = True
             return new_seq
         if isinstance(node, tvm.tir.BlockRealize):
             blk = node.block
@@ -2879,7 +3131,12 @@ def _rewrap_body(
             return tvm.tir.IfThenElse(node.condition, new_then, None)
         return node
 
-    return _substitute(original_body)
+    rewritten = _substitute(original_body)
+    if not replaced[0]:
+        print("[Heddle] WARNING: _rewrap_body could not find target SeqStmt; "
+              "consumer reorder was not applied",
+              file=sys.stderr, flush=True)
+    return rewritten
 
 
 # ---------------------------------------------------------------------------
@@ -2929,7 +3186,7 @@ def HeddleConsumerSchedule():
                 consumer_num_warps=consumer_num_warps,
                 debug=debug,
             )
-            print(" --after smt ----\n " ,result.script())
+            print("--after smt ----\n " ,result.script())
             
             return result
         except Exception as e:

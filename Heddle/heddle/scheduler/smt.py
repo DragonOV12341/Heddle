@@ -51,6 +51,13 @@ class OutputValue:
     footprint_bytes: int = 0
     spill_cost: int = 0
     lifetime: LifetimeSemantic = LifetimeSemantic.DEAD_ON_ENTRY
+    buffer_name: Optional[str] = None
+
+    def smem_buffer_key(self) -> str:
+        return self.buffer_name or self.name
+
+    def rmem_buffer_key(self) -> str:
+        return self.buffer_name or self.name
 
 
 @dataclass
@@ -162,6 +169,7 @@ class HeddleScheduler:
         include_incoming_live: bool = True,
         enable_liveness: bool = True,
         start_hints: Optional[Dict[str, int]] = None,
+        smem_allocations: Optional[Dict[str, int]] = None,
     ):
         self.nodes = nodes
         self.fu_caps = fu_caps or {
@@ -178,6 +186,7 @@ class HeddleScheduler:
         self.include_incoming_live = include_incoming_live
         self.enable_liveness = enable_liveness
         self.start_hints = start_hints or {}
+        self.smem_allocations = dict(smem_allocations or {})
 
     # ------------------------------------------------------------------ #
     # Phase A  (unchanged API)
@@ -780,12 +789,106 @@ class HeddleScheduler:
                         if delta > 0:
                             loop_carried.add(xi)  # opvi 有跨迭代依赖
 
-        # feasibility 阶段先只求一个满足依赖/warp/FU 的联合排布，避免把
-        # RMEM/SMEM 活跃区间网格也放进首轮模型。需要峰值/容量优化时再在
-        # optimize=True 的模型里展开这部分。
+        # feasibility 阶段仍跳过 RMEM 容量网格以控制模型大小，但 SMEM
+        # footprint 是 CTA 全局容量约束，需要独立于 track_liveness 建模。
         track_liveness = bool(self.enable_liveness and optimize and all_outputs and self.reg_limit > 0)
-        iter_offsets = range(0, 1)
+        max_iter_overlap = (L - 1) // max(int(ii), 1)
+        iter_offsets = (
+            range(-max_iter_overlap, max_iter_overlap + 1)
+            if self.include_incoming_live else
+            range(0, 1)
+        )
         iter_live = {}
+
+        def _iter_live_var(xi: int, iter_offset: int, tau: int):
+            key = (xi, iter_offset, tau)
+            if key in iter_live:
+                return iter_live[key]
+
+            producer_v, oval = all_outputs[xi]
+            produced_by = _start_le_var(
+                producer_v, tau - iter_offset * ii)
+
+            if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY:
+                consumers = (
+                    consumers_of[xi] if self.include_incoming_live else
+                    [(cv, d) for cv, d in consumers_of[xi] if d == 0]
+                )
+                if not consumers:
+                    b = _false_var(
+                        f"iter_live_false_x={xi}_k={iter_offset}_t={tau}")
+                else:
+                    producer_lat = int(self.nodes[producer_v].latency)
+                    consumed_terms = []
+                    for cv, d in consumers:
+                        consume_bound = tau - (iter_offset + d) * ii
+                        # Zero-latency values can be produced and consumed
+                        # in the same cycle, but they still occupy the
+                        # register during that cycle. Treat consumption as
+                        # complete only after the consumer's start cycle.
+                        if producer_lat == 0:
+                            consume_bound -= 1
+                        consumed_terms.append(
+                            _start_le_var(cv, consume_bound))
+                    all_consumed = _and_var(
+                        f"iter_consumed_x={xi}_k={iter_offset}_t={tau}",
+                        consumed_terms,
+                    )
+                    b = model.new_bool_var(
+                        f"iter_live_x={xi}_k={iter_offset}_t={tau}")
+                    model.add_implication(b, produced_by)
+                    model.add_implication(b, all_consumed.negated())
+                    model.add_bool_or([
+                        produced_by.negated(),
+                        all_consumed,
+                        b,
+                    ])
+            else:
+                b = produced_by
+
+            iter_live[key] = b
+            return b
+
+        # ---- SMEM 容量约束（全局统计） -------------------------------
+        # SMEM footprint 表示 shared buffer allocation 的大小。这个
+        # allocation 已经包含 pipeline stage / double-buffer 空间，
+        # 不能像 RMEM value 一样按重叠迭代副本重复累加；同一个
+        # shared buffer 被多个 stmt 写到时也只按 bufferName 统计一次。
+        static_smem_terms = [
+            int(footprint)
+            for footprint in self.smem_allocations.values()
+            if int(footprint) > 0
+        ]
+        for tau in range(L):
+            smem_live_by_buffer: dict[str, list] = defaultdict(list)
+            smem_footprint_by_buffer: dict[str, int] = {}
+            for xi, (pv, oval) in enumerate(all_outputs):
+                if oval.storage != StorageKind.SMEM or oval.footprint_bytes <= 0:
+                    continue
+                buffer_key = oval.smem_buffer_key()
+                if buffer_key in self.smem_allocations:
+                    continue
+                any_copy_live = _or_var(
+                    f"smem_live_x={xi}_t={tau}",
+                    [_iter_live_var(xi, iter_offset, tau)
+                        for iter_offset in iter_offsets],
+                )
+                smem_live_by_buffer[buffer_key].append(any_copy_live)
+                smem_footprint_by_buffer[buffer_key] = max(
+                    smem_footprint_by_buffer.get(buffer_key, 0),
+                    int(oval.footprint_bytes),
+                )
+            smem_terms = []
+            for buffer_key, live_terms in smem_live_by_buffer.items():
+                buffer_live = _or_var(
+                    f"smem_live_buf={buffer_key}_t={tau}",
+                    live_terms,
+                )
+                smem_terms.append(
+                    smem_footprint_by_buffer[buffer_key] * buffer_live)
+            smem_total_terms = static_smem_terms + smem_terms
+            if smem_total_terms:
+                model.add(sum(smem_total_terms) <= self.smem_limit)
 
         if track_liveness:
             # live[xi, tau]：第 xi 个输出在第 0 轮迭代的 tau 时刻是否 live。
@@ -863,74 +966,15 @@ class HeddleScheduler:
                         else:
                             model.add(incoming_live[(xi, tau)] == 0)
 
-            # 在 steady-state modulo schedule 中，同一个逻辑输出可能同时有
-            # 多个迭代副本存活。例如观察窗口覆盖 i-1、i、i+1 时，三份
-            # output register 应该分别计入容量，而不是折叠成一个 incoming
-            # 布尔值。这里按迭代偏移 k 枚举窗口内可能重叠的副本：
-            #   producer instance starts at Tv[p] + k * ii
-            #   consumer with distance d starts at Tv[c] + (k + d) * ii
-            max_iter_overlap = (L - 1) // max(int(ii), 1)
-            iter_offsets = (
-                range(-max_iter_overlap, max_iter_overlap + 1)
-                if self.include_incoming_live else
-                range(0, 1)
-            )
-            def _iter_live_var(xi: int, iter_offset: int, tau: int):
-                key = (xi, iter_offset, tau)
-                if key in iter_live:
-                    return iter_live[key]
-
-                producer_v, oval = all_outputs[xi]
-                produced_by = _start_le_var(
-                    producer_v, tau - iter_offset * ii)
-
-                if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY:
-                    consumers = (
-                        consumers_of[xi] if self.include_incoming_live else
-                        [(cv, d) for cv, d in consumers_of[xi] if d == 0]
-                    )
-                    if not consumers:
-                        b = _false_var(
-                            f"iter_live_false_x={xi}_k={iter_offset}_t={tau}")
-                    else:
-                        producer_lat = int(self.nodes[producer_v].latency)
-                        consumed_terms = []
-                        for cv, d in consumers:
-                            consume_bound = tau - (iter_offset + d) * ii
-                            # Zero-latency values can be produced and consumed
-                            # in the same cycle, but they still occupy the
-                            # register during that cycle. Treat consumption as
-                            # complete only after the consumer's start cycle.
-                            if producer_lat == 0:
-                                consume_bound -= 1
-                            consumed_terms.append(
-                                _start_le_var(cv, consume_bound))
-                        all_consumed = _and_var(
-                            f"iter_consumed_x={xi}_k={iter_offset}_t={tau}",
-                            consumed_terms,
-                        )
-                        b = model.new_bool_var(
-                            f"iter_live_x={xi}_k={iter_offset}_t={tau}")
-                        model.add_implication(b, produced_by)
-                        model.add_implication(b, all_consumed.negated())
-                        model.add_bool_or([
-                            produced_by.negated(),
-                            all_consumed,
-                            b,
-                        ])
-                else:
-                    b = produced_by
-
-                iter_live[key] = b
-                return b
-
             # ---- 每个 warp、每个时间步的寄存器容量约束 --------------------
             for w in range(W):
                 for tau in range(L):
-                    rmem_terms = []
+                    rmem_live_by_buffer: dict[str, list] = defaultdict(list)
+                    rmem_footprint_by_buffer: dict[str, int] = {}
                     for xi, (pv, oval) in enumerate(all_outputs):
                         if oval.storage != StorageKind.RMEM or oval.footprint_bytes <= 0:
                             continue
+                        buffer_key = oval.rmem_buffer_key()
                         for iter_offset in iter_offsets:
                             copy_live = _iter_live_var(
                                 xi, iter_offset, tau)
@@ -938,28 +982,21 @@ class HeddleScheduler:
                                 f"live_on_warp_x={xi}_k={iter_offset}_w={w}_t={tau}",
                                 [warp[(pv, w)], copy_live],
                             )
-                            rmem_terms.append(
-                                oval.footprint_bytes * live_on_warp)
+                            rmem_live_by_buffer[buffer_key].append(live_on_warp)
+                            rmem_footprint_by_buffer[buffer_key] = max(
+                                rmem_footprint_by_buffer.get(buffer_key, 0),
+                                int(oval.footprint_bytes),
+                            )
+                    rmem_terms = []
+                    for buffer_key, live_terms in rmem_live_by_buffer.items():
+                        buffer_live = _or_var(
+                            f"rmem_live_buf={buffer_key}_w={w}_t={tau}",
+                            live_terms,
+                        )
+                        rmem_terms.append(
+                            rmem_footprint_by_buffer[buffer_key] * buffer_live)
                     if rmem_terms:
                         model.add(sum(rmem_terms) <= self.reg_limit)
-
-            # ---- SMEM 容量约束（全局统计） -------------------------------
-            # SMEM footprint 表示 shared buffer allocation 的大小。这个
-            # allocation 已经包含 pipeline stage / double-buffer 空间，
-            # 不能像 RMEM value 一样按重叠迭代副本重复累加。
-            for tau in range(L):
-                smem_terms = []
-                for xi, (pv, oval) in enumerate(all_outputs):
-                    if oval.storage != StorageKind.SMEM or oval.footprint_bytes <= 0:
-                        continue
-                    any_copy_live = _or_var(
-                        f"smem_live_x={xi}_t={tau}",
-                        [_iter_live_var(xi, iter_offset, tau)
-                         for iter_offset in iter_offsets],
-                    )
-                    smem_terms.append(oval.footprint_bytes * any_copy_live)
-                if smem_terms:
-                    model.add(sum(smem_terms) <= self.smem_limit)
 
         # ---- 优化目标：偏好更紧凑的调度 -------------------------------
         if optimize:
@@ -995,22 +1032,27 @@ class HeddleScheduler:
                     warp_assign[self.nodes[v].name] = w
                     break
 
-        reg_peak: Dict[int, int] = {}
+        reg_peak: Dict[int, int] = {}  # warp : 寄存器用量最大值
         if track_liveness:
             for w in range(W):
                 peak = 0
                 for tau in range(L):
-                    total = 0
+                    live_bytes_by_buffer: Dict[str, int] = {}
                     for xi, (pv, oval) in enumerate(all_outputs):
                         if oval.storage != StorageKind.RMEM:
                             continue
                         owned = bool(solver.value(warp[(pv, w)]))
                         if not owned:
                             continue
+                        buffer_key = oval.rmem_buffer_key()
                         for iter_offset in iter_offsets:
                             live_var = iter_live.get((xi, iter_offset, tau))
                             if live_var is not None and bool(solver.value(live_var)):
-                                total += oval.footprint_bytes
+                                live_bytes_by_buffer[buffer_key] = max(
+                                    live_bytes_by_buffer.get(buffer_key, 0),
+                                    int(oval.footprint_bytes),
+                                )
+                    total = sum(live_bytes_by_buffer.values())
                     peak = max(peak, total)
                 reg_peak[w] = peak
 

@@ -529,6 +529,8 @@ _run_joint_solver(
   - subcore issue。
   - FU reservation。
   - barrier issue slot。
+以及
+  - 约束SMEM 容量
 - 优化目标：
 
 ```text
@@ -540,7 +542,7 @@ minimize L * N * max_end + sum(Tv)
 此阶段不启用的约束：
 
 - 不展开内部 `live/incoming_live/iter_live`。
-- 不在 CP-SAT 主模型内约束 RMEM/SMEM 容量。
+- 不在 CP-SAT 主模型内约束 RMEM 容量。
 
 阶段结果：
 

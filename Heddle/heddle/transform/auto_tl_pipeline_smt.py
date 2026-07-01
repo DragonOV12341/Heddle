@@ -1152,6 +1152,7 @@ def _schedule_with_smt(
                 name=f"s{info.idx}_w_{wr.buffer.name}",
                 storage=storage,
                 footprint_bytes=fp,
+                buffer_name=wr.buffer.name,
             ))
 
         reservation = [{rty: 1} for _ in range(max(int(issue_cycles), 1))]
