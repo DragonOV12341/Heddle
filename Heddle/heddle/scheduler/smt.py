@@ -789,9 +789,9 @@ class HeddleScheduler:
                         if delta > 0:
                             loop_carried.add(xi)  # opvi 有跨迭代依赖
 
-        # feasibility 阶段仍跳过 RMEM 容量网格以控制模型大小，但 SMEM
-        # footprint 是 CTA 全局容量约束，需要独立于 track_liveness 建模。
-        track_liveness = bool(self.enable_liveness and optimize and all_outputs and self.reg_limit > 0)
+        # RMEM 容量约束是可行性的一部分，feasibility 和 optimize 两个阶段
+        # 都必须建模；SMEM footprint 是 CTA 全局容量约束，也独立建模。
+        track_liveness = bool(self.enable_liveness and all_outputs and self.reg_limit > 0)
         max_iter_overlap = (L - 1) // max(int(ii), 1)
         iter_offsets = (
             range(-max_iter_overlap, max_iter_overlap + 1)
@@ -969,32 +969,38 @@ class HeddleScheduler:
             # ---- 每个 warp、每个时间步的寄存器容量约束 --------------------
             for w in range(W):
                 for tau in range(L):
-                    rmem_live_by_buffer: dict[str, list] = defaultdict(list)
-                    rmem_footprint_by_buffer: dict[str, int] = {}
+                    rmem_live_by_copy: dict[tuple[str, int], list] = defaultdict(list)
+                    rmem_footprint_by_copy: dict[tuple[str, int], int] = {}
                     for xi, (pv, oval) in enumerate(all_outputs):
                         if oval.storage != StorageKind.RMEM or oval.footprint_bytes <= 0:
                             continue
                         buffer_key = oval.rmem_buffer_key()
-                        for iter_offset in iter_offsets:
+                        rmem_iter_offsets = (
+                            iter_offsets
+                            if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY else
+                            range(0, 1)
+                        )
+                        for iter_offset in rmem_iter_offsets:
+                            copy_key = (buffer_key, int(iter_offset))
                             copy_live = _iter_live_var(
                                 xi, iter_offset, tau)
                             live_on_warp = _and_var(
                                 f"live_on_warp_x={xi}_k={iter_offset}_w={w}_t={tau}",
                                 [warp[(pv, w)], copy_live],
                             )
-                            rmem_live_by_buffer[buffer_key].append(live_on_warp)
-                            rmem_footprint_by_buffer[buffer_key] = max(
-                                rmem_footprint_by_buffer.get(buffer_key, 0),
+                            rmem_live_by_copy[copy_key].append(live_on_warp)
+                            rmem_footprint_by_copy[copy_key] = max(
+                                rmem_footprint_by_copy.get(copy_key, 0),
                                 int(oval.footprint_bytes),
                             )
                     rmem_terms = []
-                    for buffer_key, live_terms in rmem_live_by_buffer.items():
+                    for (buffer_key, iter_offset), live_terms in rmem_live_by_copy.items():
                         buffer_live = _or_var(
-                            f"rmem_live_buf={buffer_key}_w={w}_t={tau}",
+                            f"rmem_live_buf={buffer_key}_k={iter_offset}_w={w}_t={tau}",
                             live_terms,
                         )
                         rmem_terms.append(
-                            rmem_footprint_by_buffer[buffer_key] * buffer_live)
+                            rmem_footprint_by_copy[(buffer_key, iter_offset)] * buffer_live)
                     if rmem_terms:
                         model.add(sum(rmem_terms) <= self.reg_limit)
 
@@ -1037,7 +1043,7 @@ class HeddleScheduler:
             for w in range(W):
                 peak = 0
                 for tau in range(L):
-                    live_bytes_by_buffer: Dict[str, int] = {}
+                    live_bytes_by_copy: Dict[tuple[str, int], int] = {}
                     for xi, (pv, oval) in enumerate(all_outputs):
                         if oval.storage != StorageKind.RMEM:
                             continue
@@ -1045,14 +1051,20 @@ class HeddleScheduler:
                         if not owned:
                             continue
                         buffer_key = oval.rmem_buffer_key()
-                        for iter_offset in iter_offsets:
+                        rmem_iter_offsets = (
+                            iter_offsets
+                            if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY else
+                            range(0, 1)
+                        )
+                        for iter_offset in rmem_iter_offsets:
                             live_var = iter_live.get((xi, iter_offset, tau))
                             if live_var is not None and bool(solver.value(live_var)):
-                                live_bytes_by_buffer[buffer_key] = max(
-                                    live_bytes_by_buffer.get(buffer_key, 0),
+                                copy_key = (buffer_key, int(iter_offset))
+                                live_bytes_by_copy[copy_key] = max(
+                                    live_bytes_by_copy.get(copy_key, 0),
                                     int(oval.footprint_bytes),
                                 )
-                    total = sum(live_bytes_by_buffer.values())
+                    total = sum(live_bytes_by_copy.values())
                     peak = max(peak, total)
                 reg_peak[w] = peak
 

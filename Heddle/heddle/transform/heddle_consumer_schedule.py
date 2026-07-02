@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import sys
+import traceback
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
@@ -58,6 +59,7 @@ from heddle.transform.auto_tl_pipeline_smt import (
     _detect_wgmma_issue_cycles,
     _estimate_buffer_footprint_bytes,
     _extract_num_threads,
+    _buf_scope_str,
     _is_shared,
     _StmtInfo,
     _unwrap_to_seqstmt,
@@ -196,6 +198,15 @@ def _set_ws_annotation(annotations: Dict[str, object], key: str, value: object) 
         annotations[alias] = value
 
 
+def _clear_ws_annotation(annotations: Dict[str, object], key: str) -> bool:
+    changed = False
+    for alias in _ws_annotation_aliases(key):
+        if alias in annotations:
+            annotations.pop(alias, None)
+            changed = True
+    return changed
+
+
 def _ensure_ws_annotation(annotations: Dict[str, object], key: str, value: object) -> bool:
     aliases = _ws_annotation_aliases(key)
     existing = next((annotations[alias] for alias in aliases if alias in annotations), value)
@@ -221,7 +232,7 @@ def _build_consumer_dep_graph(
     Returns:
         consumer_indices: list of statement indices that are consumers
         deps: dict mapping consumer_idx -> list of consumer_idx it depends on
-        all_indices: list of all statement indices
+        all_indices: list of all non-barrier statement indices
         deps_all: dict mapping stmt_idx -> list of stmt_idx it depends on,
             including producer/consumer dependencies
 
@@ -233,15 +244,14 @@ def _build_consumer_dep_graph(
        must stay ordered (preserves PCWS barrier placement semantics)
     """
     consumer_indices = [info.idx for info in infos if not info.is_producer]
-    all_indices = [info.idx for info in infos]
-
     last_writer: Dict[str, int] = {}  # buffer_name -> stmt_idx
     deps: Dict[int, List[int]] = {idx: [] for idx in consumer_indices}
-    deps_all: Dict[int, List[int]] = {idx: [] for idx in all_indices}
 
     consumer_set = set(consumer_indices)
 
     def _add_all_dep(dst: int, src: int) -> None:
+        if dst not in deps_all or src not in deps_all:
+            return
         if src != dst and src not in deps_all[dst]:
             deps_all[dst].append(src)
 
@@ -259,20 +269,35 @@ def _build_consumer_dep_graph(
             "tir.ptx_wait_barrier",
         })
 
+    def _is_dependency_buffer(buf: tvm.tir.Buffer) -> bool:
+        return not _buf_scope_str(buf).startswith("local.descriptor")
+
+    barrier_stmt_indices: Set[int] = {
+        info.idx for info in infos
+        if info.is_wait_barrier or _is_barrier_wait(info)
+    }
+
+    all_indices = [info.idx for info in infos if info.idx not in barrier_stmt_indices]
+    deps_all: Dict[int, List[int]] = {idx: [] for idx in all_indices}
+
     for info in infos:
         idx = info.idx
         for rd in info.reads:
+            if not _is_dependency_buffer(rd.buffer):
+                continue
             buf_name = rd.buffer.name
             if buf_name in last_writer:
                 _add_consumer_dep(idx, last_writer[buf_name])
 
         if info.is_producer:
             for wr in info.writes:
-                if _is_shared(wr.buffer):
+                if _is_shared(wr.buffer) and _is_dependency_buffer(wr.buffer):
                     last_writer[wr.buffer.name] = idx
             continue
 
         for wr in info.writes:
+            if not _is_dependency_buffer(wr.buffer):
+                continue
             last_writer[wr.buffer.name] = idx
 
     prev_producer = None
@@ -352,10 +377,8 @@ def _build_consumer_dep_graph(
             if last_prev_reader is not None and first_curr_reader is not None:
                 _add_consumer_dep(first_curr_reader, last_prev_reader)
 
-    # barrier_infos groups barrier-touching statements by the actual barrier
-    # expression.  Preserve the per-barrier program order in deps_all so the
-    # full graph contains explicit expect/load/arrive/wait dependencies even
-    # when those calls do not expose normal buffer read/write regions.
+    # Drop barrier statements from deps_all, but preserve the producer-consumer
+    # ordering they imply by connecting real ops across each barrier touch.
     for _, raw_ops in (barrier_infos or {}).items():
         if isinstance(raw_ops, tuple) and len(raw_ops) >= 2 and isinstance(raw_ops[0], str):
             raw_iter = [raw_ops]
@@ -371,13 +394,48 @@ def _build_consumer_dep_graph(
                 idx = int(stmt_idx)
             except (TypeError, ValueError):
                 continue
-            if idx in deps_all:
+            if 0 <= idx < len(infos):
                 barrier_ops.append((idx, str(op_type)))
 
         barrier_ops.sort(key=lambda x: x[0])
-        for pos, (idx, _) in enumerate(barrier_ops):
-            for prev_idx, _ in barrier_ops[:pos]:
-                _add_all_dep(idx, prev_idx)
+        for pos, (idx, op_type) in enumerate(barrier_ops):
+            if op_type != "WAIT" or idx not in barrier_stmt_indices:
+                continue
+
+            producer_op = None
+            for prev_idx, _ in reversed(barrier_ops[:pos]):
+                if prev_idx not in barrier_stmt_indices and infos[prev_idx].is_producer:
+                    producer_op = prev_idx
+                    break
+            if producer_op is None:
+                for prev_idx in range(idx - 1, -1, -1):
+                    if prev_idx not in barrier_stmt_indices and infos[prev_idx].is_producer:
+                        producer_op = prev_idx
+                        break
+            if producer_op is None:
+                continue
+
+            producer_written_bufs = {
+                wr.buffer.name for wr in infos[producer_op].writes
+                if _is_shared(wr.buffer)
+            }
+            if not producer_written_bufs:
+                continue
+
+            consumer_op = None
+            for next_idx in range(idx + 1, len(infos)):
+                if next_idx in barrier_stmt_indices or infos[next_idx].is_producer:
+                    continue
+                if any(rd.buffer.name in producer_written_bufs for rd in infos[next_idx].reads):
+                    consumer_op = next_idx
+                    break
+
+            if (
+                consumer_op is not None
+                and consumer_op in deps_all
+                and producer_op in deps_all
+            ):
+                _add_all_dep(consumer_op, producer_op)
 
     return consumer_indices, deps, all_indices, deps_all
 
@@ -1290,23 +1348,29 @@ def _solve_smt_joint_optimize(
         )
         for tau in range(max(int(check_L), 0)):
             smem_live_bytes: Dict[str, int] = {}
-            reg_live_bytes: Dict[int, Dict[str, int]] = {
+            reg_live_bytes: Dict[int, Dict[Tuple[str, int], int]] = {
                 w: {} for w in range(num_warps)
             }
             for xi, (producer_idx, oval) in enumerate(all_outputs):
                 if oval.footprint_bytes <= 0:
                     continue
                 live_any_copy = False
-                for iter_offset in iter_offsets:
+                rmem_iter_offsets = (
+                    iter_offsets
+                    if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY else
+                    range(0, 1)
+                )
+                for iter_offset in rmem_iter_offsets:
                     if not _copy_live(xi, iter_offset, tau):
                         continue
                     live_any_copy = True
                     if oval.storage == StorageKind.RMEM:
                         buffer_key = oval.rmem_buffer_key()
+                        copy_key = (buffer_key, int(iter_offset))
                         for w in fixed_warps.get(producer_idx, [0]):
                             reg_live_bytes.setdefault(w, {})
-                            reg_live_bytes[w][buffer_key] = max(
-                                reg_live_bytes[w].get(buffer_key, 0),
+                            reg_live_bytes[w][copy_key] = max(
+                                reg_live_bytes[w].get(copy_key, 0),
                                 int(oval.footprint_bytes),
                             )
                 if oval.storage == StorageKind.SMEM and live_any_copy:
@@ -1380,6 +1444,7 @@ def _solve_smt_joint_optimize(
                     optimize=False,
                     solve_reg_limit=solve_reg_limit,
                     solve_smem_limit=solve_smem_limit,
+                    enable_liveness=False,
                 )
                 if sol is not None:
                     feasible_window = solve_window
@@ -2297,14 +2362,46 @@ def _transform_pipeline_loop(
         ann = stmt.annotations
         if ann is None:
             return None
+        print(f"[Heddle] Visit For annotations={ann}", flush=True)
         num_stages = None
-        for key in ann:
-            if str(key) == "num_stages":
+
+        def _annotation_key_name(key) -> str:
+            if isinstance(key, tvm.tir.StringImm):
+                return key.value
+            if hasattr(key, "value") and isinstance(key.value, str):
+                return key.value
+            return str(key).strip("\"'")
+
+        def _maybe_set_num_stages(value) -> None:
+            nonlocal num_stages
+            if num_stages is not None:
+                return
+            try:
+                num_stages = int(value)
+            except (TypeError, ValueError):
+                pass
+
+        def _lookup_num_stages(mapping) -> None:
+            if mapping is None:
+                return
+            try:
+                keys = list(mapping)
+            except TypeError:
+                return
+            for key in keys:
                 try:
-                    num_stages = int(ann[key])
-                except (TypeError, ValueError):
-                    pass
+                    value = mapping[key]
+                except Exception:
+                    continue
+                key_str = _annotation_key_name(key)
+                if key_str == "num_stages":
+                    _maybe_set_num_stages(value)
+                elif key_str == "annotations":
+                    _lookup_num_stages(value)
+
+        _lookup_num_stages(ann)
         if num_stages is None or num_stages <= 0:
+            print(f"[Heddle] Skip For: no num_stages in annotations={ann}", flush=True)
             return None
 
         # Unwrap to SeqStmt
@@ -2312,6 +2409,8 @@ def _transform_pipeline_loop(
 
         seq, local_buf_map = _unwrap_to_seqstmt(stmt.body)
         if seq is None or len(seq.seq) < 2:
+            seq_len = len(seq.seq) if seq is not None else None
+            print(f"[Heddle] Skip For: unwrap_to_seqstmt failed seq_len={seq_len}", flush=True)
             return None
 
         # Merge buffer maps
@@ -2325,8 +2424,7 @@ def _transform_pipeline_loop(
         has_producer = any(info.is_producer for info in infos_list)
         has_consumer = any(not info.is_producer for info in infos_list)
         if not has_producer or not has_consumer:
-            if debug:
-                print(f"[Heddle] Skip: has_producer={has_producer}, has_consumer={has_consumer}", file=sys.stderr, flush=True)
+            print(f"[Heddle] Skip: has_producer={has_producer}, has_consumer={has_consumer}", flush=True)
             return None
 
         consumer_count = sum(1 for info in infos_list if not info.is_producer)
@@ -2345,6 +2443,7 @@ def _transform_pipeline_loop(
                       f"writes=[{','.join(w.buffer.name for w in info.writes)}]",
                       file=sys.stderr, flush=True)
         if consumer_count <= 1:
+            print(f"[Heddle] Skip For: consumer_count={consumer_count}", flush=True)
             return None  # nothing to reorder
 
         # ── Auto-detect dual-consumer with cost model + split search ──
@@ -2567,38 +2666,21 @@ def _transform_pipeline_loop(
             joint_order: List[int],
             num_stages: int,
         ) -> Dict[int, int]:
-            if base_I <= 0:
-                return {}
-
-            compact_index = {ci: pos for pos, ci in enumerate(joint_order)}
-            offsets: Dict[int, int] = {}
-            skipped: Dict[int, int] = {}
-
-            for ci in consumer_indices:
-                info = infos_list[ci]
-                # Only shared-buffer readers need rewritten ring-buffer stage
-                # expressions. Pure register/local ops may be scheduled late
-                # without changing which producer iteration they consume.
-                if not any(_is_shared(rd.buffer) for rd in info.reads):
-                    continue
-                offset = -(int(opt_M[ci]) // base_I)
-                if offset == 0:
-                    continue
-                if num_stages > 0 and abs(offset) >= num_stages:
-                    skipped[ci] = offset
-                    continue
-                offsets[compact_index[ci]] = offset
-
-            if debug and offsets:
-                print(f"[Heddle] Derived joint stage offsets for PCWS: {offsets}",
-                      file=sys.stderr, flush=True)
-            if debug and skipped:
-                print(
-                    f"[Heddle] Skipped unsupported joint stage offsets "
-                    f"(num_stages={num_stages}): {skipped}",
-                    file=sys.stderr, flush=True,
-                )
-            return offsets
+            if debug and base_I > 0:
+                candidate_offsets = {
+                    ci: -(int(opt_M[ci]) // base_I)
+                    for ci in consumer_indices
+                    if ci in opt_M and -(int(opt_M[ci]) // base_I) != 0
+                }
+                if candidate_offsets:
+                    print(
+                        "[Heddle] Not emitting automatic stage offsets from "
+                        f"joint M/I because they are not semantics-safe yet: "
+                        f"{candidate_offsets}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            return {}
 
         def _joint_result_to_phase_b_result(optimized: Dict) -> Optional[Tuple[List[int], Dict[str, int], Dict[str, int], Dict[int, int], List[int], int]]:
             opt_M = optimized.get("M") or {}
@@ -2712,6 +2794,7 @@ def _transform_pipeline_loop(
                     file=sys.stderr, flush=True,
                 )
             else:
+                print('[d] joint_phase_b_result None. 使用UnifiedScheduler求解')
                 phase_b_result = _phase_b_consumer_ordering(
                     infos_list, consumer_indices, deps,
                     use_precise_latency=use_precise_latency,
@@ -2800,7 +2883,8 @@ def _transform_pipeline_loop(
                         seq,
                         infos_list,
                         phase_b_order,
-                        full_stmt_order=phase_b_full_order,
+                        # full_stmt_order=phase_b_full_order,
+                        full_stmt_order=None,
                     )
                     new_body = _rewrap_body(stmt.body, seq, new_seq)
                     changed[0] = True
@@ -2870,6 +2954,11 @@ def _transform_pipeline_loop(
                     if offsets_str:
                         _set_ws_annotation(new_annotations, "tl_pcws_stage_offsets", offsets_str)
                         annotations_changed = True
+                    else:
+                        annotations_changed = (
+                            _clear_ws_annotation(new_annotations, "tl_pcws_stage_offsets")
+                            or annotations_changed
+                        )
 
                 if phase_b_warps:
                     pcws_order = phase_b_order if phase_b_order is not None else consumer_indices
@@ -3190,8 +3279,8 @@ def HeddleConsumerSchedule():
             
             return result
         except Exception as e:
-            if debug:
-                print(f"[Heddle] Pass failed with error: {e}", file=sys.stderr, flush=True)
+            print(f"[Heddle] Pass failed with error: {e}", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
             return func  # graceful fallback: return unchanged
 
     return _pass_func

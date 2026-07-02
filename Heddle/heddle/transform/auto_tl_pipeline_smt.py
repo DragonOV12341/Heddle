@@ -1017,8 +1017,13 @@ def _build_stmt_infos(
         
         # 假设已经通过 visitor 拿到了 self.barrier_operations
         for barrier_expr, op_type, node in extractor.barrier_operations:
-            # 1. 表达式化简 (比如把 k % 2 + 1 化简为标准形式)
-            simplified_expr = analyzer.simplify(barrier_expr)
+            # 1. 表达式化简 (比如把 k % 2 + 1 化简为标准形式)。
+            # Some lowered barrier operands are not plain arithmetic PrimExprs;
+            # keep the original expression instead of aborting the whole pass.
+            try:
+                simplified_expr = analyzer.simplify(barrier_expr)
+            except Exception:
+                simplified_expr = barrier_expr
 
             # 2. 寻找是否已有结构相同的 barrier 分组
             found_key = None
