@@ -1019,7 +1019,7 @@ class HeddleScheduler:
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = max(float(self.timeout_ms) / 1000.0, 1)
         solver.parameters.num_workers = 4
-        solver.parameters.log_search_progress=True
+        solver.parameters.log_search_progress=False
         
         
         status = solver.solve(model)

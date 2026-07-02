@@ -90,7 +90,7 @@ def test_gemm():
 def test_fa_fwd():
     B, H, Tseq, D = 1, 32, 4096, 128
     print(f"\n=== FlashAttention FWD ({B=} {H=} {Tseq=} {D=}) ===")
-    bM, bN, stages, threads = 128, 64, 2, 128
+    bM, bN, stages, threads = 128, 64, 3, 128
     scale = (1.0 / D) ** 0.5 * 1.44269504
     shape = [B, Tseq, H, D]
     flops = 4.0 * B * H * Tseq * Tseq * D

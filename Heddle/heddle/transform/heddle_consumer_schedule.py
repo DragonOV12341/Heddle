@@ -238,13 +238,16 @@ def _build_consumer_dep_graph(
 
     Dependencies include:
     1. Buffer RAW (read-after-write) through any buffer
-    2. Sync ordering: sync statements (barrier waits) get a program-order
+    2. Buffer WAR (write-after-read) through any buffer, preserving local state
+       updates such as copying old sm before resetting sm
+    3. Sync ordering: sync statements (barrier waits) get a program-order
        chain to preserve barrier timing relative to compute
-    3. Producer-consumer ordering: the first consumer after each producer
+    4. Producer-consumer ordering: the first consumer after each producer
        must stay ordered (preserves PCWS barrier placement semantics)
     """
     consumer_indices = [info.idx for info in infos if not info.is_producer]
     last_writer: Dict[str, int] = {}  # buffer_name -> stmt_idx
+    last_readers: Dict[str, List[int]] = {}  # buffer_name -> stmt_idx list since last write
     deps: Dict[int, List[int]] = {idx: [] for idx in consumer_indices}
 
     consumer_set = set(consumer_indices)
@@ -288,16 +291,23 @@ def _build_consumer_dep_graph(
             buf_name = rd.buffer.name
             if buf_name in last_writer:
                 _add_consumer_dep(idx, last_writer[buf_name])
+            last_readers.setdefault(buf_name, []).append(idx)
 
         if info.is_producer:
             for wr in info.writes:
                 if _is_shared(wr.buffer) and _is_dependency_buffer(wr.buffer):
+                    for reader_idx in last_readers.get(wr.buffer.name, []):
+                        _add_all_dep(idx, reader_idx)
+                    last_readers[wr.buffer.name] = []
                     last_writer[wr.buffer.name] = idx
             continue
 
         for wr in info.writes:
             if not _is_dependency_buffer(wr.buffer):
                 continue
+            for reader_idx in last_readers.get(wr.buffer.name, []):
+                _add_consumer_dep(idx, reader_idx)
+            last_readers[wr.buffer.name] = []
             last_writer[wr.buffer.name] = idx
 
     prev_producer = None
@@ -2056,6 +2066,72 @@ def _reorder_loop_body(
     return tvm.tir.SeqStmt(new_stmts)
 
 
+def _planned_reordered_stmt_order(
+    infos: List[_StmtInfo],
+    new_consumer_order: List[int],
+    full_stmt_order: Optional[List[int]] = None,
+) -> List[int]:
+    """Return original stmt indices in the same order `_reorder_loop_body` emits."""
+    if full_stmt_order is not None:
+        seen: Set[int] = set()
+        ordered: List[int] = []
+        for idx in full_stmt_order:
+            if idx not in seen:
+                ordered.append(idx)
+                seen.add(idx)
+        for info in infos:
+            idx = info.idx
+            if idx not in seen:
+                ordered.append(idx)
+                seen.add(idx)
+        return ordered
+
+    producer_indices = [info.idx for info in infos if info.is_producer]
+
+    prod_deps: Dict[int, Set[int]] = {p: set() for p in producer_indices}
+    prod_writes: Dict[int, Set[str]] = {}
+    for p in producer_indices:
+        prod_writes[p] = {w.buffer.name for w in infos[p].writes if _is_shared(w.buffer)}
+    for p in producer_indices:
+        p_reads = {r.buffer.name for r in infos[p].reads if _is_shared(r.buffer)}
+        for p2 in producer_indices:
+            if p2 != p and prod_writes[p2] & p_reads:
+                prod_deps[p].add(p2)
+
+    hoisted_producers: List[int] = []
+    remaining = list(producer_indices)
+    while remaining:
+        ready = [p for p in remaining if not (prod_deps[p] - set(hoisted_producers))]
+        if not ready:
+            hoisted_producers.extend(remaining)
+            break
+        next_p = ready[0]
+        hoisted_producers.append(next_p)
+        remaining.remove(next_p)
+
+    producer_before: Dict[int, int] = {}
+    for pi in producer_indices:
+        if pi in hoisted_producers:
+            continue
+        p_written = prod_writes.get(pi, set())
+        for ci in new_consumer_order:
+            c_reads = {r.buffer.name for r in infos[ci].reads}
+            if p_written & c_reads:
+                producer_before[pi] = ci
+                break
+
+    ordered = list(hoisted_producers)
+    non_hoisted = [p for p in producer_indices if p not in hoisted_producers]
+    for ci in new_consumer_order:
+        to_insert = [p for p in non_hoisted if producer_before.get(p) == ci]
+        ordered.extend(to_insert)
+        for p in to_insert:
+            non_hoisted.remove(p)
+        ordered.append(ci)
+    ordered.extend(non_hoisted)
+    return ordered
+
+
 # ---------------------------------------------------------------------------
 # Unified scheduling cost model
 # ---------------------------------------------------------------------------
@@ -2362,7 +2438,7 @@ def _transform_pipeline_loop(
         ann = stmt.annotations
         if ann is None:
             return None
-        print(f"[Heddle] Visit For annotations={ann}", flush=True)
+        # print(f"[Heddle] Visit For annotations={ann}", flush=True)
         num_stages = None
 
         def _annotation_key_name(key) -> str:
@@ -2401,7 +2477,7 @@ def _transform_pipeline_loop(
 
         _lookup_num_stages(ann)
         if num_stages is None or num_stages <= 0:
-            print(f"[Heddle] Skip For: no num_stages in annotations={ann}", flush=True)
+            # print(f"[Heddle] Skip For: no num_stages in annotations={ann}", flush=True)
             return None
 
         # Unwrap to SeqStmt
@@ -2687,7 +2763,36 @@ def _transform_pipeline_loop(
             if not opt_M:
                 return None
 
-            missing_times = [ci for ci in consumer_indices if ci not in opt_M]
+            schedulable_indices = set(all_indices)
+            stmt_positions = {info.idx: pos for pos, info in enumerate(infos_list)}
+
+            def _is_joint_elided_consumer(ci: int) -> bool:
+                return ci not in schedulable_indices
+
+            def _derive_elided_time(ci: int) -> int:
+                pos = stmt_positions.get(ci, ci)
+                prev_times = [
+                    int(opt_M[info.idx])
+                    for info in infos_list[:pos]
+                    if info.idx in opt_M
+                ]
+                next_times = [
+                    int(opt_M[info.idx])
+                    for info in infos_list[pos + 1:]
+                    if info.idx in opt_M
+                ]
+                if prev_times and next_times:
+                    return min(max(prev_times), min(next_times))
+                if prev_times:
+                    return max(prev_times)
+                if next_times:
+                    return min(next_times)
+                return 0
+
+            missing_times = [
+                ci for ci in consumer_indices
+                if ci not in opt_M and not _is_joint_elided_consumer(ci)
+            ]
             if missing_times:
                 if debug:
                     print(
@@ -2697,12 +2802,33 @@ def _transform_pipeline_loop(
                     )
                 return None
 
+            joint_times_by_idx = {
+                ci: int(opt_M[ci]) if ci in opt_M else _derive_elided_time(ci)
+                for ci in consumer_indices
+            }
+            joint_full_time_by_idx = {
+                info.idx: int(opt_M[info.idx]) if info.idx in opt_M
+                else joint_times_by_idx.get(info.idx, stmt_positions.get(info.idx, 0))
+                for info in infos_list
+            }
             joint_full_order = sorted(
-                [idx for idx in all_indices if idx in opt_M],
-                key=lambda idx: (int(opt_M[idx]), idx),
+                [info.idx for info in infos_list],
+                key=lambda idx: (
+                    int(joint_full_time_by_idx.get(idx, 0)),
+                    stmt_positions.get(idx, idx),
+                ),
             )
-            joint_order = [idx for idx in joint_full_order if idx in set(consumer_indices)]
-            joint_times = {f"s{ci}": int(opt_M[ci]) for ci in consumer_indices}
+            joint_order = sorted(
+                list(consumer_indices),
+                key=lambda idx: (
+                    int(joint_times_by_idx[idx]),
+                    stmt_positions.get(idx, idx),
+                ),
+            )
+            joint_times = {
+                f"s{ci}": int(joint_times_by_idx[ci])
+                for ci in consumer_indices
+            }
             try:
                 base_I = int(optimized.get("I", 0))
             except (TypeError, ValueError):
@@ -2713,10 +2839,55 @@ def _transform_pipeline_loop(
             joint_stage_offsets = _derive_joint_stage_offsets(
                 opt_M, base_I, joint_order, joint_num_stages)
 
-            opt_warps = optimized.get("warp_assign") or {}
+            opt_warps_raw = optimized.get("warp_assign") or {}
+            opt_warps: Dict[int, int] = {}
+            for raw_k, raw_v in opt_warps_raw.items():
+                try:
+                    if isinstance(raw_k, str) and raw_k.startswith("s"):
+                        raw_idx = int(raw_k[1:])
+                    else:
+                        raw_idx = int(raw_k)
+                    opt_warps[raw_idx] = int(raw_v)
+                except (TypeError, ValueError):
+                    continue
             joint_warps: Dict[str, int] = {}
             if opt_warps:
-                missing_warps = [ci for ci in consumer_indices if ci not in opt_warps]
+                joint_full_order_pos = {
+                    idx: pos for pos, idx in enumerate(joint_full_order)
+                }
+
+                def _derive_elided_warp(ci: int) -> Optional[int]:
+                    pos = joint_full_order_pos.get(ci)
+                    if pos is not None:
+                        for idx in reversed(joint_full_order[:pos]):
+                            if idx in opt_warps:
+                                return int(opt_warps[idx])
+                        for idx in joint_full_order[pos + 1:]:
+                            if idx in opt_warps:
+                                return int(opt_warps[idx])
+
+                    stmt_pos = stmt_positions.get(ci, ci)
+                    for info in reversed(infos_list[:stmt_pos]):
+                        if info.idx in opt_warps:
+                            return int(opt_warps[info.idx])
+                    for info in infos_list[stmt_pos + 1:]:
+                        if info.idx in opt_warps:
+                            return int(opt_warps[info.idx])
+                    return None
+
+                raw_warps: Dict[int, int] = {}
+                missing_warps: List[int] = []
+                for ci in consumer_indices:
+                    if ci in opt_warps:
+                        raw_warps[ci] = int(opt_warps[ci])
+                    elif _is_joint_elided_consumer(ci):
+                        derived_warp = _derive_elided_warp(ci)
+                        if derived_warp is not None:
+                            raw_warps[ci] = derived_warp
+                        else:
+                            missing_warps.append(ci)
+                    else:
+                        missing_warps.append(ci)
                 if missing_warps:
                     if debug:
                         print(
@@ -2727,7 +2898,7 @@ def _transform_pipeline_loop(
                 else:
                     # The joint solver assigns logical warp ids. FineGrainedWS
                     # per-op dispatch expects compact 128-thread warp-group ids.
-                    raw_groups = {ci: max(0, int(opt_warps[ci]) // 4) for ci in consumer_indices}
+                    raw_groups = {ci: max(0, int(raw_warps[ci]) // 4) for ci in consumer_indices}
                     group_remap = {g: pos for pos, g in enumerate(sorted(set(raw_groups.values())))}
                     joint_warps = {
                         f"s{ci}": group_remap[raw_groups[ci]]
@@ -2742,6 +2913,84 @@ def _transform_pipeline_loop(
                 joint_full_order,
                 joint_num_stages,
             )
+
+        def _build_joint_pipeline_annotations(
+            optimized: Dict,
+            emitted_stmt_order: List[int],
+            num_stages: int,
+        ) -> Optional[Dict[str, object]]:
+            opt_M = optimized.get("M") or {}
+            if not opt_M or not emitted_stmt_order:
+                return None
+
+            try:
+                base_I = int(optimized.get("I", 0))
+            except (TypeError, ValueError):
+                base_I = 0
+
+            stmt_positions = {info.idx: pos for pos, info in enumerate(infos_list)}
+            info_by_idx = {info.idx: info for info in infos_list}
+
+            def _derive_elided_time(idx: int) -> int:
+                pos = stmt_positions.get(idx, idx)
+                prev_times = [
+                    int(opt_M[info.idx])
+                    for info in infos_list[:pos]
+                    if info.idx in opt_M
+                ]
+                next_times = [
+                    int(opt_M[info.idx])
+                    for info in infos_list[pos + 1:]
+                    if info.idx in opt_M
+                ]
+                if prev_times and next_times:
+                    return min(max(prev_times), min(next_times))
+                if prev_times:
+                    return max(prev_times)
+                if next_times:
+                    return min(next_times)
+                return 0
+
+            time_by_idx = {
+                idx: int(opt_M[idx]) if idx in opt_M else _derive_elided_time(idx)
+                for idx in emitted_stmt_order
+            }
+            non_producer_order = sorted(
+                [
+                    idx for idx in emitted_stmt_order
+                    if idx in info_by_idx and not info_by_idx[idx].is_producer
+                ],
+                key=lambda idx: (time_by_idx.get(idx, 0), stmt_positions.get(idx, idx)),
+            )
+            order_rank = {idx: rank for rank, idx in enumerate(non_producer_order)}
+
+            groups: List[List[int]] = []
+            order: List[int] = []
+            stage: List[int] = []
+            smax = max(0, int(num_stages) - 1)
+            for pos, idx in enumerate(emitted_stmt_order):
+                info = info_by_idx.get(idx)
+                groups.append([pos])
+                if info is not None and info.is_producer:
+                    order.append(-1)
+                    stage.append(-1)
+                    continue
+                order.append(int(order_rank.get(idx, len(order_rank))))
+                if base_I > 0 and num_stages > 0:
+                    stage.append(max(0, min(smax, int(time_by_idx.get(idx, 0)) // base_I)))
+                else:
+                    stage.append(0)
+
+            return {
+                "tl_pipeline_group": tvm.runtime.convert(groups),
+                "tl_pipeline_order": tvm.runtime.convert(order),
+                "tl_pipeline_stage": tvm.runtime.convert(stage),
+                "tl.debug_joint_pipeline_stmt_order": tvm.runtime.convert(emitted_stmt_order),
+                "tl.debug_joint_pipeline_stmt_time": tvm.runtime.convert(
+                    [int(time_by_idx.get(idx, -1)) for idx in emitted_stmt_order]
+                ),
+                "tl.debug_joint_pipeline_from_smt": tvm.tir.IntImm("int32", 1),
+            }
 
         for plan in mod_sched_plans :
             print('----start  _solve_smt_joint_optimize', flush=True)
@@ -2879,6 +3128,11 @@ def _transform_pipeline_loop(
                     and phase_b_full_order != [info.idx for info in infos_list]
                 )
                 if order_changed or full_order_changed:
+                    emitted_stmt_order = _planned_reordered_stmt_order(
+                        infos_list,
+                        phase_b_order,
+                        full_stmt_order=None,
+                    )
                     new_seq = _reorder_loop_body(
                         seq,
                         infos_list,
@@ -2889,6 +3143,7 @@ def _transform_pipeline_loop(
                     new_body = _rewrap_body(stmt.body, seq, new_seq)
                     changed[0] = True
                 else:
+                    emitted_stmt_order = [info.idx for info in infos_list]
                     new_body = stmt.body
 
                 # Attach barrier hints as loop annotations for PCWS.
@@ -2896,6 +3151,23 @@ def _transform_pipeline_loop(
                 # the ordering is unchanged.
                 new_annotations = dict(stmt.annotations) if stmt.annotations else {}
                 annotations_changed = False
+                if joint_phase_b_source is not None:
+                    joint_pipeline_annotations = _build_joint_pipeline_annotations(
+                        joint_phase_b_source,
+                        emitted_stmt_order,
+                        phase_b_num_stages or _loop_num_stages(),
+                    )
+                    if joint_pipeline_annotations:
+                        for key, value in joint_pipeline_annotations.items():
+                            new_annotations[key] = value
+                        annotations_changed = True
+                        if debug:
+                            print(
+                                "[Heddle] Injected joint SMT tl_pipeline_* annotations: "
+                                f"stmt_order={emitted_stmt_order}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
                 if phase_b_num_stages > 0:
                     old_num_stages = new_annotations.get("num_stages")
                     try:
@@ -2961,13 +3233,8 @@ def _transform_pipeline_loop(
                         )
 
                 if phase_b_warps:
-                    pcws_order = phase_b_order if phase_b_order is not None else consumer_indices
-                    pcws_warp_keys = {
-                        f"s{ci}": f"s{pos}"
-                        for pos, ci in enumerate(pcws_order)
-                    }
                     warp_str = ",".join(
-                        f"{pcws_warp_keys.get(k, k)}:{v}"
+                        f"{k}:{v}"
                         for k, v in sorted(phase_b_warps.items())
                     )
                     _set_ws_annotation(new_annotations, "tl_pcws_warp_assigns", warp_str)

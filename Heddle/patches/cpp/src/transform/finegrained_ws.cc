@@ -49,6 +49,8 @@ struct AsyncCopyBlockInfo {
   Stmt producer_stmt;              // TMA issue or cp.async enqueue+commit
   Optional<Stmt> wait_stmt;        // Existing forward wait for TMA blocks
   Optional<Var> write_buffer_data; // shared buffer written by producer
+  int producer_stmt_index = -1;    // Index in the original flattened loop body.
+  int wait_stmt_index = -1;        // Index in the original flattened loop body.
 };
 
 using BufferDataToBufferMap =
@@ -57,6 +59,11 @@ using BufferSet = std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>;
 using VarSet = std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>;
 using VarBindingMap =
     std::unordered_map<Var, PrimExpr, ObjectPtrHash, ObjectPtrEqual>;
+
+static Stmt MakeSeqOrStmt(const Array<Stmt> &seq) {
+  ICHECK(!seq.empty());
+  return seq.size() == 1 ? seq[0] : SeqStmt(seq);
+}
 
 // ---------------------------------------------------------------------------
 // Cross-stage consumer: per-buffer, per-compute-stmt stage offset
@@ -306,12 +313,12 @@ struct PhaseCounter {
  * \brief Replace the loop-variable-based stage expression with a
  *        phase-counter-based one inside producer / consumer statements.
  *
- *  When `needs_phase_counter` is true, the barrier IDs already use
- *  `phase_counter->StageExpr(N)` but the shared-memory buffer offsets
- *  still embed `FloorMod(loop_var - loop_min, N)`.  This mutator
- *  rewrites every matching FloorMod to the replacement expression so
- *  that stage indexing stays in sync with barrier indexing when loop
- *  iterations are conditionally skipped.
+ *  FineGrainedWS may rebuild producer/consumer loops after `num_stages`
+ *  has been changed by an upstream scheduler.  Barrier IDs use the current
+ *  stage expression, but shared-memory buffer offsets can still embed an
+ *  older stage expression such as `FloorMod(k, 2)` or lowered `k & 1`.
+ *  This mutator rewrites direct loop-var stage expressions to the replacement
+ *  expression so buffer staging stays in sync with barrier indexing.
  */
 class StageExprReplacer : public StmtExprMutator {
 public:
@@ -329,10 +336,33 @@ private:
         num_stages_(num_stages), replacement_(std::move(replacement)) {}
 
   PrimExpr VisitExpr_(const FloorModNode *op) final {
-    if (is_const_int(op->b, num_stages_) && MatchLinearIdx(op->a)) {
+    if (MatchStageMod(op->b) && MatchLinearIdx(op->a)) {
       return replacement_;
     }
     return StmtExprMutator::VisitExpr_(op);
+  }
+
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(builtin::bitwise_and()) && op->args.size() == 2) {
+      if (MatchLinearIdx(op->args[0]) && is_const_int(op->args[1], 1)) {
+        return replacement_;
+      }
+      if (MatchLinearIdx(op->args[1]) && is_const_int(op->args[0], 1)) {
+        return replacement_;
+      }
+    }
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
+  bool MatchStageMod(const PrimExpr &expr) const {
+    if (is_const_int(expr, num_stages_))
+      return true;
+    if (const auto *imm = expr.as<IntImmNode>()) {
+      // Support loops originally authored with a smaller static ring buffer
+      // (commonly 2) and later promoted to a larger num_stages.
+      return imm->value > 1 && imm->value < num_stages_;
+    }
+    return false;
   }
 
   /*! Match `loop_var`, `loop_var - loop_min`, or `loop_var - 0`. */
@@ -355,6 +385,124 @@ private:
   int num_stages_;
   PrimExpr replacement_;
 };
+
+/*!
+ * \brief Replace stale loop-variable parity expressions after num_stages has
+ *        been promoted by an upstream scheduler.
+ *
+ *  Older TIR may still contain parity for a 2-stage ring buffer, for example
+ *  `FloorMod(FloorDiv(k, 2), 2)` or `FloorDiv(FloorMod(k, 4), 2)`, even after
+ *  FineGrainedWS has rebuilt barrier ids as `k % 3 + base`.  This mutator
+ *  rewrites only direct loop-var parity expressions, leaving unrelated lane or
+ *  fragment arithmetic untouched.
+ */
+class StageParityReplacer : public StmtExprMutator {
+public:
+  static Stmt Replace(const Stmt &stmt, Var loop_var, PrimExpr loop_min,
+                      int num_stages, PrimExpr replacement) {
+    StageParityReplacer r(std::move(loop_var), std::move(loop_min), num_stages,
+                          std::move(replacement));
+    return r.VisitStmt(stmt);
+  }
+
+private:
+  StageParityReplacer(Var loop_var, PrimExpr loop_min, int num_stages,
+                      PrimExpr replacement)
+      : loop_var_(std::move(loop_var)), loop_min_(std::move(loop_min)),
+        num_stages_(num_stages), replacement_(std::move(replacement)) {}
+
+  PrimExpr VisitExpr_(const FloorModNode *op) final {
+    if (is_const_int(op->b, 2)) {
+      if (const auto *div = op->a.as<FloorDivNode>()) {
+        if (MatchOldStageFactor(div->b) && MatchLinearIdx(div->a)) {
+          return replacement_;
+        }
+      }
+    }
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
+  PrimExpr VisitExpr_(const FloorDivNode *op) final {
+    if (MatchOldStageFactor(op->b)) {
+      if (const auto *mod = op->a.as<FloorModNode>()) {
+        if (MatchOldParityPeriod(mod->b) && MatchLinearIdx(mod->a)) {
+          return replacement_;
+        }
+      }
+    }
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
+  bool MatchOldStageFactor(const PrimExpr &expr) const {
+    if (const auto *imm = expr.as<IntImmNode>()) {
+      return imm->value > 1 && imm->value < num_stages_;
+    }
+    return false;
+  }
+
+  bool MatchOldParityPeriod(const PrimExpr &expr) const {
+    if (const auto *imm = expr.as<IntImmNode>()) {
+      return imm->value > 2 && imm->value < 2 * num_stages_ &&
+             imm->value % 2 == 0;
+    }
+    return false;
+  }
+
+  bool MatchLinearIdx(const PrimExpr &expr) const {
+    if (expr.same_as(loop_var_))
+      return true;
+    if (const auto *sub = expr.as<SubNode>()) {
+      if (sub->a.same_as(loop_var_)) {
+        if (is_const_int(sub->b, 0))
+          return true;
+        if (sub->b.same_as(loop_min_))
+          return true;
+      }
+    }
+    return false;
+  }
+
+  Var loop_var_;
+  PrimExpr loop_min_;
+  int num_stages_;
+  PrimExpr replacement_;
+};
+
+static Array<Buffer>
+PromoteAsyncRingAllocBuffers(const Array<Buffer> &alloc_buffers,
+                             const std::unordered_set<Var, ObjectPtrHash,
+                                                      ObjectPtrEqual>
+                                 &async_write_buffers,
+                             int num_stages) {
+  if (num_stages <= 1 || async_write_buffers.empty()) {
+    return alloc_buffers;
+  }
+
+  Array<Buffer> result;
+  result.reserve(alloc_buffers.size());
+  for (const Buffer &buffer : alloc_buffers) {
+    bool should_promote = async_write_buffers.count(buffer->data) &&
+                          IsSharedBuffer(buffer) && !buffer->shape.empty();
+    if (!should_promote) {
+      result.push_back(buffer);
+      continue;
+    }
+
+    const auto *first_dim = buffer->shape[0].as<IntImmNode>();
+    if (!first_dim || first_dim->value >= num_stages) {
+      result.push_back(buffer);
+      continue;
+    }
+
+    Array<PrimExpr> shape = buffer->shape;
+    shape.Set(0, IntImm(shape[0].dtype(), num_stages));
+    // Keep the same Buffer object so layout_map keys and body references stay
+    // consistent with alloc_buffers.
+    const_cast<BufferNode *>(buffer.get())->shape = shape;
+    result.push_back(buffer);
+  }
+  return result;
+}
 
 class BufferDataToBufferCollector : public StmtExprVisitor {
 public:
@@ -665,6 +813,7 @@ class AsyncCopyBlockExtractor {
 public:
   std::vector<AsyncCopyBlockInfo> blocks;
   std::vector<Stmt> compute_stmts;
+  std::vector<int> compute_stmt_indices;
 
   void Extract(const Array<Stmt> &flat_stmts) {
     size_t i = 0;
@@ -680,7 +829,8 @@ public:
           blocks.push_back({AsyncProducerKind::kTma,
                             StripTmaCopyWriteBufferAttr(flat_stmts[i]),
                             Optional<Stmt>(flat_stmts[i + 1]),
-                            write_buffer_data});
+                            write_buffer_data, static_cast<int>(i),
+                            static_cast<int>(i + 1)});
           i += 2;
           continue;
         }
@@ -700,16 +850,18 @@ public:
             producer_seq.push_back(flat_stmts[j]);
           }
           producer_seq.push_back(flat_stmts[cp_async_end + 1]);
-          Stmt producer_stmt = producer_seq.size() == 1 ? producer_seq[0]
-                                                        : SeqStmt(producer_seq);
+          Stmt producer_stmt = MakeSeqOrStmt(producer_seq);
           blocks.push_back({AsyncProducerKind::kCpAsync, producer_stmt,
                             Optional<Stmt>(),
-                            GetCpAsyncDstBufferData(producer_stmt)});
+                            GetCpAsyncDstBufferData(producer_stmt),
+                            static_cast<int>(i),
+                            static_cast<int>(cp_async_end + 2)});
           i = cp_async_end + 3;
           continue;
         }
       }
       compute_stmts.push_back(flat_stmts[i]);
+      compute_stmt_indices.push_back(static_cast<int>(i));
       i++;
     }
   }
@@ -1482,6 +1634,13 @@ private:
       return StmtExprMutator::VisitStmt_(op);
     }
 
+    std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> async_write_buffers;
+    for (const auto &block : extractor.blocks) {
+      if (block.write_buffer_data.defined()) {
+        async_write_buffers.insert(block.write_buffer_data.value());
+      }
+    }
+
     // NOTE: tl_pipeline_order/stage with -1 values are user-provided
     // producer markers from T.Pipelined(order=..., stage=..., group=...).
     // FineGrainedWS should process these, not skip them.
@@ -1564,6 +1723,27 @@ private:
       }
     }
 
+    auto insertion_pos_before_original_stmt = [&](int original_index) {
+      int pos = 0;
+      for (int idx : extractor.compute_stmt_indices) {
+        if (idx < original_index) {
+          ++pos;
+        }
+      }
+      return std::max(
+          0, std::min(pos, static_cast<int>(extractor.compute_stmts.size())));
+    };
+    auto insertion_pos_after_original_stmt = [&](int original_index) {
+      int pos = 0;
+      for (int idx : extractor.compute_stmt_indices) {
+        if (idx <= original_index) {
+          ++pos;
+        }
+      }
+      return std::max(
+          0, std::min(pos, static_cast<int>(extractor.compute_stmts.size())));
+    };
+
     // --- Apply barrier hints (Proposal 2) ---
     // Override wait/arrive positions if Phase B provided hints.
     // Safety: hints cannot place waits before first_read.
@@ -1578,16 +1758,19 @@ private:
       }
       if (!buf_name.empty() && barrier_hints_.count(buf_name)) {
         auto [hint_wait, hint_arrive] = barrier_hints_.at(buf_name);
+        int hint_wait_pos = insertion_pos_before_original_stmt(hint_wait);
+        int hint_arrive_pos = insertion_pos_after_original_stmt(hint_arrive);
         // Clamp: hint_wait must be in [0, wait_insert_pos[ti]].
         // The wait is inserted BEFORE compute_stmt[wait_insert_pos].
         // Hints can only move the wait EARLIER (closer to loop head),
         // never past first_read, as that would read before data is ready.
-        int safe_wait = std::max(0, std::min(hint_wait, wait_insert_pos[ti]));
+        int safe_wait =
+            std::max(0, std::min(hint_wait_pos, wait_insert_pos[ti]));
         // Clamp: hint_arrive must be >= dependency-derived lower bound
         // (last_access + 1). This is critical: releasing the slot before
         // the final consumer access causes a correctness bug.
         int safe_arrive =
-            std::max(hint_arrive, arrive_insert_pos[ti]);
+            std::max(hint_arrive_pos, arrive_insert_pos[ti]);
         // Clamp: hint_arrive must be <= compute_stmts.size()
         safe_arrive = std::min(
             safe_arrive,
@@ -2115,8 +2298,9 @@ private:
             producer_phase_counter->Increment()));
       }
     }
+    ICHECK(!producer_body_stmts.empty());
     Stmt producer_loop_body =
-        MergeAdjacentEquivalentIfs(SeqStmt(producer_body_stmts));
+        MergeAdjacentEquivalentIfs(MakeSeqOrStmt(producer_body_stmts));
     producer_loop_body = rewrap_loop_body_lets(producer_loop_body);
 
     // --- Three-Role Detection ---
@@ -2199,9 +2383,16 @@ private:
       consumer_body_stmts.push_back(stmt);
       if (track_warp_groups) consumer_stmt_warp_group.push_back(wg);
     };
-    // Lookup warp group for a compute_stmt index; returns -1 if unassigned.
+    // Lookup warp group for a compute_stmt index. Solver annotations use the
+    // original flattened pipeline stmt ids (s0, s1, ...), while
+    // compute_stmts has async producer/wait pairs removed.
     auto warp_group_for_ci = [&](int ci) -> int {
-      auto it = warp_assigns_map_.find(ci);
+      if (ci < 0 ||
+          ci >= static_cast<int>(extractor.compute_stmt_indices.size())) {
+        return -1;
+      }
+      int original_stmt_index = extractor.compute_stmt_indices[ci];
+      auto it = warp_assigns_map_.find(original_stmt_index);
       return (it != warp_assigns_map_.end()) ? it->second : -1;
     };
 
@@ -2536,23 +2727,28 @@ private:
       }
     }
 
+    ICHECK(!consumer_body_stmts.empty());
     Stmt consumer_loop_body =
-        MergeAdjacentEquivalentIfs(SeqStmt(consumer_body_stmts));
+        MergeAdjacentEquivalentIfs(MakeSeqOrStmt(consumer_body_stmts));
     consumer_loop_body = rewrap_loop_body_lets(consumer_loop_body);
 
-    // --- Replace shared-memory stage expressions with phase counters ---
-    // When the loop body is conditionally guarded, the barrier IDs already
-    // use phase-counter-based stage/parity, but the shared-memory buffer
-    // offsets still embed FloorMod(loop_var - loop_min, num_stages).
-    // Rewrite them so that buffer staging stays in sync with barriers.
-    if (needs_phase_counter) {
-      producer_loop_body = StageExprReplacer::Replace(
-          producer_loop_body, loop_var, loop_min, num_stages,
-          producer_phase_counter->StageExpr(num_stages));
-      consumer_loop_body = StageExprReplacer::Replace(
-          consumer_loop_body, loop_var, loop_min, num_stages,
-          consumer_phase_counter->StageExpr(num_stages));
-    }
+    // --- Replace shared-memory stage expressions with the active WS stage ---
+    // Barrier IDs and shared-memory ring-buffer indices must use the same stage
+    // source.  This is required both for guarded loops (phase counters) and for
+    // scheduler-promoted num_stages where the original body may still contain
+    // k % 2 / k & 1 staging expressions.
+    producer_loop_body = StageExprReplacer::Replace(
+        producer_loop_body, loop_var, loop_min, num_stages,
+        producer_stage_expr);
+    producer_loop_body = StageParityReplacer::Replace(
+        producer_loop_body, loop_var, loop_min, num_stages,
+        producer_parity_expr);
+    consumer_loop_body = StageExprReplacer::Replace(
+        consumer_loop_body, loop_var, loop_min, num_stages,
+        consumer_stage_expr);
+    consumer_loop_body = StageParityReplacer::Replace(
+        consumer_loop_body, loop_var, loop_min, num_stages,
+        consumer_parity_expr);
 
     // --- Build dQ Writer Loop Body (three-role only) ---
     Stmt dq_writer_loop_body;
@@ -2573,7 +2769,8 @@ private:
       dq_writer_stmts.push_back(Evaluate(
           Call(DataType::Handle(), named_barrier_arrive(),
                {IntImm(DataType::Int(32), 2), three_role_barrier_count})));
-      dq_writer_loop_body = SeqStmt(dq_writer_stmts);
+      ICHECK(!dq_writer_stmts.empty());
+      dq_writer_loop_body = MakeSeqOrStmt(dq_writer_stmts);
       dq_writer_loop_body = rewrap_loop_body_lets(dq_writer_loop_body);
     }
 
@@ -2666,7 +2863,7 @@ private:
       }
 
       if (!epilogue_stmts.empty()) {
-        Stmt epilogue_body = SeqStmt(epilogue_stmts);
+        Stmt epilogue_body = MakeSeqOrStmt(epilogue_stmts);
         // Guard: skip epilogue if fewer than abs(offset) iterations executed.
         // This handles masked loops where all iterations may be skipped.
         PrimExpr min_required =
@@ -3297,8 +3494,10 @@ private:
               consumer_phase_counter->Increment()));
         }
 
-        Stmt wg0_loop_body = SeqStmt(wg0_body_stmts);
-        Stmt wg1_loop_body = SeqStmt(wg1_body_stmts);
+        ICHECK(!wg0_body_stmts.empty());
+        ICHECK(!wg1_body_stmts.empty());
+        Stmt wg0_loop_body = MakeSeqOrStmt(wg0_body_stmts);
+        Stmt wg1_loop_body = MakeSeqOrStmt(wg1_body_stmts);
         wg0_loop_body = rewrap_loop_body_lets(wg0_loop_body);
         wg1_loop_body = rewrap_loop_body_lets(wg1_loop_body);
 
@@ -3459,7 +3658,8 @@ private:
                          << " has no stmts, inserting nop";
             wg_loops[w] = Evaluate(0);
           } else {
-            Stmt wg_body = MergeAdjacentEquivalentIfs(SeqStmt(wg_stmts[w]));
+            Stmt wg_body =
+                MergeAdjacentEquivalentIfs(MakeSeqOrStmt(wg_stmts[w]));
             wg_body = rewrap_loop_body_lets(wg_body);
 
             // Rewrite stage expressions if needed
@@ -3715,9 +3915,11 @@ private:
 
     // Build the new Block and BlockRealize (without recursive mutation
     // since we've already transformed the body directly).
+    Array<Buffer> alloc_buffers = PromoteAsyncRingAllocBuffers(
+        orig_block->alloc_buffers, async_write_buffers, num_stages);
     Block new_block(orig_block->iter_vars, orig_block->reads,
                     orig_block->writes, orig_block->name_hint, new_block_body,
-                    orig_block->init, orig_block->alloc_buffers,
+                    orig_block->init, alloc_buffers,
                     orig_block->match_buffers, orig_block->annotations);
     return BlockRealize(op->iter_values, op->predicate, new_block);
   }
@@ -4088,7 +4290,7 @@ private:
       auto nested = TryPrependToConsumerBranch(new_seq.back(), prepend_stmt);
       if (nested.defined()) {
         new_seq.Set(new_seq.size() - 1, nested.value());
-        return SeqStmt(new_seq);
+        return new_seq.size() == 1 ? new_seq[0] : SeqStmt(new_seq);
       }
       return std::nullopt;
     }
@@ -4151,7 +4353,7 @@ private:
       auto nested = TryPrependToProducerBranch(new_seq.back(), prepend_stmt);
       if (nested.defined()) {
         new_seq.Set(new_seq.size() - 1, nested.value());
-        return SeqStmt(new_seq);
+        return new_seq.size() == 1 ? new_seq[0] : SeqStmt(new_seq);
       }
       return std::nullopt;
     }
@@ -4211,7 +4413,7 @@ private:
       auto nested = TryAppendToProducerBranch(new_seq.back(), append_stmt);
       if (nested.defined()) {
         new_seq.Set(new_seq.size() - 1, nested.value());
-        return SeqStmt(new_seq);
+        return new_seq.size() == 1 ? new_seq[0] : SeqStmt(new_seq);
       }
       return std::nullopt;
     }
@@ -4276,7 +4478,7 @@ private:
       auto nested = TryAppendToConsumerBranch(new_seq.back(), append_stmt);
       if (nested.defined()) {
         new_seq.Set(new_seq.size() - 1, nested.value());
-        return SeqStmt(new_seq);
+        return new_seq.size() == 1 ? new_seq[0] : SeqStmt(new_seq);
       }
       return std::nullopt;
     }
