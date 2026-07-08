@@ -379,6 +379,38 @@ class TestSMTModuloRegMultiplicity:
         assert result is not None
         assert result["reg_peak"][0] == 180
 
+    def test_phase_b_returns_output_lifetimes(self):
+        specs = [
+            ("A", "ALU", 1, [("A", 3)], [("oA", "RMEM", 60, 0)]),
+        ]
+
+        sched = _make_smt_nodes(
+            specs, num_warps=1, reg_limit=180, timeout_ms=5000)
+        result = sched._solve_phase_b(ii=1, L=3, optimize=False)
+        assert result is not None
+
+        lifetimes = result["variable_lifetimes"]
+        assert set(lifetimes) == {"oA"}
+        buffer_lifetime = lifetimes["oA"]
+        current_iter = next(
+            lt for lt in buffer_lifetime["copies"]
+            if lt["iter_offset"] == 0
+        )
+        start = result["schedule"]["A"]
+        assert buffer_lifetime["name"] == "oA"
+        assert buffer_lifetime["storage"] == "RMEM"
+        assert buffer_lifetime["buffer"] == "oA"
+        assert buffer_lifetime["producers"] == ["A"]
+        assert current_iter["producer"] == "A"
+        assert current_iter["live_start"] == start
+        assert current_iter["live_end_exclusive"] == start + 3
+        assert current_iter["live_end"] == start + 2
+        assert current_iter["consumers"] == [{
+            "consumer": "A",
+            "distance": 3,
+            "consume_time": start + 3,
+        }]
+
     def test_rmem_allocation_is_grouped_by_buffer_name(self):
         specs = [
             ("A", "ALU", 1, [], [("A_buf", "RMEM", 60, 0, "frag", "DEAD_ON_EXIT")]),

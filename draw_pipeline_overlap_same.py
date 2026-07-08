@@ -64,10 +64,16 @@ def configure_chinese_font():
 configure_chinese_font()
 
 # optimized mod sched
-warp_assign={'s0': 2, 's2': 6, 's3': 6, 's4': 6, 's5': 4, 's6': 5, 's7': 4, 's8': 5, 's9': 7, 's10': 6, 's11': 5, 's12': 6, 's13': 4, 's14': 2, 's16': 4}
-optimized_L=1174
-base_I=512
-optimized_M={0: 0, 2: 8, 3: 4, 4: 12, 5: 282, 6: 434, 7: 440, 8: 448, 9: 448, 10: 978, 11: 498, 12: 984, 13: 978, 14: 2, 16: 1046}
+# warp_assign={'s0': 6, 's2': 2, 's3': 2, 's4': 2, 's5': 0, 's6': 3, 's7': 0, 's8': 3, 's9': 1, 's10': 2, 's11': 3, 's12': 2, 's13': 0, 's14': 6, 's16': 0}
+# optimized_L=1174
+# base_I=512
+# optimized_M={0: 0, 2: 8, 3: 4, 4: 12, 5: 282, 6: 434, 7: 440, 8: 448, 9: 448, 10: 978, 11: 498, 12: 984, 13: 978, 14: 2, 16: 1046}
+
+warp_assign={'s0': 0, 's2': 6, 's3': 8, 's4': 7, 's5': 8, 's6': 7, 's7': 10, 's8': 6, 's9': 5, 's10': 11, 's11': 7, 's12': 4, 's13': 8, 's14': 3, 's16': 8}
+optimized_L=726
+base_I=256
+optimized_M={0: 0, 2: 0, 3: 6, 4: 2, 5: 282, 6: 370, 7: 374, 8: 380, 9: 380, 10: 654, 11: 414, 12: 658, 13: 654, 14: 0, 16: 662}
+variable_lifetimes={'Ks': {'name': 'Ks', 'storage': 'SMEM', 'buffer': 'Ks', 'footprint_bytes': 32768, 'lifetime': 'dead_on_entry', 'producers': ['s0'], 'copies': [{'producer': 's0', 'producer_warp': 0, 'iter_offset': -2, 'live_start': -512, 'live_end': -231, 'live_end_exclusive': -230, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': -230}]}, {'producer': 's0', 'producer_warp': 0, 'iter_offset': -1, 'live_start': -256, 'live_end': 25, 'live_end_exclusive': 26, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 26}]}, {'producer': 's0', 'producer_warp': 0, 'iter_offset': 0, 'live_start': 0, 'live_end': 281, 'live_end_exclusive': 282, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 282}]}, {'producer': 's0', 'producer_warp': 0, 'iter_offset': 1, 'live_start': 256, 'live_end': 537, 'live_end_exclusive': 538, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 538}]}, {'producer': 's0', 'producer_warp': 0, 'iter_offset': 2, 'live_start': 512, 'live_end': 793, 'live_end_exclusive': 794, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 794}]}]}, 'smp': {'name': 'smp', 'storage': 'RMEM', 'buffer': 'smp', 'footprint_bytes': 8, 'lifetime': 'dead_on_entry', 'producers': ['s2'], 'copies': [{'producer': 's2', 'producer_warp': 6, 'iter_offset': -2, 'live_start': -512, 'live_end': -133, 'live_end_exclusive': -132, 'consumers': [{'consumer': 's3', 'distance': 0, 'consume_time': -506}, {'consumer': 's7', 'distance': 0, 'consume_time': -138}, {'consumer': 's8', 'distance': 0, 'consume_time': -132}]}, {'producer': 's2', 'producer_warp': 6, 'iter_offset': -1, 'live_start': -256, 'live_end': 123, 'live_end_exclusive': 124, 'consumers': [{'consumer': 's3', 'distance': 0, 'consume_time': -250}, {'consumer': 's7', 'distance': 0, 'consume_time': 118}, {'consumer': 's8', 'distance': 0, 'consume_time': 124}]}, {'producer': 's2', 'producer_warp': 6, 'iter_offset': 0, 'live_start': 0, 'live_end': 379, 'live_end_exclusive': 380, 'consumers': [{'consumer': 's3', 'distance': 0, 'consume_time': 6}, {'consumer': 's7', 'distance': 0, 'consume_time': 374}, {'consumer': 's8', 'distance': 0, 'consume_time': 380}]}, {'producer': 's2', 'producer_warp': 6, 'iter_offset': 1, 'live_start': 256, 'live_end': 635, 'live_end_exclusive': 636, 'consumers': [{'consumer': 's3', 'distance': 0, 'consume_time': 262}, {'consumer': 's7', 'distance': 0, 'consume_time': 630}, {'consumer': 's8', 'distance': 0, 'consume_time': 636}]}, {'producer': 's2', 'producer_warp': 6, 'iter_offset': 2, 'live_start': 512, 'live_end': 891, 'live_end_exclusive': 892, 'consumers': [{'consumer': 's3', 'distance': 0, 'consume_time': 518}, {'consumer': 's7', 'distance': 0, 'consume_time': 886}, {'consumer': 's8', 'distance': 0, 'consume_time': 892}]}]}, 'sm': {'name': 'sm', 'storage': 'RMEM', 'buffer': 'sm', 'footprint_bytes': 8, 'lifetime': 'dead_on_entry', 'producers': ['s3', 's6', 's7'], 'copies': [{'producer': 's3', 'producer_warp': 8, 'iter_offset': -2, 'live_start': -506, 'live_end': -143, 'live_end_exclusive': -142, 'consumers': [{'consumer': 's6', 'distance': 0, 'consume_time': -142}]}, {'producer': 's3', 'producer_warp': 8, 'iter_offset': -1, 'live_start': -250, 'live_end': 113, 'live_end_exclusive': 114, 'consumers': [{'consumer': 's6', 'distance': 0, 'consume_time': 114}]}, {'producer': 's3', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 6, 'live_end': 369, 'live_end_exclusive': 370, 'consumers': [{'consumer': 's6', 'distance': 0, 'consume_time': 370}]}, {'producer': 's3', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 262, 'live_end': 625, 'live_end_exclusive': 626, 'consumers': [{'consumer': 's6', 'distance': 0, 'consume_time': 626}]}, {'producer': 's3', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 518, 'live_end': 881, 'live_end_exclusive': 882, 'consumers': [{'consumer': 's6', 'distance': 0, 'consume_time': 882}]}, {'producer': 's6', 'producer_warp': 7, 'iter_offset': -2, 'live_start': -142, 'live_end': 113, 'live_end_exclusive': 114, 'consumers': [{'consumer': 's6', 'distance': 1, 'consume_time': 114}, {'consumer': 's7', 'distance': 0, 'consume_time': -138}, {'consumer': 's9', 'distance': 0, 'consume_time': -132}]}, {'producer': 's6', 'producer_warp': 7, 'iter_offset': -1, 'live_start': 114, 'live_end': 369, 'live_end_exclusive': 370, 'consumers': [{'consumer': 's6', 'distance': 1, 'consume_time': 370}, {'consumer': 's7', 'distance': 0, 'consume_time': 118}, {'consumer': 's9', 'distance': 0, 'consume_time': 124}]}, {'producer': 's6', 'producer_warp': 7, 'iter_offset': 0, 'live_start': 370, 'live_end': 625, 'live_end_exclusive': 626, 'consumers': [{'consumer': 's6', 'distance': 1, 'consume_time': 626}, {'consumer': 's7', 'distance': 0, 'consume_time': 374}, {'consumer': 's9', 'distance': 0, 'consume_time': 380}]}, {'producer': 's6', 'producer_warp': 7, 'iter_offset': 1, 'live_start': 626, 'live_end': 881, 'live_end_exclusive': 882, 'consumers': [{'consumer': 's6', 'distance': 1, 'consume_time': 882}, {'consumer': 's7', 'distance': 0, 'consume_time': 630}, {'consumer': 's9', 'distance': 0, 'consume_time': 636}]}, {'producer': 's6', 'producer_warp': 7, 'iter_offset': 2, 'live_start': 882, 'live_end': 1137, 'live_end_exclusive': 1138, 'consumers': [{'consumer': 's6', 'distance': 1, 'consume_time': 1138}, {'consumer': 's7', 'distance': 0, 'consume_time': 886}, {'consumer': 's9', 'distance': 0, 'consume_time': 892}]}, {'producer': 's7', 'producer_warp': 10, 'iter_offset': -2, 'live_start': -138, 'live_end': 117, 'live_end_exclusive': 118, 'consumers': [{'consumer': 's7', 'distance': 1, 'consume_time': 118}, {'consumer': 's8', 'distance': 0, 'consume_time': -132}, {'consumer': 's9', 'distance': 0, 'consume_time': -132}]}, {'producer': 's7', 'producer_warp': 10, 'iter_offset': -1, 'live_start': 118, 'live_end': 373, 'live_end_exclusive': 374, 'consumers': [{'consumer': 's7', 'distance': 1, 'consume_time': 374}, {'consumer': 's8', 'distance': 0, 'consume_time': 124}, {'consumer': 's9', 'distance': 0, 'consume_time': 124}]}, {'producer': 's7', 'producer_warp': 10, 'iter_offset': 0, 'live_start': 374, 'live_end': 629, 'live_end_exclusive': 630, 'consumers': [{'consumer': 's7', 'distance': 1, 'consume_time': 630}, {'consumer': 's8', 'distance': 0, 'consume_time': 380}, {'consumer': 's9', 'distance': 0, 'consume_time': 380}]}, {'producer': 's7', 'producer_warp': 10, 'iter_offset': 1, 'live_start': 630, 'live_end': 885, 'live_end_exclusive': 886, 'consumers': [{'consumer': 's7', 'distance': 1, 'consume_time': 886}, {'consumer': 's8', 'distance': 0, 'consume_time': 636}, {'consumer': 's9', 'distance': 0, 'consume_time': 636}]}, {'producer': 's7', 'producer_warp': 10, 'iter_offset': 2, 'live_start': 886, 'live_end': 1141, 'live_end_exclusive': 1142, 'consumers': [{'consumer': 's7', 'distance': 1, 'consume_time': 1142}, {'consumer': 's8', 'distance': 0, 'consume_time': 892}, {'consumer': 's9', 'distance': 0, 'consume_time': 892}]}]}, 'acc_s': {'name': 'acc_s', 'storage': 'RMEM', 'buffer': 'acc_s', 'footprint_bytes': 128, 'lifetime': 'dead_on_entry', 'producers': ['s4', 's5', 's9'], 'copies': [{'producer': 's4', 'producer_warp': 7, 'iter_offset': -2, 'live_start': -510, 'live_end': -231, 'live_end_exclusive': -230, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': -230}]}, {'producer': 's4', 'producer_warp': 7, 'iter_offset': -1, 'live_start': -254, 'live_end': 25, 'live_end_exclusive': 26, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 26}]}, {'producer': 's4', 'producer_warp': 7, 'iter_offset': 0, 'live_start': 2, 'live_end': 281, 'live_end_exclusive': 282, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 282}]}, {'producer': 's4', 'producer_warp': 7, 'iter_offset': 1, 'live_start': 258, 'live_end': 537, 'live_end_exclusive': 538, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 538}]}, {'producer': 's4', 'producer_warp': 7, 'iter_offset': 2, 'live_start': 514, 'live_end': 793, 'live_end_exclusive': 794, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 794}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': -2, 'live_start': -230, 'live_end': 25, 'live_end_exclusive': 26, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 26}, {'consumer': 's6', 'distance': 0, 'consume_time': -142}, {'consumer': 's9', 'distance': 0, 'consume_time': -132}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': -1, 'live_start': 26, 'live_end': 281, 'live_end_exclusive': 282, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 282}, {'consumer': 's6', 'distance': 0, 'consume_time': 114}, {'consumer': 's9', 'distance': 0, 'consume_time': 124}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 282, 'live_end': 537, 'live_end_exclusive': 538, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 538}, {'consumer': 's6', 'distance': 0, 'consume_time': 370}, {'consumer': 's9', 'distance': 0, 'consume_time': 380}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 538, 'live_end': 793, 'live_end_exclusive': 794, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 794}, {'consumer': 's6', 'distance': 0, 'consume_time': 626}, {'consumer': 's9', 'distance': 0, 'consume_time': 636}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 794, 'live_end': 1049, 'live_end_exclusive': 1050, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 1050}, {'consumer': 's6', 'distance': 0, 'consume_time': 882}, {'consumer': 's9', 'distance': 0, 'consume_time': 892}]}, {'producer': 's9', 'producer_warp': 5, 'iter_offset': -2, 'live_start': -132, 'live_end': 141, 'live_end_exclusive': 142, 'consumers': [{'consumer': 's9', 'distance': 1, 'consume_time': 124}, {'consumer': 's10', 'distance': 0, 'consume_time': 142}, {'consumer': 's13', 'distance': 0, 'consume_time': 142}]}, {'producer': 's9', 'producer_warp': 5, 'iter_offset': -1, 'live_start': 124, 'live_end': 397, 'live_end_exclusive': 398, 'consumers': [{'consumer': 's9', 'distance': 1, 'consume_time': 380}, {'consumer': 's10', 'distance': 0, 'consume_time': 398}, {'consumer': 's13', 'distance': 0, 'consume_time': 398}]}, {'producer': 's9', 'producer_warp': 5, 'iter_offset': 0, 'live_start': 380, 'live_end': 653, 'live_end_exclusive': 654, 'consumers': [{'consumer': 's9', 'distance': 1, 'consume_time': 636}, {'consumer': 's10', 'distance': 0, 'consume_time': 654}, {'consumer': 's13', 'distance': 0, 'consume_time': 654}]}, {'producer': 's9', 'producer_warp': 5, 'iter_offset': 1, 'live_start': 636, 'live_end': 909, 'live_end_exclusive': 910, 'consumers': [{'consumer': 's9', 'distance': 1, 'consume_time': 892}, {'consumer': 's10', 'distance': 0, 'consume_time': 910}, {'consumer': 's13', 'distance': 0, 'consume_time': 910}]}, {'producer': 's9', 'producer_warp': 5, 'iter_offset': 2, 'live_start': 892, 'live_end': 1165, 'live_end_exclusive': 1166, 'consumers': [{'consumer': 's9', 'distance': 1, 'consume_time': 1148}, {'consumer': 's10', 'distance': 0, 'consume_time': 1166}, {'consumer': 's13', 'distance': 0, 'consume_time': 1166}]}]}, 'desc_a': {'name': 'desc_a', 'storage': 'RMEM', 'buffer': 'desc_a', 'footprint_bytes': 2, 'lifetime': 'dead_on_entry', 'producers': ['s5', 's16'], 'copies': [{'producer': 's5', 'producer_warp': 8, 'iter_offset': -2, 'live_start': -230, 'live_end': 25, 'live_end_exclusive': 26, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 26}, {'consumer': 's6', 'distance': 0, 'consume_time': -142}, {'consumer': 's9', 'distance': 0, 'consume_time': -132}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': -1, 'live_start': 26, 'live_end': 281, 'live_end_exclusive': 282, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 282}, {'consumer': 's6', 'distance': 0, 'consume_time': 114}, {'consumer': 's9', 'distance': 0, 'consume_time': 124}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 282, 'live_end': 537, 'live_end_exclusive': 538, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 538}, {'consumer': 's6', 'distance': 0, 'consume_time': 370}, {'consumer': 's9', 'distance': 0, 'consume_time': 380}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 538, 'live_end': 793, 'live_end_exclusive': 794, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 794}, {'consumer': 's6', 'distance': 0, 'consume_time': 626}, {'consumer': 's9', 'distance': 0, 'consume_time': 636}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 794, 'live_end': 1049, 'live_end_exclusive': 1050, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 1050}, {'consumer': 's6', 'distance': 0, 'consume_time': 882}, {'consumer': 's9', 'distance': 0, 'consume_time': 892}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': -2, 'live_start': 150, 'live_end': 405, 'live_end_exclusive': 406, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 406}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': -1, 'live_start': 406, 'live_end': 661, 'live_end_exclusive': 662, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 662}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 662, 'live_end': 917, 'live_end_exclusive': 918, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 918}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 918, 'live_end': 1173, 'live_end_exclusive': 1174, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 1174}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 1174, 'live_end': 1429, 'live_end_exclusive': 1430, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 1430}]}]}, 'desc_b': {'name': 'desc_b', 'storage': 'RMEM', 'buffer': 'desc_b', 'footprint_bytes': 2, 'lifetime': 'dead_on_entry', 'producers': ['s5', 's16'], 'copies': [{'producer': 's5', 'producer_warp': 8, 'iter_offset': -2, 'live_start': -230, 'live_end': 25, 'live_end_exclusive': 26, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 26}, {'consumer': 's6', 'distance': 0, 'consume_time': -142}, {'consumer': 's9', 'distance': 0, 'consume_time': -132}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': -1, 'live_start': 26, 'live_end': 281, 'live_end_exclusive': 282, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 282}, {'consumer': 's6', 'distance': 0, 'consume_time': 114}, {'consumer': 's9', 'distance': 0, 'consume_time': 124}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 282, 'live_end': 537, 'live_end_exclusive': 538, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 538}, {'consumer': 's6', 'distance': 0, 'consume_time': 370}, {'consumer': 's9', 'distance': 0, 'consume_time': 380}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 538, 'live_end': 793, 'live_end_exclusive': 794, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 794}, {'consumer': 's6', 'distance': 0, 'consume_time': 626}, {'consumer': 's9', 'distance': 0, 'consume_time': 636}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 794, 'live_end': 1049, 'live_end_exclusive': 1050, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 1050}, {'consumer': 's6', 'distance': 0, 'consume_time': 882}, {'consumer': 's9', 'distance': 0, 'consume_time': 892}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': -2, 'live_start': 150, 'live_end': 405, 'live_end_exclusive': 406, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 406}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': -1, 'live_start': 406, 'live_end': 661, 'live_end_exclusive': 662, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 662}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 662, 'live_end': 917, 'live_end_exclusive': 918, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 918}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 918, 'live_end': 1173, 'live_end_exclusive': 1174, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 1174}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 1174, 'live_end': 1429, 'live_end_exclusive': 1430, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 1430}]}]}, 'ss': {'name': 'ss', 'storage': 'RMEM', 'buffer': 'ss', 'footprint_bytes': 8, 'lifetime': 'dead_on_entry', 'producers': ['s8'], 'copies': [{'producer': 's8', 'producer_warp': 6, 'iter_offset': -2, 'live_start': -132, 'live_end': 145, 'live_end_exclusive': 146, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 124}, {'consumer': 's11', 'distance': 0, 'consume_time': -98}, {'consumer': 's12', 'distance': 0, 'consume_time': 146}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': -1, 'live_start': 124, 'live_end': 401, 'live_end_exclusive': 402, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 380}, {'consumer': 's11', 'distance': 0, 'consume_time': 158}, {'consumer': 's12', 'distance': 0, 'consume_time': 402}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': 0, 'live_start': 380, 'live_end': 657, 'live_end_exclusive': 658, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 636}, {'consumer': 's11', 'distance': 0, 'consume_time': 414}, {'consumer': 's12', 'distance': 0, 'consume_time': 658}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': 1, 'live_start': 636, 'live_end': 913, 'live_end_exclusive': 914, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 892}, {'consumer': 's11', 'distance': 0, 'consume_time': 670}, {'consumer': 's12', 'distance': 0, 'consume_time': 914}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': 2, 'live_start': 892, 'live_end': 1169, 'live_end_exclusive': 1170, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 1148}, {'consumer': 's11', 'distance': 0, 'consume_time': 926}, {'consumer': 's12', 'distance': 0, 'consume_time': 1170}]}]}, 'ss_shared': {'name': 'ss_shared', 'storage': 'SMEM', 'buffer': 'ss_shared', 'footprint_bytes': 512, 'lifetime': 'dead_on_entry', 'producers': ['s8'], 'copies': [{'producer': 's8', 'producer_warp': 6, 'iter_offset': -2, 'live_start': -132, 'live_end': 145, 'live_end_exclusive': 146, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 124}, {'consumer': 's11', 'distance': 0, 'consume_time': -98}, {'consumer': 's12', 'distance': 0, 'consume_time': 146}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': -1, 'live_start': 124, 'live_end': 401, 'live_end_exclusive': 402, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 380}, {'consumer': 's11', 'distance': 0, 'consume_time': 158}, {'consumer': 's12', 'distance': 0, 'consume_time': 402}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': 0, 'live_start': 380, 'live_end': 657, 'live_end_exclusive': 658, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 636}, {'consumer': 's11', 'distance': 0, 'consume_time': 414}, {'consumer': 's12', 'distance': 0, 'consume_time': 658}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': 1, 'live_start': 636, 'live_end': 913, 'live_end_exclusive': 914, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 892}, {'consumer': 's11', 'distance': 0, 'consume_time': 670}, {'consumer': 's12', 'distance': 0, 'consume_time': 914}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': 2, 'live_start': 892, 'live_end': 1169, 'live_end_exclusive': 1170, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 1148}, {'consumer': 's11', 'distance': 0, 'consume_time': 926}, {'consumer': 's12', 'distance': 0, 'consume_time': 1170}]}]}, 'ssum': {'name': 'ssum', 'storage': 'RMEM', 'buffer': 'ssum', 'footprint_bytes': 8, 'lifetime': 'dead_on_entry', 'producers': ['s10'], 'copies': [{'producer': 's10', 'producer_warp': 11, 'iter_offset': -2, 'live_start': 142, 'live_end': 397, 'live_end_exclusive': 398, 'consumers': [{'consumer': 's10', 'distance': 1, 'consume_time': 398}, {'consumer': 's12', 'distance': 0, 'consume_time': 146}]}, {'producer': 's10', 'producer_warp': 11, 'iter_offset': -1, 'live_start': 398, 'live_end': 653, 'live_end_exclusive': 654, 'consumers': [{'consumer': 's10', 'distance': 1, 'consume_time': 654}, {'consumer': 's12', 'distance': 0, 'consume_time': 402}]}, {'producer': 's10', 'producer_warp': 11, 'iter_offset': 0, 'live_start': 654, 'live_end': 909, 'live_end_exclusive': 910, 'consumers': [{'consumer': 's10', 'distance': 1, 'consume_time': 910}, {'consumer': 's12', 'distance': 0, 'consume_time': 658}]}, {'producer': 's10', 'producer_warp': 11, 'iter_offset': 1, 'live_start': 910, 'live_end': 1165, 'live_end_exclusive': 1166, 'consumers': [{'consumer': 's10', 'distance': 1, 'consume_time': 1166}, {'consumer': 's12', 'distance': 0, 'consume_time': 914}]}, {'producer': 's10', 'producer_warp': 11, 'iter_offset': 2, 'live_start': 1166, 'live_end': 1421, 'live_end_exclusive': 1422, 'consumers': [{'consumer': 's10', 'distance': 1, 'consume_time': 1422}, {'consumer': 's12', 'distance': 0, 'consume_time': 1170}]}]}, 'acc_o': {'name': 'acc_o', 'storage': 'RMEM', 'buffer': 'acc_o', 'footprint_bytes': 256, 'lifetime': 'dead_on_entry', 'producers': ['s11', 's16'], 'copies': [{'producer': 's11', 'producer_warp': 7, 'iter_offset': -2, 'live_start': -98, 'live_end': 157, 'live_end_exclusive': 158, 'consumers': [{'consumer': 's11', 'distance': 1, 'consume_time': 158}, {'consumer': 's16', 'distance': 0, 'consume_time': 150}]}, {'producer': 's11', 'producer_warp': 7, 'iter_offset': -1, 'live_start': 158, 'live_end': 413, 'live_end_exclusive': 414, 'consumers': [{'consumer': 's11', 'distance': 1, 'consume_time': 414}, {'consumer': 's16', 'distance': 0, 'consume_time': 406}]}, {'producer': 's11', 'producer_warp': 7, 'iter_offset': 0, 'live_start': 414, 'live_end': 669, 'live_end_exclusive': 670, 'consumers': [{'consumer': 's11', 'distance': 1, 'consume_time': 670}, {'consumer': 's16', 'distance': 0, 'consume_time': 662}]}, {'producer': 's11', 'producer_warp': 7, 'iter_offset': 1, 'live_start': 670, 'live_end': 925, 'live_end_exclusive': 926, 'consumers': [{'consumer': 's11', 'distance': 1, 'consume_time': 926}, {'consumer': 's16', 'distance': 0, 'consume_time': 918}]}, {'producer': 's11', 'producer_warp': 7, 'iter_offset': 2, 'live_start': 926, 'live_end': 1181, 'live_end_exclusive': 1182, 'consumers': [{'consumer': 's11', 'distance': 1, 'consume_time': 1182}, {'consumer': 's16', 'distance': 0, 'consume_time': 1174}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': -2, 'live_start': 150, 'live_end': 405, 'live_end_exclusive': 406, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 406}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': -1, 'live_start': 406, 'live_end': 661, 'live_end_exclusive': 662, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 662}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 662, 'live_end': 917, 'live_end_exclusive': 918, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 918}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 918, 'live_end': 1173, 'live_end_exclusive': 1174, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 1174}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 1174, 'live_end': 1429, 'live_end_exclusive': 1430, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 1430}]}]}, 'ls': {'name': 'ls', 'storage': 'RMEM', 'buffer': 'ls', 'footprint_bytes': 8, 'lifetime': 'dead_on_entry', 'producers': ['s12'], 'copies': [{'producer': 's12', 'producer_warp': 4, 'iter_offset': -2, 'live_start': 146, 'live_end': 401, 'live_end_exclusive': 402, 'consumers': [{'consumer': 's12', 'distance': 1, 'consume_time': 402}]}, {'producer': 's12', 'producer_warp': 4, 'iter_offset': -1, 'live_start': 402, 'live_end': 657, 'live_end_exclusive': 658, 'consumers': [{'consumer': 's12', 'distance': 1, 'consume_time': 658}]}, {'producer': 's12', 'producer_warp': 4, 'iter_offset': 0, 'live_start': 658, 'live_end': 913, 'live_end_exclusive': 914, 'consumers': [{'consumer': 's12', 'distance': 1, 'consume_time': 914}]}, {'producer': 's12', 'producer_warp': 4, 'iter_offset': 1, 'live_start': 914, 'live_end': 1169, 'live_end_exclusive': 1170, 'consumers': [{'consumer': 's12', 'distance': 1, 'consume_time': 1170}]}, {'producer': 's12', 'producer_warp': 4, 'iter_offset': 2, 'live_start': 1170, 'live_end': 1425, 'live_end_exclusive': 1426, 'consumers': [{'consumer': 's12', 'distance': 1, 'consume_time': 1426}]}]}, 'acc_s_c': {'name': 'acc_s_c', 'storage': 'SMEM', 'buffer': 'acc_s_c', 'footprint_bytes': 16384, 'lifetime': 'dead_on_entry', 'producers': ['s13'], 'copies': [{'producer': 's13', 'producer_warp': 8, 'iter_offset': -2, 'live_start': 142, 'live_end': 149, 'live_end_exclusive': 150, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 150}]}, {'producer': 's13', 'producer_warp': 8, 'iter_offset': -1, 'live_start': 398, 'live_end': 405, 'live_end_exclusive': 406, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 406}]}, {'producer': 's13', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 654, 'live_end': 661, 'live_end_exclusive': 662, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 662}]}, {'producer': 's13', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 910, 'live_end': 917, 'live_end_exclusive': 918, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 918}]}, {'producer': 's13', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 1166, 'live_end': 1173, 'live_end_exclusive': 1174, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 1174}]}]}, 'Vs': {'name': 'Vs', 'storage': 'SMEM', 'buffer': 'Vs', 'footprint_bytes': 32768, 'lifetime': 'dead_on_entry', 'producers': ['s14'], 'copies': [{'producer': 's14', 'producer_warp': 3, 'iter_offset': -2, 'live_start': -512, 'live_end': 149, 'live_end_exclusive': 150, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 150}]}, {'producer': 's14', 'producer_warp': 3, 'iter_offset': -1, 'live_start': -256, 'live_end': 405, 'live_end_exclusive': 406, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 406}]}, {'producer': 's14', 'producer_warp': 3, 'iter_offset': 0, 'live_start': 0, 'live_end': 661, 'live_end_exclusive': 662, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 662}]}, {'producer': 's14', 'producer_warp': 3, 'iter_offset': 1, 'live_start': 256, 'live_end': 917, 'live_end_exclusive': 918, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 918}]}, {'producer': 's14', 'producer_warp': 3, 'iter_offset': 2, 'live_start': 512, 'live_end': 1173, 'live_end_exclusive': 1174, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 1174}]}]}}
 
 # naive mod sched
 I = 512
@@ -131,7 +137,10 @@ unit_mapping = {
 }
 
 BOX_HEIGHT = 0.55
-ISSUE_ALPHA = 0.8
+LIFETIME_BOX_HEIGHT = 0.28
+LIFETIME_ROW_GAP = 1.15
+LIFETIME_ITER_Y_STEP = 0.33
+ISSUE_ALPHA = 0.6
 UNITS_ORDER = ['TMA', 'TC', 'ALU', 'SFU']
 
 ITERATION_COLOR_PALETTE = {
@@ -149,6 +158,15 @@ WG_HATCHES = {
     1: '',
     2: '...',
     3: '\\\\\\',
+}
+LIFETIME_ITER_COLORS = {
+    -1: {'face': '#5c3d2e', 'edge': '#ba7a5f'},
+    0: {'face': '#1f4e5b', 'edge': '#3a889e'},
+    1: {'face': '#3f4f2f', 'edge': '#8aaa5e'},
+}
+LIFETIME_STORAGE_HATCHES = {
+    'RMEM': '',
+    'SMEM': '///',
 }
 
 
@@ -491,6 +509,274 @@ def draw_single_modulo_window(schedule_m, ii, schedule_l, output_filename, op_wg
     print(f"单个 II 窗口内的 op 启动顺序图已成功导出: {output_filename}")
 
 
+def aggregate_lifetimes_by_buffer(variable_lifetime_items):
+    """Aggregate copy-level lifetimes into one interval per buffer and iteration."""
+    if isinstance(variable_lifetime_items, dict):
+        buffer_items = variable_lifetime_items.values()
+    else:
+        buffer_items = variable_lifetime_items
+
+    aggregated_items = []
+    for buffer_info in buffer_items:
+        copies_by_iter = {}
+        for copy in buffer_info.get('copies', []):
+            iter_offset = copy['iter_offset']
+            merged = copies_by_iter.setdefault(
+                iter_offset,
+                {
+                    'name': buffer_info.get('name', buffer_info.get('buffer')),
+                    'buffer': buffer_info.get('buffer', buffer_info.get('name')),
+                    'storage': buffer_info.get('storage', 'UNKNOWN'),
+                    'footprint_bytes': buffer_info.get('footprint_bytes', 0),
+                    'lifetime': buffer_info.get('lifetime', 'unknown'),
+                    'producers': set(buffer_info.get('producers', [])),
+                    'iter_offset': iter_offset,
+                    'live_start': copy['live_start'],
+                    'live_end': copy['live_end'],
+                    'live_end_exclusive': copy.get('live_end_exclusive', copy['live_end']),
+                    'consumers': [],
+                },
+            )
+            merged['live_start'] = min(merged['live_start'], copy['live_start'])
+            merged['live_end'] = max(merged['live_end'], copy['live_end'])
+            merged['live_end_exclusive'] = max(
+                merged['live_end_exclusive'],
+                copy.get('live_end_exclusive', copy['live_end']),
+            )
+            merged['producers'].add(copy.get('producer'))
+            merged['consumers'].extend(copy.get('consumers', []))
+
+        for item in copies_by_iter.values():
+            item['producers'] = sorted(producer for producer in item['producers'] if producer)
+            aggregated_items.append(item)
+
+    return aggregated_items
+
+
+def build_lifetime_layout(lifetime_items):
+    """Build one y row per buffer and keep all iteration intervals on that row."""
+    buffer_names = sorted({item['buffer'] for item in lifetime_items})
+    y_by_buffer = {
+        name: idx * LIFETIME_ROW_GAP
+        for idx, name in enumerate(reversed(buffer_names))
+    }
+    y_ticks = [y_by_buffer[name] for name in buffer_names]
+    y_labels = list(buffer_names)
+    total_height = max(y_by_buffer.values(), default=0) + LIFETIME_ROW_GAP
+    return y_by_buffer, y_ticks, y_labels, total_height
+
+
+def lifetime_stage_label(iter_offset):
+    if iter_offset == -1:
+        return 'i-1'
+    if iter_offset == 0:
+        return 'i'
+    if iter_offset == 1:
+        return 'i+1'
+    if iter_offset > 0:
+        return f"i+{iter_offset}"
+    return f"i{iter_offset}"
+
+
+def build_lifetime_events(lifetime_items, ii, schedule_l):
+    events = {0, ii, ii * 2, ii * 3, schedule_l, ii + schedule_l, ii * 2 + schedule_l}
+    for item in lifetime_items:
+        events.add(item['live_start'])
+        events.add(item['live_end'])
+        events.add(item['live_end_exclusive'])
+        for consumer in item.get('consumers', []):
+            events.add(consumer['consume_time'])
+    sorted_events = sorted(events)
+    return sorted_events, {t: idx for idx, t in enumerate(sorted_events)}
+
+
+def lifetime_iter_hatch(iter_offset):
+    return '\\\\\\' if iter_offset > 0 else 'xxx'
+
+
+def lifetime_iter_colors(iter_offset):
+    fallback_colors = [
+        {'face': '#4b3f72', 'edge': '#9d87d2'},
+        {'face': '#554b2f', 'edge': '#c0a45d'},
+    ]
+    return LIFETIME_ITER_COLORS.get(
+        iter_offset,
+        fallback_colors[abs(iter_offset) % len(fallback_colors)],
+    )
+
+
+def lifetime_storage_hatch(storage):
+    return LIFETIME_STORAGE_HATCHES.get(storage, '\\\\\\')
+
+
+def lifetime_iter_y_offset(iter_offset):
+    return iter_offset * LIFETIME_ITER_Y_STEP
+
+
+def draw_lifetime_block(ax, cx_start, cx_end, y_pos, colors, label, hatch=None, alpha=0.82):
+    c_width = max(cx_end - cx_start, 0.25)
+    rect = patches.Rectangle(
+        (cx_start, y_pos - LIFETIME_BOX_HEIGHT / 2),
+        c_width,
+        LIFETIME_BOX_HEIGHT,
+        linewidth=1.4,
+        edgecolor=colors['edge'],
+        facecolor=colors['face'],
+        zorder=3,
+        alpha=alpha,
+    )
+    ax.add_patch(rect)
+    if hatch:
+        hatch_rect = patches.Rectangle(
+            (cx_start, y_pos - LIFETIME_BOX_HEIGHT / 2),
+            c_width,
+            LIFETIME_BOX_HEIGHT,
+            linewidth=0,
+            edgecolor='#f0f0f0',
+            facecolor='none',
+            hatch=hatch,
+            zorder=4,
+            alpha=0.45,
+        )
+        ax.add_patch(hatch_rect)
+    ax.text(
+        cx_start + c_width / 2,
+        y_pos,
+        label,
+        color='white',
+        ha='center',
+        va='center',
+        fontsize=7,
+        zorder=5,
+        fontweight='bold',
+        alpha=0.9,
+    )
+
+
+def draw_variable_lifetimes(lifetime_items, ii, schedule_l, output_filename):
+    lifetime_items = aggregate_lifetimes_by_buffer(lifetime_items)
+    y_by_name, y_ticks, y_labels, total_height = build_lifetime_layout(lifetime_items)
+    sorted_events, time_to_coord = build_lifetime_events(lifetime_items, ii, schedule_l)
+
+    fig, ax = plt.subplots(figsize=(26, max(10, total_height * 0.52)), dpi=150)
+    setup_dark_axis(fig, ax)
+
+    for idx in range(len(sorted_events)):
+        ax.axvline(x=idx, color='#2c2c2c', linestyle=':', linewidth=0.9, zorder=1)
+
+    iteration_guides = [
+        (-ii, 'i-1 start', '#ba7a5f'),
+        (0, 'i start', '#3a889e'),
+        (ii, 'i+1 start', '#8aaa5e'),
+        (ii * 2, 'i+2 start', '#777777'),
+    ]
+    for t, label, color in iteration_guides:
+        if t not in time_to_coord:
+            continue
+        x = time_to_coord[t]
+        ax.axvline(x=x, color=color, linestyle='-', linewidth=1.6, alpha=0.9, zorder=2)
+        ax.text(x + 0.15, total_height - 0.2, label, color=color, ha='left', va='top', fontsize=9)
+
+    for item in sorted(lifetime_items, key=lambda x: (x['buffer'], x['iter_offset'], x['live_start'])):
+        y_pos = y_by_name[item['buffer']] + lifetime_iter_y_offset(item['iter_offset'])
+        colors = lifetime_iter_colors(item['iter_offset'])
+        cx_start = time_to_coord[item['live_start']]
+        cx_end = time_to_coord[item['live_end_exclusive']]
+        label = (
+            f"{lifetime_stage_label(item['iter_offset'])} "
+            f"{item['storage']} {item['footprint_bytes']}B "
+            f"{item['live_start']}..{item['live_end']}"
+        )
+        draw_lifetime_block(
+            ax,
+            cx_start,
+            cx_end,
+            y_pos,
+            colors,
+            label,
+            hatch=lifetime_storage_hatch(item['storage']),
+        )
+
+        for consumer in item.get('consumers', []):
+            consume_x = time_to_coord[consumer['consume_time']]
+            ax.vlines(
+                consume_x,
+                y_pos - LIFETIME_BOX_HEIGHT / 2,
+                y_pos + LIFETIME_BOX_HEIGHT / 2,
+                color='#f4d35e',
+                linewidth=1.5,
+                zorder=6,
+            )
+            ax.text(
+                consume_x,
+                y_pos + LIFETIME_BOX_HEIGHT / 2 + 0.05,
+                consumer['consumer'],
+                color='#f4d35e',
+                ha='center',
+                va='bottom',
+                fontsize=6,
+                zorder=7,
+            )
+
+    ax.set_yticks(y_ticks)
+    ax.set_yticklabels(y_labels, fontsize=8)
+
+    important_times = {0, ii, ii * 2, ii * 3, schedule_l, ii + schedule_l, ii * 2 + schedule_l}
+    xtick_positions = choose_xticks(sorted_events, important_times, max_xtick_labels=42, min_tick_gap=2)
+    ax.set_xticks(xtick_positions)
+    ax.set_xticklabels([str(sorted_events[idx]) for idx in xtick_positions], fontsize=8, rotation=0)
+    ax.tick_params(axis='x', pad=8, length=4)
+
+    bottom_y = -1.0
+    ax.spines['bottom'].set_position(('data', bottom_y))
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_visible(False)
+    ax.set_xlim(-0.5, len(sorted_events) - 0.5)
+    ax.set_ylim(bottom_y - 1.5, total_height - 0.2)
+
+    ax.annotate('', xy=(len(sorted_events) - 0.5, bottom_y), xytext=(-0.5, bottom_y), arrowprops=dict(arrowstyle="->", color='white', lw=1.5))
+    ax.text(len(sorted_events) - 0.5, bottom_y + 0.18, 'Lifetime timeline (Hardware Cycle)', color='white', ha='right', va='bottom', fontsize=10)
+
+    iter_offsets = sorted({item['iter_offset'] for item in lifetime_items})
+    iter_legend_patches = [
+        patches.Patch(
+            facecolor=lifetime_iter_colors(iter_offset)['face'],
+            edgecolor=lifetime_iter_colors(iter_offset)['edge'],
+            label=f"{lifetime_stage_label(iter_offset)} lifetime",
+        )
+        for iter_offset in iter_offsets
+    ]
+    iter_legend_patches.append(
+        patches.Patch(facecolor='#f4d35e', edgecolor='#f4d35e', label='consumer consume_time marker')
+    )
+    iter_legend = ax.legend(handles=iter_legend_patches, loc='upper right', facecolor='#1A1A1A', edgecolor='#444444', fontsize=10)
+    ax.add_artist(iter_legend)
+
+    storage_legend_patches = [
+        patches.Patch(
+            facecolor='#555555',
+            edgecolor='#f0f0f0',
+            hatch=lifetime_storage_hatch(storage),
+            label=f"{storage} storage",
+        )
+        for storage in sorted({item['storage'] for item in lifetime_items})
+    ]
+    ax.legend(
+        handles=storage_legend_patches,
+        loc='upper right',
+        bbox_to_anchor=(1.0, 0.84),
+        facecolor='#1A1A1A',
+        edgecolor='#444444',
+        fontsize=10,
+    )
+
+    plt.tight_layout()
+    plt.savefig(output_filename, dpi=300, facecolor=fig.get_facecolor(), edgecolor='none')
+    plt.close(fig)
+    print(f"按 buffer 聚合的变量 lifetime 甘特图已成功导出: {output_filename}")
+
+
 def main():
     plt.style.use('dark_background')
     op_wgid, active_wgids, wgid_ops = build_warpgroup_info(warp_assign)
@@ -515,6 +801,7 @@ def main():
 
     # 基础/naive 模调度方案：复用优化版 overlap 绘图格式，但不画 warp 分配 hatch。
     draw_overlap_schedule(M, I, L, 'naive_sched_plan.png')
+    draw_variable_lifetimes(variable_lifetimes, base_I, optimized_L, 'var_life.png')
 
 
 if __name__ == '__main__':

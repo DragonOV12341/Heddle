@@ -1,9 +1,9 @@
 /*!
  * \file finegrained_ws.cc
- * \brief FineGrainedWS for sm90+ async-copy pipelines.
+ * \brief 针对 sm90+ 异步拷贝流水线的 FineGrainedWS 优化。
  *
- * Works on the inline barrier IR emitted by lowering passes such as
- * LowerBulkCopy / LowerPTXAsyncCopy:
+ * 该文件处理由 LowerBulkCopy / LowerPTXAsyncCopy 等下沉阶段产生的
+ * 内联 barrier 风格的 TIR（inline barrier IR）：
  *   SeqStmt({
  *     AttrStmt("tl.tma_copy_write_buffer", buf, 1,
  *       IfThenElse(threadIdx.x == 0,
@@ -11,12 +11,12 @@
  *     mbarrier_wait_parity(mbar, parity)
  *   })
  *
- * The pass splits the pipelined loop into:
- *   producer: issues TMA / cp.async
- *   consumer: waits, computes, and releases buffers
+ * 本 pass 将流水线循环拆分為两部分：
+ *   - producer：负责发起 TMA / cp.async 拷贝
+ *   - consumer：负责等待拷贝、执行计算并释放共享缓冲
  *
- * For pure-TMA loops we rewrite the forward-barrier protocol so the producer
- * releases the barrier after issuing the TMA copy:
+ * 对于仅含 TMA 的循环，重写前向 barrier 协议，使 producer 在发出 TMA 后
+ * 立即释放 barrier，从而减少等待和提高并行度：
  *   expect_transaction -> tma_load -> arrive
  */
 
@@ -31,6 +31,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace tvm {
 namespace tl {
@@ -39,18 +40,18 @@ using namespace tir;
 using namespace runtime;
 
 // ---------------------------------------------------------------------------
-// Data structures
+// 数据结构定义
 // ---------------------------------------------------------------------------
 
 enum class AsyncProducerKind : uint8_t { kTma, kCpAsync };
 
 struct AsyncCopyBlockInfo {
   AsyncProducerKind kind;
-  Stmt producer_stmt;              // TMA issue or cp.async enqueue+commit
-  Optional<Stmt> wait_stmt;        // Existing forward wait for TMA blocks
-  Optional<Var> write_buffer_data; // shared buffer written by producer
-  int producer_stmt_index = -1;    // Index in the original flattened loop body.
-  int wait_stmt_index = -1;        // Index in the original flattened loop body.
+  Stmt producer_stmt;              // producer 语句：发起 TMA 或 cp.async 并提交
+  Optional<Stmt> wait_stmt;        // 可选的 forward wait（与 producer 配对的等待语句）
+  Optional<Var> write_buffer_data; // producer 写入的共享缓冲的 data 变量
+  int producer_stmt_index = -1;    // 在原始扁平化循环体中的索引（producer）
+  int wait_stmt_index = -1;        // 在原始扁平化循环体中的索引（wait）
 };
 
 using BufferDataToBufferMap =
@@ -66,23 +67,23 @@ static Stmt MakeSeqOrStmt(const Array<Stmt> &seq) {
 }
 
 // ---------------------------------------------------------------------------
-// Cross-stage consumer: per-buffer, per-compute-stmt stage offset
+// 跨阶段消费者配置：按缓冲区及每个 compute_stmt 的阶段偏移（stage offset）
 // ---------------------------------------------------------------------------
 
 struct ConsumerStageConfig {
   int compute_stmt_index;
-  int stage_offset;  // 0 = current iteration, -1 = previous, +1 = next
-  int buffer_index;  // index into extractor.blocks
+  int stage_offset;  // 阶段偏移：0=当前迭代，-1=上一阶段，+1=下一阶段
+  int buffer_index;  // 对应 extractor.blocks 的索引（指示该 compute_stmt 使用哪个缓冲区）
 };
 
 /*!
- * \brief Parse the consumer stage map from a simplified JSON-like string.
+ * \brief 从简化的类 JSON 字符串解析 consumer 阶段映射配置。
  *
- * Format: "buffer_name:pattern1=offset1,pattern2=offset2;buffer_name2:..."
- * Example: "V_shared:wgmma=-1" means any compute_stmt whose string repr
- * contains "wgmma" and reads V_shared gets stage_offset=-1.
+ * 字符串格式："buffer_name:pattern1=offset1,pattern2=offset2;buffer_name2:..."
+ * 示例："V_shared:wgmma=-1" 表示任意字符串表示中包含 "wgmma" 且读取
+ * V_shared 的 compute_stmt，其 stage_offset = -1（表示使用前一阶段的数据）。
  *
- * Returns a map: buffer_name -> [(pattern, offset), ...]
+ * 返回值：map，键为 buffer 名称，值为 (pattern, offset) 的列表。
  */
 static std::unordered_map<std::string,
                           std::vector<std::pair<std::string, int>>>
@@ -92,7 +93,7 @@ ParseConsumerStageMap(const std::string &config_str) {
   if (config_str.empty())
     return result;
 
-  // Parse "buf1:pat1=off1,pat2=off2;buf2:pat3=off3"
+  // 解析示例输入："buf1:pat1=off1,pat2=off2;buf2:pat3=off3"
   std::istringstream buf_stream(config_str);
   std::string buf_entry;
   while (std::getline(buf_stream, buf_entry, ';')) {
@@ -116,11 +117,13 @@ ParseConsumerStageMap(const std::string &config_str) {
 }
 
 /*!
- * \brief Parse barrier hints from config string.
+ * \brief 从配置字符串解析 barrier 提示信息（等待/到达位置）。
  *
- * Format: "buffer_name:wait=W,arrive=A;buffer_name2:wait=W2,arrive=A2"
+ * 字符串格式："buffer_name:wait=W,arrive=A;buffer_name2:wait=W2,arrive=A2"
+ * 返回 map：buffer_name -> (wait_pos, arrive_pos)。
  *
- * Returns a map: buffer_name -> (wait_pos, arrive_pos)
+ * 这些提示用于 finegrained 调度时指定某个缓冲区的 wait/arrive 索引，
+ * 以便在 joint pipeline 中放置 barrier 调用。
  */
 static std::unordered_map<std::string, std::pair<int, int>>
 ParseBarrierHints(const std::string &config_str) {
@@ -158,10 +161,10 @@ ParseBarrierHints(const std::string &config_str) {
 }
 
 /*!
- * \brief Parse per-compute-stmt stage offsets from config string.
+ * \brief 从配置字符串解析每个 compute_stmt 的阶段偏移（stage offset）。
  *
- * Format: "idx1=offset1,idx2=offset2"
- * Example: "3=-1" means compute_stmt[3] uses stage_offset=-1
+ * 格式："idx1=offset1,idx2=offset2"，例如 "3=-1" 表示第 3 个 compute_stmt
+ * 使用 stage_offset=-1（即访问前一阶段的数据）。
  */
 static std::unordered_map<int, int>
 ParseStageOffsets(const std::string &config_str) {
@@ -183,11 +186,10 @@ ParseStageOffsets(const std::string &config_str) {
 }
 
 /*!
- * \brief Parse per-op warp group assignments from config string.
+ * \brief 解析每个操作（compute_stmt）对应的 warp 分组分配配置。
  *
- * Format: "s0:0,s1:1,s2:0,s3:1"
- * Each entry maps a compute_stmt name (sN where N = compute_stmt index)
- * to a warp group ID. Used by Plan B per-op warp dispatch.
+ * 格式："s0:0,s1:1,s2:0,s3:1"，每项将 compute_stmt 名称（sN）映射到一个
+ * warp group ID。该配置用于 Plan B 的按操作 warp 分发策略。
  */
 static std::unordered_map<int, int>
 ParseWarpAssigns(const std::string &config_str) {
@@ -203,7 +205,7 @@ ParseWarpAssigns(const std::string &config_str) {
       continue;
     std::string name = entry.substr(0, colon_pos);
     int warp_id = std::stoi(entry.substr(colon_pos + 1));
-    // Extract compute_stmt index from "sN" format
+    // 从 "sN" 格式中提取 compute_stmt 的索引（例如 s10 -> 10）
     if (name.size() > 1 && name[0] == 's') {
       int ci = std::stoi(name.substr(1));
       result[ci] = warp_id;
@@ -257,16 +259,15 @@ struct LocalLiveSet {
 };
 
 // ---------------------------------------------------------------------------
-// PhaseCounter: mutable int32 counter for guarded-loop phase tracking
+// PhaseCounter：用于受保护循环（guarded-loop）阶段跟踪的可变 int32 计数器
 // ---------------------------------------------------------------------------
 
 /*!
- * \brief When a pipeline loop body is conditionally guarded (e.g.
- *        `if block_mask[k]: ...`), the loop-variable-based parity
- *        `(k / num_stages) % 2` can desynchronise because skipped iterations
- *        don't touch barriers.  A PhaseCounter is a local int32[1] buffer
- *        that tracks the *actual* number of guarded-body entries so that
- *        parity/stage are always correct.
+ * \brief 当流水线循环体被条件保护（例如 `if block_mask[k]: ...`）时，基于
+ * 循环变量的 parity 计算（如 `(k / num_stages) % 2`）可能与实际发生的
+ * barrier 不一致，因为被跳过的迭代不会触发 barrier。PhaseCounter 提供
+ * 一个本地 int32[1] 缓冲，用于跟踪真实进入受保护循环体的次数，从而保证
+ * parity/stage 的正确性。
  */
 struct PhaseCounter {
   Buffer buf;
@@ -310,15 +311,13 @@ struct PhaseCounter {
 };
 
 /*!
- * \brief Replace the loop-variable-based stage expression with a
- *        phase-counter-based one inside producer / consumer statements.
+ * \brief 在 producer/consumer 语句内部，将基于循环变量的 stage 表达式替换为
+ * 基于 phase-counter 的表达式。
  *
- *  FineGrainedWS may rebuild producer/consumer loops after `num_stages`
- *  has been changed by an upstream scheduler.  Barrier IDs use the current
- *  stage expression, but shared-memory buffer offsets can still embed an
- *  older stage expression such as `FloorMod(k, 2)` or lowered `k & 1`.
- *  This mutator rewrites direct loop-var stage expressions to the replacement
- *  expression so buffer staging stays in sync with barrier indexing.
+ * 由于上游 scheduler 可能改变了 `num_stages`，FineGrainedWS 在重建循环后
+ * 需要确保 barrier id 与共享内存缓冲区的分段（staging）表达式同步。该
+ * 变换器会识别常见的旧式表达（如 `FloorMod(k, 2)` 或 `k & 1`）并替换为
+ * 给定的替换表达式，避免缓冲偏移与 barrier 索引不一致的问题。
  */
 class StageExprReplacer : public StmtExprMutator {
 public:
@@ -336,6 +335,9 @@ private:
         num_stages_(num_stages), replacement_(std::move(replacement)) {}
 
   PrimExpr VisitExpr_(const FloorModNode *op) final {
+    // 识别常见的阶段取模模式，例如 FloorMod(k, N) 或类似表达，
+    // 当模数匹配期望的 num_stages（或是较小的历史值）且被取模的表达
+    // 与 loop_var 线性相关时，直接替换为 phase-counter 表达式。
     if (MatchStageMod(op->b) && MatchLinearIdx(op->a)) {
       return replacement_;
     }
@@ -343,6 +345,8 @@ private:
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
+    // 识别位运算降级的 parity 表达式，例如 (k & 1)。当存在 bitwise_and
+    // 且其中一侧为 loop_var 且另一侧为常数 1 时，把该表达式替换为 replacement_。
     if (op->op.same_as(builtin::bitwise_and()) && op->args.size() == 2) {
       if (MatchLinearIdx(op->args[0]) && is_const_int(op->args[1], 1)) {
         return replacement_;
@@ -358,8 +362,8 @@ private:
     if (is_const_int(expr, num_stages_))
       return true;
     if (const auto *imm = expr.as<IntImmNode>()) {
-      // Support loops originally authored with a smaller static ring buffer
-      // (commonly 2) and later promoted to a larger num_stages.
+      // 支持原先使用较小静态环形缓冲（通常为 2）的循环，
+      // 后续可能被提升为更大的 num_stages，此处做兼容处理。
       return imm->value > 1 && imm->value < num_stages_;
     }
     return false;
@@ -387,14 +391,12 @@ private:
 };
 
 /*!
- * \brief Replace stale loop-variable parity expressions after num_stages has
- *        been promoted by an upstream scheduler.
+ * \brief 当上游将 num_stages 提升后，替换过时的基于循环变量的 parity 表达式。
  *
- *  Older TIR may still contain parity for a 2-stage ring buffer, for example
- *  `FloorMod(FloorDiv(k, 2), 2)` or `FloorDiv(FloorMod(k, 4), 2)`, even after
- *  FineGrainedWS has rebuilt barrier ids as `k % 3 + base`.  This mutator
- *  rewrites only direct loop-var parity expressions, leaving unrelated lane or
- *  fragment arithmetic untouched.
+ * 旧的 TIR 可能仍然包含针对 2-stage 环形缓冲的 parity 表达式（例如
+ * `FloorMod(FloorDiv(k, 2), 2)` 或 `FloorDiv(FloorMod(k, 4), 2)`），即使
+ * FineGrainedWS 已将 barrier id 重建为 `k % 3 + base`。该变换器仅重写
+ * 直接与 loop_var 相关的 parity 表达式，保留与 lane/fragment 相关的算术不变。
  */
 class StageParityReplacer : public StmtExprMutator {
 public:
@@ -412,6 +414,9 @@ private:
         num_stages_(num_stages), replacement_(std::move(replacement)) {}
 
   PrimExpr VisitExpr_(const FloorModNode *op) final {
+    // 识别旧式 parity 表达式的形式，例如 FloorMod(FloorDiv(k, f), 2)，
+    // 当外层取模的基数为 2 且内层 FloorDiv 的因子匹配旧的 stage 大小
+    // 且被除数与 loop_var 线性相关时，替换为新的 parity 表达式。
     if (is_const_int(op->b, 2)) {
       if (const auto *div = op->a.as<FloorDivNode>()) {
         if (MatchOldStageFactor(div->b) && MatchLinearIdx(div->a)) {
@@ -423,6 +428,9 @@ private:
   }
 
   PrimExpr VisitExpr_(const FloorDivNode *op) final {
+    // 识别另一类旧式模式，例如 FloorDiv(FloorMod(k, p), q)，其中 p/q 与老的
+    // parity/period 相关，通过匹配旧的周期因子并确认被取模的对象与 loop_var
+    // 线性相关后进行替换。
     if (MatchOldStageFactor(op->b)) {
       if (const auto *mod = op->a.as<FloorModNode>()) {
         if (MatchOldParityPeriod(mod->b) && MatchLinearIdx(mod->a)) {
@@ -496,8 +504,8 @@ PromoteAsyncRingAllocBuffers(const Array<Buffer> &alloc_buffers,
 
     Array<PrimExpr> shape = buffer->shape;
     shape.Set(0, IntImm(shape[0].dtype(), num_stages));
-    // Keep the same Buffer object so layout_map keys and body references stay
-    // consistent with alloc_buffers.
+    // 保持相同的 Buffer 对象，以便 layout_map 的 key 和函数体中的引用
+    // 与 alloc_buffers 保持一致（只修改 shape 字段实现提升）。
     const_cast<BufferNode *>(buffer.get())->shape = shape;
     result.push_back(buffer);
   }
@@ -591,6 +599,8 @@ private:
   }
 
   void VisitExpr_(const CallNode *op) final {
+    // 处理 tl::access_ptr()（包装 buffer load/store 的访问包装器），
+    // 通过分析底层 base_load 与访问掩码，提取 read/write buffer 集合。
     if (op->op.same_as(tl::access_ptr())) {
       ICHECK_EQ(op->args.size(), 3);
       const auto *base_load = op->args[0].as<BufferLoadNode>();
@@ -611,6 +621,8 @@ private:
       return;
     }
 
+    // 处理 builtin::tvm_access_ptr()（低级访问指针表达式），通过第二个参数
+    // (Var) 将指针映射回对应的 Buffer，并据此更新读写集合。
     if (op->op.same_as(builtin::tvm_access_ptr())) {
       ICHECK_EQ(op->args.size(), 5);
       const auto *var = op->args[1].as<VarNode>();
@@ -646,6 +658,9 @@ private:
   VarSet bound_vars_;
 };
 
+// ProducerSimtCopyDetector：检测 producer 是否为 SIMT 式的拷贝模式
+//（即在非条件/非 async-copy 区域存在 global 读取并在 shared 写入），
+// 用于区分需要特殊处理的 producer（SIMT）与普通异步拷贝。
 class ProducerSimtCopyDetector : public StmtExprVisitor {
 public:
   static bool HasSimtCopy(const Stmt &stmt,
@@ -671,6 +686,9 @@ private:
   }
 
   void VisitExpr_(const BufferLoadNode *op) final {
+    // 只有当不在 if 条件内且不在 async_copy 区域时，才把 global load 记作
+    // producer 的 global 读取（避免将条件检查或 async-copy 内部的加载
+    // 误判为 producer global 读取）。
     if (!in_if_cond_ && !in_async_copy_ && IsGlobalBuffer(op->buffer)) {
       has_global_read_ = true;
     }
@@ -678,6 +696,8 @@ private:
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
+    // 同样地，只有在非条件、非 async-copy 区域对 shared buffer 的写入
+    // 才被视为 producer 的 shared 写动作。
     if (!in_if_cond_ && !in_async_copy_ && IsSharedBuffer(op->buffer)) {
       has_shared_write_ = true;
     }
@@ -726,6 +746,8 @@ private:
   }
 
   void MarkAccess(const Buffer &buffer, int rw_mask) {
+    // 根据 rw_mask 判断对 buffer 的读/写：低位表示 read，高位表示 write。
+    // 仅在非 if 条件、非 async-copy 且 buffer 合法时记录访问信息。
     if (in_if_cond_ || in_async_copy_ || !buffer.defined()) {
       return;
     }
@@ -752,7 +774,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Helpers (reused from warp_specialized_rewriter.cc patterns)
+// 辅助函数（复用自 warp_specialized_rewriter.cc 的常用模式）
 // ---------------------------------------------------------------------------
 
 static PrimExpr makeGetBarrier(PrimExpr barrier_id) {
@@ -795,19 +817,18 @@ static bool IsTrivialNoOpStmt(const Stmt &stmt) {
 }
 
 // ---------------------------------------------------------------------------
-// AsyncCopyBlockExtractor
+// 异步拷贝块提取器（AsyncCopyBlockExtractor）
 // ---------------------------------------------------------------------------
 
 /*!
- * \brief Extract async producer blocks from a flattened loop body.
+ * \brief 从扁平化的循环体中提取异步拷贝（async producer）块。
  *
- * Recognized patterns:
+ * 识别模式：
+ *  - 模式一：AttrStmt("tl.tma_copy_write_buffer", ...) + mbarrier_wait_parity
+ *  - 模式二：IfThenElse 包含 tma_load + mbarrier_wait_parity
+ *  - 模式三：一个或多个纯 cp_async 语句 + commit_group + wait_group(0)
  *
- *  Pattern 1: AttrStmt("tl.tma_copy_write_buffer", ...) + mbarrier_wait_parity
- *  Pattern 2: IfThenElse containing tma_load + mbarrier_wait_parity
- *  Pattern 3: one or more cp_async-only stmts + commit_group + wait_group(0)
- *
- * Everything else is classified as a compute statement.
+ * 除上述模式外的语句一律归为 compute_statements（计算语句）。
  */
 class AsyncCopyBlockExtractor {
 public:
@@ -817,14 +838,15 @@ public:
 
   void Extract(const Array<Stmt> &flat_stmts) {
     size_t i = 0;
+    // 遍历扁平化的语句序列，按识别到的模式将语句分类为 producer 或 compute。
     while (i < flat_stmts.size()) {
       if (i + 1 < flat_stmts.size() &&
           IsMbarrierWaitParity(flat_stmts[i + 1])) {
         Optional<Var> write_buffer_data =
             ExtractTmaCopyWriteBufferData(flat_stmts[i]);
-        // Check Pattern 1/2: TMA producer + wait pair, optionally wrapped in a
-        // simple guard/Block/Let/Attr shell. Recover the written shared buffer
-        // when the tl.tma_copy_write_buffer annotation survives under wrappers.
+        // 匹配模式 1/2：TMA producer + wait 配对，可能被简单的 guard/Block/Let/Attr
+        // 包装。若 tl.tma_copy_write_buffer 注解在这些包装内仍然存在，则恢复
+        // 写入的共享缓冲变量信息。
         if (write_buffer_data.defined() || ContainsTmaLoad(flat_stmts[i])) {
           blocks.push_back({AsyncProducerKind::kTma,
                             StripTmaCopyWriteBufferAttr(flat_stmts[i]),
@@ -1044,7 +1066,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// TMA Reduce-Add Detector (for three-role WS)
+// TMA Reduce-Add 模式检测器（用于三角色 WS：detect 三步 TMA reduce-add 模式）
 // ---------------------------------------------------------------------------
 
 /*!
@@ -1141,7 +1163,7 @@ DetectTmaReduceAdd(const std::vector<Stmt> &compute_stmts) {
   for (size_t i = 0; i < compute_stmts.size(); ++i) {
     Var smem_buf;
 
-    // Case 1: All three ops in one statement.
+    // 情况 1：三种操作（store, arrive, wait）都在同一语句中出现。
     if (ContainsTmaReduceStore(compute_stmts[i], &smem_buf) &&
         ContainsTmaStoreArrive(compute_stmts[i]) &&
         ContainsTmaStoreWait(compute_stmts[i])) {
@@ -1153,9 +1175,9 @@ DetectTmaReduceAdd(const std::vector<Stmt> &compute_stmts) {
       continue;
     }
 
-    // Case 2: Split across consecutive stmts.
-    // Look for tma_store(need_reduce=1) in stmt[i], then scan forward
-    // for tma_store_arrive and tma_store_wait within the next few stmts.
+    // 情况 2：操作分布在相邻语句中。
+    // 在 stmt[i] 中查找带 need_reduce=1 的 tma_store，然后向前扫描若干语句
+    // 以寻找对应的 tma_store_arrive 和 tma_store_wait。
     if (!ContainsTmaReduceStore(compute_stmts[i], &smem_buf))
       continue;
     if (!smem_buf.defined())
@@ -1169,19 +1191,18 @@ DetectTmaReduceAdd(const std::vector<Stmt> &compute_stmts) {
         wait_idx = static_cast<int>(j);
     }
     if (arrive_idx >= 0 && wait_idx >= 0) {
-      // Found the full pattern across stmts [i .. max(arrive_idx, wait_idx)].
-      // Record the range — all stmts from i to the last one are part of the
-      // TMA reduce-add and will be extracted to the dQ writer.
+      // 在语句区间 [i .. max(arrive_idx, wait_idx)] 找到了完整模式。
+      // 将该区间记录为一个整体 —— 这些语句属于 TMA reduce-add 模式，
+      // 稍后会被提取到 dQ writer（专门的写入逻辑）。
       TmaReduceAddInfo info;
       info.compute_stmt_index = static_cast<int>(i);
       info.full_stmt = compute_stmts[i]; // tma_store stmt
       info.smem_buffer_data = smem_buf;
-      // Mark the arrive/wait indices as additional stmts to extract.
-      // We store the tma_store index; the arrive/wait will be handled
-      // by recording all indices in the extraction set.
+      // 将 arrive/wait 的索引作为额外需要提取的语句记录。
+      // 我们以 tma_store 的索引为主，并通过提取集合记录其对应的 arrive/wait。
       results.push_back(info);
-      // Also record arrive and wait as separate entries for the extraction set.
-      // Use the same smem_buffer_data since they're part of the same pattern.
+      // 还要把 arrive 和 wait 单独加入提取集合。
+      // 它们使用相同的 smem_buffer_data，因为它们属于同一个模式。
       {
         TmaReduceAddInfo arrive_info;
         arrive_info.compute_stmt_index = arrive_idx;
@@ -1196,7 +1217,7 @@ DetectTmaReduceAdd(const std::vector<Stmt> &compute_stmts) {
         wait_info.smem_buffer_data = smem_buf;
         results.push_back(wait_info);
       }
-      // Skip past the pattern to avoid double-detection.
+      // 跳过整个模式区间以避免重复检测。
       i = static_cast<size_t>(std::max(arrive_idx, wait_idx));
     }
   }
@@ -1204,7 +1225,8 @@ DetectTmaReduceAdd(const std::vector<Stmt> &compute_stmts) {
 }
 
 // ---------------------------------------------------------------------------
-// ThreadIdxRewriter (from warp_specialized_rewriter.cc)
+// threadIdx.x 重写器（ThreadIdxRewriter），复用自 warp_specialized_rewriter.cc
+// 负责在按 warp/线程分派时调整 threadIdx 绑定
 // ---------------------------------------------------------------------------
 
 /*!
@@ -1272,7 +1294,7 @@ private:
       replace_count_++;
       return replaced_;
     }
-    // Also try name-based matching as fallback for dual-consumer
+    // 同时尝试基于名字的匹配作为 dual-consumer 的回退方案
     if (var->name_hint == thread_var_->name_hint &&
         var != thread_var_.get()) {
       name_match_count_++;
@@ -1314,10 +1336,9 @@ private:
         op->op.same_as(mbarrier_expect_tx())) {
       has_tma_op_ = true;
     }
-    // Rewrite NamedBarrier<N> in extern call strings when
-    // rewrite_barrier_count_ is set. This handles AllReduce calls
-    // that use NamedBarrier<consumer_extent> which needs to become
-    // NamedBarrier<wg_extent> for dual-consumer mode.
+    // 当设置 rewrite_barrier_count_ 时，重写 extern 调用字符串中的 NamedBarrier<N>。
+    // 这用于处理那些使用 NamedBarrier<consumer_extent> 的 AllReduce 调用，
+    // 在 dual-consumer 模式下需要将其转换为 NamedBarrier<wg_extent>。
     if (rewrite_barrier_from_ > 0 &&
         op->op.same_as(builtin::call_extern())) {
       if (op->args.size() >= 1) {
@@ -1327,7 +1348,7 @@ private:
               "NamedBarrier<" + std::to_string(rewrite_barrier_from_) + ">";
           std::string new_barrier;
           if (barrier_id_offset_ > 0) {
-            // Use NamedBarrier<count, offset> to shift bar.sync IDs
+            // 使用 NamedBarrier<count, offset> 来偏移 bar.sync ID（用于重映射 barrier 编号）
             new_barrier = "NamedBarrier<" +
                           std::to_string(rewrite_barrier_to_) + ", " +
                           std::to_string(barrier_id_offset_) + ">";
@@ -1365,7 +1386,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// MbarrierInitRemover: removes all create_list_of_mbarrier calls from a stmt
+// MbarrierInitRemover：从语句中移除所有 create_list_of_mbarrier 调用
 // ---------------------------------------------------------------------------
 
 /*!
@@ -1388,7 +1409,7 @@ private:
     for (const auto &s : op->seq) {
       if (IsCreateListOfMbarrier(s)) {
         changed = true;
-        continue; // drop this statement
+        continue; // 跳过该语句（移除该语句）
       }
       Stmt visited = VisitStmt(s);
       new_seq.push_back(visited);
@@ -1404,15 +1425,15 @@ private:
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
     if (IsCreateListOfMbarrier(GetRef<Stmt>(op))) {
-      // Return a no-op (should be caught by SeqStmt visitor above,
-      // but handle standalone case too)
+      // 返回一个空操作（通常由上层 SeqStmt visitor 捕获，但这里也处理
+      // 独立的单条语句情况以保证健壮性）
       return Evaluate(0);
     }
     return GetRef<Stmt>(op);
   }
 
-  // Stop recursion at BlockRealize — the new init is inside the block
-  // and we don't want to remove it.
+  // 在遇到 BlockRealize 时停止递归 —— 新的初始化已放在 block 内，
+  // 我们不应将其移除。
   Stmt VisitStmt_(const BlockRealizeNode *op) final { return GetRef<Stmt>(op); }
 
   static bool IsCreateListOfMbarrier(const Stmt &stmt) {
@@ -1426,7 +1447,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// FineGrainedWSRewriter — main pass
+// FineGrainedWSRewriter — 主流程（核心 pass）
 // ---------------------------------------------------------------------------
 
 class FineGrainedWSRewriter : public StmtExprMutator {
@@ -1439,7 +1460,7 @@ public:
       const std::string &barrier_hints_str = "",
       const std::string &stage_offsets_str = "",
       const std::string &warp_assigns_str = "") {
-    // Check thread tags
+    // 检查线程标签（thread tags）
     if (!ThreadTagChecker::HasOnlyThreadIdxX(f)) {
       LOG(WARNING) << "FineGrainedWS: disabled because program uses "
                       "thread tags other than threadIdx.x";
@@ -1457,15 +1478,15 @@ public:
     T.warp_assigns_map_ = ParseWarpAssigns(warp_assigns_str);
     f.CopyOnWrite()->body = T(f->body);
 
-    // TODO(lei): This should be refactored
-    // If WS was applied, remove any create_list_of_mbarrier calls that
-    // remain OUTSIDE the block (e.g. at function body level from
-    // lower_tile_op). The new init is already inside the block.
+    // TODO(lei): 需要重构（待改进）
+    // 如果已经应用了 WS（warp-specialized / producer-consumer WS），则移除
+    // 任何仍位于 block 外部的 create_list_of_mbarrier 调用（例如在函数体级别
+    // 从 lower_tile_op 产生的）。新的初始化已经放在 block 内部，无需外部 init。
     if (T.ws_transformed_) {
       f.CopyOnWrite()->body = MbarrierInitRemover::Remove(f->body);
     }
 
-    // Mark dual-consumer mode in function attrs for codegen
+    // 在函数属性中标记 dual-consumer 模式，供后续 codegen 使用
     if (T.dual_consumer_enabled_ && T.ws_transformed_) {
       f = WithAttr(f, "tl_finegrainedws_dual_consumer", Integer(1));
     }
@@ -1474,7 +1495,7 @@ public:
   }
 
 private:
-  // Locate the threadIdx.x binding
+  // 定位 threadIdx.x 的绑定
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == tir::attr::thread_extent &&
         Downcast<IterVar>(op->node)->thread_tag == "threadIdx.x") {
@@ -1488,8 +1509,7 @@ private:
         attr_stmt.CopyOnWrite()->node = thread_iv_;
         attr_stmt.CopyOnWrite()->value = num_threads;
       }
-      // clean up if we may have multiple threadIdx.x that
-      // need to be transformed
+      // 如果可能存在多个 threadIdx.x 需要被变换，则在此处做清理
       num_threads_ = old_num_threads;
       thread_iv_ = {};
       return attr_stmt;
@@ -1503,7 +1523,7 @@ private:
 
     const Block &orig_block = op->block;
 
-    // Find the explicitly pipelined loop for producer/consumer WS.
+    // 查找用于 producer/consumer WS 的显式流水线循环。
     const ForNode *pipeline_loop = FindAnnotatedPipelineLoop(orig_block->body);
     if (!pipeline_loop)
       return StmtExprMutator::VisitStmt_(op);
@@ -1514,8 +1534,8 @@ private:
         static_cast<int>(Downcast<Integer>(num_stages_anno.value())->value);
     ICHECK_GE(num_stages, 1);
 
-    // Read barrier hints and stage offsets from pipeline loop annotations.
-    // These are set by Heddle Phase B and take precedence over pass config.
+    // 从流水线循环的注解中读取 barrier 提示和阶段偏移（stage offsets）。
+    // 这些注解由 Heddle 的 Phase B 设置，会覆盖本 pass 的配置。
     {
       auto hints_anno =
           pipeline_loop->annotations.Get("tl_finegrainedws_barrier_hints");
@@ -1537,9 +1557,9 @@ private:
       }
     }
 
-    // Auto-detect dual-consumer from loop annotation (set by Heddle).
-    // This overrides the pass config when the annotation is present.
-    int heddle_split_idx = -1;  // -1 = use heuristic, >=0 = use Heddle's choice
+    // 从循环注解中自动检测 dual-consumer（由 Heddle 设置）。
+    // 若注解存在，则覆盖 pass 配置。
+    int heddle_split_idx = -1;  // -1 = 使用启发式；>=0 = 使用 Heddle 指定的拆分点
     {
       auto dc_anno =
           pipeline_loop->annotations.Get("tl_finegrainedws_dual_consumer");
@@ -1561,8 +1581,8 @@ private:
       }
     }
 
-    // Auto-detect three-role from loop annotation (set by Heddle).
-    // Overrides the pass config when annotation present.
+    // 从循环注解中自动检测 three-role 模式（由 Heddle 设置）。
+    // 若注解存在，则覆盖 pass 配置。
     {
       auto tr_anno =
           pipeline_loop->annotations.Get("tl_finegrainedws_three_role");
@@ -1576,8 +1596,8 @@ private:
       }
     }
 
-    // Read per-op warp assignments from loop annotation (Plan B).
-    // Format: "s0:0,s1:1,s2:0,s3:1"
+    // 从循环注解读取按操作的 warp 分配（Plan B）。
+    // 格式示例："s0:0,s1:1,s2:0,s3:1"
     {
       auto wa_anno =
           pipeline_loop->annotations.Get("tl_finegrainedws_warp_assigns");
@@ -1590,7 +1610,7 @@ private:
                     << " per-op warp assignments from annotation";
         }
       }
-      // Also check pcws variant
+      // 同时检查 pcws 变体（producer-consumer warp-specialized 变体）
       if (warp_assigns_map_.empty()) {
         auto wa_anno2 =
             pipeline_loop->annotations.Get("tl_pcws_warp_assigns");
@@ -1606,7 +1626,7 @@ private:
       }
     }
 
-    // Flatten the loop body
+    // 将循环体展开为扁平语句列表（便于按语句级别分析/提取 producer/consumer）
     Array<Stmt> flat_stmts;
     Stmt loop_body_root = pipeline_loop->body;
     if (auto *realize = pipeline_loop->body.as<BlockRealizeNode>()) {
@@ -1625,12 +1645,12 @@ private:
       }
       return body;
     };
-    // Extract async producer blocks (TMA and cp.async)
+    // 提取异步 producer 块（包括 TMA 与 cp.async）
     AsyncCopyBlockExtractor extractor;
     extractor.Extract(flat_stmts);
 
     if (extractor.blocks.empty()) {
-      // No TMA loads found — fall through to standard pipeline
+      // 未发现 TMA load：回退为标准流水线处理路径
       return StmtExprMutator::VisitStmt_(op);
     }
 
@@ -1641,9 +1661,9 @@ private:
       }
     }
 
-    // NOTE: tl_pipeline_order/stage with -1 values are user-provided
-    // producer markers from T.Pipelined(order=..., stage=..., group=...).
-    // FineGrainedWS should process these, not skip them.
+    // 注意：tl_pipeline_order/stage 中为 -1 的值表示这些 producer 标记来自用户注解
+    //（T.Pipelined(order=..., stage=..., group=...)）。FineGrainedWS 应当处理这些标记，
+    // 而不是跳过它们。
 
     VarBindingMap saved_loop_guard_bindings = current_loop_guard_bindings_;
     for (const auto &[var, value] : loop_body_lets) {
@@ -1654,7 +1674,7 @@ private:
         BufferDataToBufferCollector::Collect(GetRef<Stmt>(op));
 
     // ---------------------------------------------------------------
-    // Build producer and consumer loop bodies
+    // 构建 producer 与 consumer 的循环体
     // ---------------------------------------------------------------
     PrimExpr consumer_thread_extent = thread_iv_->dom->extent;
     PrimExpr producer_thread_extent =
@@ -2232,6 +2252,19 @@ private:
         needs_phase_counter ? consumer_phase_counter->ParityExpr(num_stages)
                             : base_parity_expr;
 
+    bool track_warp_groups = !warp_assigns_map_.empty();
+    std::vector<int> producer_block_warp_group(extractor.blocks.size(), -1);
+    if (track_warp_groups && !needs_phase_counter) {
+      for (size_t ti = 0; ti < extractor.blocks.size(); ++ti) {
+        auto it = warp_assigns_map_.find(extractor.blocks[ti].producer_stmt_index);
+        if (it != warp_assigns_map_.end()) {
+          producer_block_warp_group[ti] = it->second;
+        }
+      }
+    }
+
+    std::vector<std::pair<int, Stmt>> routed_producer_stmts;
+
     // --- Build Producer Body ---
     Array<Stmt> producer_body_stmts;
     for (size_t ti = 0; ti < extractor.blocks.size(); ti++) {
@@ -2243,15 +2276,26 @@ private:
                               block_group[ti] != block_group[ti + 1];
       PrimExpr bp_id =
           IntImm(DataType::Int(32), bp_bases[ti]) + producer_stage_expr;
+      int producer_wg = producer_block_warp_group[ti];
+      bool route_to_consumer_wg = producer_wg >= 0;
 
       // Back-pressure wait: producer cannot reuse the stage buffer until the
       // consumer releases it. xor(parity, 1) bootstraps the first iteration.
       if (is_first_in_group) {
-        producer_body_stmts.push_back(WrapStmtWithGuardSource(
+        Stmt bp_wait = WrapStmtWithGuardSource(
             protocol_guard_sources[ti], protocol_guards[ti],
-            makeParityWait(bp_id, bitwise_xor(producer_parity_expr, 1))));
+            makeParityWait(bp_id, bitwise_xor(producer_parity_expr, 1)));
+        if (route_to_consumer_wg) {
+          routed_producer_stmts.push_back({producer_wg, bp_wait});
+        } else {
+          producer_body_stmts.push_back(bp_wait);
+        }
         for (const auto &stmt : producer_loop_prefix_stmts[ti]) {
-          producer_body_stmts.push_back(stmt);
+          if (route_to_consumer_wg) {
+            routed_producer_stmts.push_back({producer_wg, stmt});
+          } else {
+            producer_body_stmts.push_back(stmt);
+          }
         }
       }
 
@@ -2280,14 +2324,23 @@ private:
       }
 
       // Execute the producer statement.
-      producer_body_stmts.push_back(producer_stmt);
+      if (route_to_consumer_wg) {
+        routed_producer_stmts.push_back({producer_wg, producer_stmt});
+      } else {
+        producer_body_stmts.push_back(producer_stmt);
+      }
       if (is_last_in_group && group_has_cp_async[group]) {
         ICHECK_GE(fwd_bases[ti], 0);
         PrimExpr fwd_id =
             IntImm(DataType::Int(32), fwd_bases[ti]) + producer_stage_expr;
-        producer_body_stmts.push_back(WrapStmtWithGuardSource(
+        Stmt cp_arrive = WrapStmtWithGuardSource(
             producer_issue_guard_sources[ti], producer_issue_guards[ti],
-            makeCpAsyncBarrierNoInc(fwd_id)));
+            makeCpAsyncBarrierNoInc(fwd_id));
+        if (route_to_consumer_wg) {
+          routed_producer_stmts.push_back({producer_wg, cp_arrive});
+        } else {
+          producer_body_stmts.push_back(cp_arrive);
+        }
       }
       // Phase counter increment – exactly once per guarded iteration,
       // after ALL groups have issued their barrier ops.
@@ -2298,7 +2351,9 @@ private:
             producer_phase_counter->Increment()));
       }
     }
-    ICHECK(!producer_body_stmts.empty());
+    if (producer_body_stmts.empty()) {
+      producer_body_stmts.push_back(Evaluate(0));
+    }
     Stmt producer_loop_body =
         MergeAdjacentEquivalentIfs(MakeSeqOrStmt(producer_body_stmts));
     producer_loop_body = rewrap_loop_body_lets(producer_loop_body);
@@ -2369,7 +2424,6 @@ private:
     // -1 = common (goes to all warp groups), >=0 = assigned warp group.
     // Populated only when warp_assigns_map_ is non-empty.
     std::vector<int> consumer_stmt_warp_group;
-    bool track_warp_groups = !warp_assigns_map_.empty();
     if (track_warp_groups &&
         warp_assigns_map_.size() < extractor.compute_stmts.size()) {
       LOG(WARNING) << "FineGrainedWS per-op dispatch requires warp assigns "
@@ -2395,6 +2449,113 @@ private:
       auto it = warp_assigns_map_.find(original_stmt_index);
       return (it != warp_assigns_map_.end()) ? it->second : -1;
     };
+    auto push_consumer_stmt_to_wgs = [&](Stmt stmt,
+                                        const std::vector<int> &wgs) {
+      if (!track_warp_groups || wgs.empty()) {
+        push_consumer_stmt(stmt, -1);
+        return;
+      }
+      for (int wg : wgs) {
+        push_consumer_stmt(stmt, wg);
+      }
+    };
+
+    // A forward wait must execute in the warp group(s) that actually read the
+    // producer-written shared buffer.  Using the insertion-position compute
+    // stmt's WG is incorrect when Heddle places the wait before a different
+    // stmt, e.g. Vs wait before s15 while PV/s16 reads Vs in another WG.
+    std::vector<std::vector<int>> wait_reader_wgs(extractor.blocks.size());
+    if (track_warp_groups) {
+      for (size_t ti = 0; ti < extractor.blocks.size(); ++ti) {
+        if (!extractor.blocks[ti].write_buffer_data.defined()) continue;
+        const Var &target = extractor.blocks[ti].write_buffer_data.value();
+        std::vector<int> wgs;
+        for (size_t ci = 0; ci < extractor.compute_stmts.size(); ++ci) {
+          BufferDataAccessInfo access = AnalyzeBufferDataAccess(
+              extractor.compute_stmts[ci], target, buffer_data_to_buffer);
+          if (!access.read) continue;
+          int wg = warp_group_for_ci(static_cast<int>(ci));
+          if (wg < 0) {
+            wgs.clear();
+            wgs.push_back(-1);
+            break;
+          }
+          if (std::find(wgs.begin(), wgs.end(), wg) == wgs.end()) {
+            wgs.push_back(wg);
+          }
+        }
+        if (wgs.empty()) {
+          wgs.push_back(warp_group_for_ci(wait_insert_pos[ti]));
+        }
+        std::sort(wgs.begin(), wgs.end());
+        wgs.erase(std::unique(wgs.begin(), wgs.end()), wgs.end());
+        wait_reader_wgs[ti] = std::move(wgs);
+      }
+    }
+
+    auto single_tma_writer_wg_for_stmt = [&](const Stmt &stmt) -> int {
+      if (!track_warp_groups || !ContainsTmaLoadStmt(stmt)) {
+        return -1;
+      }
+      // A TMA writer updates shared memory and signals an mbarrier; it should
+      // be issued once even when the writer stmt lacks an explicit assignment.
+      return 0;
+    };
+    auto close_local_deps_into_single_wg = [&]() {
+      if (!track_warp_groups) return;
+      std::unordered_map<Buffer, int, ObjectPtrHash, ObjectPtrEqual>
+          last_buffer_writer_wg;
+      std::unordered_map<Var, int, ObjectPtrHash, ObjectPtrEqual>
+          last_var_writer_wg;
+
+      for (size_t si = 0; si < consumer_body_stmts.size(); ++si) {
+        LocalAccessSummary access =
+            LocalAccessCollector::Collect(consumer_body_stmts[si],
+                                          buffer_data_to_buffer);
+        int required_wg = -1;
+        auto require_wg = [&](int wg) {
+          if (wg < 0) return;
+          if (required_wg < 0) {
+            required_wg = wg;
+          }
+        };
+        for (const Buffer &buf : access.read_buffers) {
+          auto it = last_buffer_writer_wg.find(buf);
+          if (it != last_buffer_writer_wg.end()) {
+            require_wg(it->second);
+          }
+        }
+        for (const Var &var : access.read_vars) {
+          auto it = last_var_writer_wg.find(var);
+          if (it != last_var_writer_wg.end()) {
+            require_wg(it->second);
+          }
+        }
+        if (required_wg >= 0) {
+          int old_wg = consumer_stmt_warp_group[si];
+          if (old_wg >= 0 && old_wg != required_wg) {
+            LOG(INFO) << "FineGrainedWS per-op dispatch: moving stmt " << si
+                      << " from WG" << old_wg << " to WG" << required_wg
+                      << " to keep local-register dependencies in one WG";
+          }
+          consumer_stmt_warp_group[si] = required_wg;
+        }
+
+        int writer_wg = consumer_stmt_warp_group[si];
+        if (writer_wg >= 0) {
+          for (const Buffer &buf : access.write_buffers) {
+            last_buffer_writer_wg[buf] = writer_wg;
+          }
+          for (const Var &var : access.def_vars) {
+            last_var_writer_wg[var] = writer_wg;
+          }
+        }
+      }
+    };
+
+    for (const auto &entry : routed_producer_stmts) {
+      push_consumer_stmt(entry.second, entry.first);
+    }
 
     // Helper: compute effective stage/parity for a given block, considering
     // the stage_offset of the compute_stmt at its wait position.
@@ -2507,7 +2668,20 @@ private:
                 wait_stmt,
                 dummy_wait);
           }
-          push_consumer_stmt(wait_stmt, warp_group_for_ci(static_cast<int>(ci)));
+          std::vector<int> wait_wgs;
+          for (size_t tj = ti; tj < extractor.blocks.size(); ++tj) {
+            if (block_group[tj] != block_group[ti]) break;
+            for (int wg : wait_reader_wgs[tj]) {
+              if (std::find(wait_wgs.begin(), wait_wgs.end(), wg) ==
+                  wait_wgs.end()) {
+                wait_wgs.push_back(wg);
+              }
+            }
+          }
+          std::sort(wait_wgs.begin(), wait_wgs.end());
+          wait_wgs.erase(std::unique(wait_wgs.begin(), wait_wgs.end()),
+                         wait_wgs.end());
+          push_consumer_stmt_to_wgs(wait_stmt, wait_wgs);
         }
       }
       // Three-role: insert named_barrier_wait(dQ_empty) before first dQ write.
@@ -2531,6 +2705,7 @@ private:
         // Skip — this stmt is moved to the dQ writer.
       } else if (!moved_compute_stmts[ci]) {
         Stmt compute_stmt = extractor.compute_stmts[ci];
+        int compute_wg = warp_group_for_ci(static_cast<int>(ci));
         int offset = has_cross_stage ? compute_stmt_stage_offsets[ci] : 0;
         if (offset != 0) {
           // Cross-stage: rewrite shared-memory buffer stage expressions.
@@ -2553,7 +2728,10 @@ private:
                  IntImm(DataType::Int(32), std::abs(offset))),
               compute_stmt);
         }
-        push_consumer_stmt(compute_stmt, warp_group_for_ci(static_cast<int>(ci)));
+        if (compute_wg < 0) {
+          compute_wg = single_tma_writer_wg_for_stmt(compute_stmt);
+        }
+        push_consumer_stmt(compute_stmt, compute_wg);
       }
       for (size_t ti = 0; ti < extractor.blocks.size(); ++ti) {
         bool is_last_in_group = ti + 1 == extractor.blocks.size() ||
@@ -2650,6 +2828,7 @@ private:
           uniform_phase_guard_source, uniform_phase_guard,
           consumer_phase_counter->Increment()), -1);
     }
+    close_local_deps_into_single_wg();
     // --- Async PV: relax the last warpgroup_wait depth ---
     // When Heddle signals tl_finegrainedws_async_pv=1, change the LAST
     // warpgroup_wait(0) to warpgroup_wait(1). This allows the final PV

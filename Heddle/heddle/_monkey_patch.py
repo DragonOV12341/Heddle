@@ -201,17 +201,27 @@ def _patch_transform_init() -> None:
 
     if not hasattr(transform_mod, 'HeddleConsumerSchedule'):
         transform_mod.HeddleConsumerSchedule = HeddleConsumerSchedule
-
+    
+    # 将 SMT 分析放到MVB前面进行。排除 用户的 numstage对 IR结构的影响
     if not hasattr(transform_mod, "_heddle_original_pcws"):
-        transform_mod._heddle_original_pcws = transform_mod.ProducerConsumerWarpSpecialized
-
-        def _heddle_pcws_wrapper():
+        transform_mod._old_mvb = transform_mod.MultiVersionBuffer
+        def _mvb_wrapper():
             return tvm.transform.Sequential([
                 HeddleConsumerSchedule(),
-                transform_mod._heddle_original_pcws(),
+                transform_mod._old_mvb(),
             ])
 
-        transform_mod.ProducerConsumerWarpSpecialized = _heddle_pcws_wrapper
+        transform_mod.MultiVersionBuffer = _mvb_wrapper
+    # if not hasattr(transform_mod, "_heddle_original_pcws"):
+    #     transform_mod._heddle_original_pcws = transform_mod.ProducerConsumerWarpSpecialized
+
+    #     def _heddle_pcws_wrapper():
+    #         return tvm.transform.Sequential([
+    #             HeddleConsumerSchedule(),
+    #             transform_mod._heddle_original_pcws(),
+    #         ])
+
+    #     transform_mod.ProducerConsumerWarpSpecialized = _heddle_pcws_wrapper
 
 
 def apply_all_patches() -> None:

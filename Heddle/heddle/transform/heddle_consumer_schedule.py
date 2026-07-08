@@ -58,7 +58,6 @@ from heddle.transform.auto_tl_pipeline_smt import (
     _detect_op_issue_cycles,
     _detect_wgmma_issue_cycles,
     _estimate_buffer_footprint_bytes,
-    _extract_num_threads,
     _buf_scope_str,
     _is_shared,
     _StmtInfo,
@@ -450,7 +449,7 @@ def _build_consumer_dep_graph(
     return consumer_indices, deps, all_indices, deps_all
 
 
-def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtInfo'], op_indices: List[int]) -> List[Dict]:
+def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtInfo'], op_indices: List[int], start_ii : int = 1) -> List[Dict]:
     from ortools.sat.python import cp_model
     from heddle.scheduler.smt import ResourceType
     print('enter _solve_naive_modulo_sched', flush=True)
@@ -664,47 +663,67 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         result["modular_rrt"] = table
         return result
 
+    plan_cache: Dict[int, Optional[Dict]] = {}
+
+    def cached_solve_for_I(I: int):
+        if I not in plan_cache:
+            plan_cache[I] = solve_for_I(I)
+        return plan_cache[I]
+
     def solve_min_I(max_I: int = 6) -> List:
         rets = []
         print(f'{estimated_total_latency=}') 
-        lb = 1
-        ub = estimated_total_latency
+        ub = max(1, max_I)
+        lb = max(start_ii, 1)
         ans_ub = None
         ans_lb = None
         last_lb = lb
+        checked_I = []
+        
         while True :
-            print(f"\r[Modulo Sched] Testing Initiation Interval: {lb=},{ub=} ...", end="", flush=True)
-
+            print(f"\r[Modulo Sched] 二分法缩小搜索区间: {lb=},{ub=} ...", end="", flush=True)
+            # 区间过短时，直接遍历
+            if ub-lb <= 5 :
+                break
             if ans_ub is None:
-                ans_ub = solve_for_I(ub)
+                ans_ub = cached_solve_for_I(ub)
             if ans_lb is None: 
-                ans_lb = solve_for_I(lb)
+                ans_lb = cached_solve_for_I(lb)
             assert ans_ub is not None 
+
             if ans_lb is None :
-                if ub-lb <= 10 :
-                    break
+                # lb 无解。移动lb到 [lb,ub] 中点
                 if lb > last_lb :
                     last_lb = lb
                 lb = (ub + lb) // 2
             else:
+                # lb 有解。将lb作为新的ub， lb 从 last_lb开始，区间变为 [last_lb, lb]
                 ub = lb
                 lb = last_lb
                 ans_ub = ans_lb
                 ans_lb = None
-
-        
+        stages = 0
+        min_ii_plan = None
         for i in range(lb,ub+1) :
-            print(f"\r[Modulo Sched] Testing Initiation Interval: I = {i}/{max_I} ...", end="", flush=True)
-            ans = solve_for_I(i)
+            print(f"\r[Modulo Sched] Trying : I = {i} ...", end="", flush=True)
+            ans = cached_solve_for_I(i)
             if ans is not None :
+                stages = (ans['L'] + ans['I'] - 1) // ans['I']
+                ans["num_stages"] = stages
+                min_ii_plan = ans
                 rets.append(ans);break
-                    
-        # for I in range(1, max_I + 1):
-        #     print(f"\r[Modulo Sched] Testing Initiation Interval: I = {I}/{max_I} ...", end="", flush=True)
-        #     ans = solve_for_I(I)
-        #     if ans is not None and ans["I"] < ans["L"]:
-        #         rets.append(ans)
-        #         break
+
+        print(f"--- naive mod sched : 最大stage = {stages}")
+        if start_ii <= 1 :
+            # --------- 补充其他 I ： estimated_total_latency 取 不同分位
+            for delta in [0.6, 0.7, 0.8 ,0.9] :
+                ii = delta * estimated_total_latency
+                ans = cached_solve_for_I(int(ii))
+                if ans is not None:
+                    stages = (ans['L'] + ans['I'] - 1) // ans['I']
+                    ans["num_stages"] = stages
+                    rets.append(ans)
+        rets.sort(key=lambda ans : ans['I'])
         return rets
 
     results = None
@@ -1058,7 +1077,9 @@ def _solve_smt_joint_optimize(
     ops = list(all_indices)
     if not ops:
         return None
-
+    
+    expect_consumer_warps = int(mod_sched_plan.get('heddle_expect_consumer_warps', 4))
+    print(f"heddle expected consumer_warps = {expect_consumer_warps}")
     base_M = dict(mod_sched_plan.get("M", {}))
     try:
         base_I = int(mod_sched_plan.get("I", 0))
@@ -1070,7 +1091,9 @@ def _solve_smt_joint_optimize(
         base_L = 0
     if base_I <= 0:
         return dict(mod_sched_plan)
-
+    
+    expect_num_stage = (base_L + base_I - 1) // base_I  # ceil(L/I) 预计stages
+    print(f'{expect_num_stage=}')
     _rtype_map = {
         "TMA": ResourceType.TMA,
         "TC": ResourceType.TensorCore,
@@ -1130,7 +1153,230 @@ def _solve_smt_joint_optimize(
             return [{ResourceType.TensorCore: 1} for _ in range(issue_cycles)]
         issue_cycles = _detect_op_issue_cycles(info.stmt)
         return [{rty: 1} for _ in range(max(int(issue_cycles), 1))]
+    
+    def _is_multiversioned_smem_buffer(buf: tvm.tir.Buffer) -> bool:
+        scope = _buf_scope_str(buf)
+        return _is_shared(buf) or scope == "shared.barrier"
 
+    @dataclass
+    class _JointBufferValue:
+        name: str
+        storage: StorageKind
+        base_footprint_bytes: int
+        version_factor: int = 1
+        is_barrier: bool = False
+
+        @property
+        def footprint_bytes(self) -> int:
+            return max(0, int(self.base_footprint_bytes)) * max(1, int(self.version_factor))
+
+    @dataclass
+    class _JointBufferAccess:
+        op_idx: int
+        buffer_name: str
+        is_write: bool
+        is_producer: bool
+        time: int
+
+    def _storage_for_buffer(buf: tvm.tir.Buffer) -> StorageKind:
+        return StorageKind.SMEM if _is_multiversioned_smem_buffer(buf) else StorageKind.RMEM
+
+    def _collect_buffer_registry() -> Tuple[
+        Dict[str, _JointBufferValue],
+        Dict[int, List[str]],
+        Dict[int, List[str]],
+        List[_JointBufferAccess],
+    ]:
+        buffers: Dict[str, _JointBufferValue] = {}
+        op_reads: Dict[int, List[str]] = {idx: [] for idx in ops}
+        op_writes: Dict[int, List[str]] = {idx: [] for idx in ops}
+        accesses: List[_JointBufferAccess] = []
+
+        def _ensure_buffer(buf: tvm.tir.Buffer) -> None:
+            name = buf.name
+            storage = _storage_for_buffer(buf)
+            footprint = int(_estimate_buffer_footprint_bytes(buf))
+            old = buffers.get(name)
+            if old is None:
+                buffers[name] = _JointBufferValue(
+                    name=name,
+                    storage=storage,
+                    base_footprint_bytes=footprint,
+                    is_barrier=_buf_scope_str(buf) == "shared.barrier",
+                )
+                return
+            old.base_footprint_bytes = max(int(old.base_footprint_bytes), footprint)
+            old.is_barrier = old.is_barrier or (_buf_scope_str(buf) == "shared.barrier")
+            if old.storage != StorageKind.SMEM and storage == StorageKind.SMEM:
+                old.storage = storage
+
+        for idx in ops:
+            info = infos[idx]
+            t = int(base_M.get(idx, 0))
+            for rd in info.reads:
+                _ensure_buffer(rd.buffer)
+                name = rd.buffer.name
+                op_reads[idx].append(name)
+                accesses.append(_JointBufferAccess(
+                    op_idx=idx,
+                    buffer_name=name,
+                    is_write=False,
+                    is_producer=bool(info.is_producer),
+                    time=t,
+                ))
+            for wr in info.writes:
+                _ensure_buffer(wr.buffer)
+                name = wr.buffer.name
+                op_writes[idx].append(name)
+                accesses.append(_JointBufferAccess(
+                    op_idx=idx,
+                    buffer_name=name,
+                    is_write=True,
+                    is_producer=bool(info.is_producer or info.is_true_tma),
+                    time=t,
+                ))
+
+        return buffers, op_reads, op_writes, accesses
+
+    buffer_values, op_buffer_reads, op_buffer_writes, buffer_accesses = _collect_buffer_registry()
+
+    def _is_joint_wait_barrier(info: _StmtInfo) -> bool:
+        if getattr(info, "is_wait_barrier", False):
+            return True
+        if not (getattr(info, "is_sync_top", False) or getattr(info, "is_sync_nested", False)):
+            return False
+        return bool(_call_op_names(info.stmt) & {
+            "tl.mbarrier_wait_parity",
+            "tir.ptx_wait_barrier",
+        })
+
+    def _shared_wait_reader_pairs() -> List[Tuple[int, int]]:
+        producer_written_shared = {
+            wr.buffer.name
+            for info in infos
+            if getattr(info, "is_producer", False) or getattr(info, "is_true_tma", False)
+            for wr in info.writes
+            if _is_shared(wr.buffer)
+        }
+        pairs: List[Tuple[int, int]] = []
+        active_wait: Optional[int] = None
+        for info in infos:
+            if getattr(info, "is_producer", False):
+                continue
+            if _is_joint_wait_barrier(info):
+                active_wait = info.idx
+                continue
+            if active_wait is None:
+                continue
+            if any(rd.buffer.name in producer_written_shared for rd in info.reads):
+                pair = (active_wait, info.idx)
+                if pair not in pairs:
+                    pairs.append(pair)
+        return pairs
+
+    wait_reader_pairs = _shared_wait_reader_pairs()
+    same_warpgroup_pairs = [
+        (f"s{wait_idx}", f"s{reader_idx}")
+        for wait_idx, reader_idx in wait_reader_pairs
+        if wait_idx in all_indices and reader_idx in all_indices
+    ]
+    if wait_reader_pairs:
+        print(
+            f"--- SMT wait/shared-reader warpgroup pairs: {wait_reader_pairs}; "
+            f"schedulable={same_warpgroup_pairs}",
+            flush=True,
+        )
+
+    def _pipeline_version_factors() -> Dict[str, int]:
+        """Estimate pre-MultiVersionBuffer shared-buffer replication.
+
+        Heddle now runs before tilelang.transform.MultiVersionBuffer(), so the
+        analyzed IR still exposes the logical single-stage shared buffer.  The
+        downstream pass will expand producer/consumer shared buffers by the
+        pipeline stage count; reflect that expansion in the solver's SMEM
+        footprint instead of waiting for the IR rewrite.
+        """
+        if expect_num_stage <= 1 or base_I <= 0:
+            return {}
+
+        buffer_events: Dict[str, Dict[str, object]] = {}
+        for access in buffer_accesses:
+            buf_value = buffer_values.get(access.buffer_name)
+            if buf_value is None or buf_value.storage != StorageKind.SMEM:
+                continue
+            entry = buffer_events.setdefault(
+                access.buffer_name,
+                {
+                    "writes": [],
+                    "reads": [],
+                    "has_producer_write": False,
+                    "is_barrier": bool(buf_value.is_barrier),
+                },
+            )
+            if access.is_write:
+                entry["writes"].append((access.op_idx, access.time, access.is_producer))
+                if access.is_producer:
+                    entry["has_producer_write"] = True
+            else:
+                entry["reads"].append((access.op_idx, access.time, not access.is_producer))
+
+        factors: Dict[str, int] = {}
+        for buffer_name, entry in buffer_events.items():
+            writes = list(entry.get("writes", []))
+            reads = list(entry.get("reads", []))
+            if bool(entry.get("is_barrier")) and not writes:
+                factors[buffer_name] = max(1, int(expect_num_stage))
+                continue
+            if not writes:
+                continue
+
+            participates = bool(entry.get("is_barrier")) or bool(entry.get("has_producer_write"))
+            if not participates:
+                participates = any(
+                    wt <= rt and is_consumer
+                    for _, wt, _ in writes
+                    for _, rt, is_consumer in reads
+                )
+            if not participates:
+                continue
+
+            # Count how many logical loop iterations keep this buffer live in
+            # the naive modulo window.  This is bounded by expect_num_stage,
+            # matching MultiVersionBuffer's physical ring-buffer size.
+            max_live_copies = 1
+            iter_span = range(-expect_num_stage, expect_num_stage + 1)
+            version_window = max(base_L, base_I * max(expect_num_stage, 1), base_I)
+            for tau in range(version_window):
+                live_iters: Set[int] = set()
+                for _, write_t, _ in writes:
+                    for iter_offset in iter_span:
+                        produced_at = write_t + iter_offset * base_I
+                        if produced_at > tau:
+                            continue
+                        reader_times = [
+                            (read_t if read_t >= write_t else read_t + base_I)
+                            + iter_offset * base_I
+                            for _, read_t, is_consumer in reads
+                            if is_consumer
+                        ]
+                        if reader_times:
+                            if max(reader_times) <= tau:
+                                continue
+                        elif tau > produced_at:
+                            continue
+                        live_iters.add(iter_offset)
+                if len(live_iters) > max_live_copies:
+                    max_live_copies = len(live_iters)
+
+            factors[buffer_name] = max(1, min(int(expect_num_stage), max_live_copies))
+
+        return factors
+
+    pipeline_buffer_versions = _pipeline_version_factors()
+    for buffer_name, factor in pipeline_buffer_versions.items():
+        if buffer_name in buffer_values:
+            buffer_values[buffer_name].version_factor = factor
+    
     nodes: List[OpNode] = []
     node_by_idx: Dict[int, OpNode] = {}
     for idx in ops:
@@ -1138,15 +1384,14 @@ def _solve_smt_joint_optimize(
         rty = _resource_for_info(info)
         latency = _latency_for_info(info)
         outputs: List[OutputValue] = []
-        for wr in info.writes:
-            storage = StorageKind.SMEM if _is_shared(wr.buffer) else StorageKind.RMEM
-            footprint = _estimate_buffer_footprint_bytes(wr.buffer)
+        for buffer_name in op_buffer_writes.get(idx, []):
+            buf_value = buffer_values[buffer_name]
             outputs.append(OutputValue(
-                name=f"s{idx}_w_{wr.buffer.name}",
-                storage=storage,
-                footprint_bytes=footprint,
+                name=f"s{idx}_w_{buffer_name}",
+                storage=buf_value.storage,
+                footprint_bytes=buf_value.footprint_bytes,
                 lifetime=LifetimeSemantic.DEAD_ON_ENTRY,
-                buffer_name=wr.buffer.name,
+                buffer_name=buffer_name,
             ))
         
         need_warpgroup = info.is_wgmma
@@ -1191,8 +1436,8 @@ def _solve_smt_joint_optimize(
     # 那么相邻两轮迭代中的该 stmt 必须至少间隔一个依赖延迟。
     for idx in ops:
         info = infos[idx]
-        write_bufs = {wr.buffer.name for wr in info.writes}
-        read_bufs = {rd.buffer.name for rd in info.reads}
+        write_bufs = set(op_buffer_writes.get(idx, []))
+        read_bufs = set(op_buffer_reads.get(idx, []))
         if write_bufs & read_bufs:
             node_by_idx[idx].add_dependency(
                 node_by_idx[idx],
@@ -1217,26 +1462,33 @@ def _solve_smt_joint_optimize(
         kernel_num_threads = int(kernel_num_threads)
     except (TypeError, ValueError):
         kernel_num_threads = 128
-    nwarps = max(1, (max(kernel_num_threads, 1) + 31) // 32) * 2
-    mod_sched_plan['num_warps'] = nwarps
-    print(f'---- num_warps (考虑PCWS 乘以2后) = {nwarps} (from threadIdx.x extent {kernel_num_threads})')
-    num_warps = max(1, int(mod_sched_plan.get("num_warps", 1)))
-    reg_limit = int(mod_sched_plan.get("reg_limit", 32* 240 * 4)) # 单个线程 255个 f32 寄存器；每个warp内需*32，阈值设置略低于 255
+
+    # threadIdx.x extent here is the user-specified consumer thread count.
+    # Keep the solver's assignable warp space to consumer warps only; the
+    # TMA-only producer WG is added later by FineGrainedWS/PCWS lowering.
+    # Otherwise per-op warp ids can spill into a third 128-thread consumer
+    # group, causing TileLang to expand 256 consumer threads to 384.
+    
+
+    mod_sched_plan['num_warps'] = expect_consumer_warps
+    print(f'---- num_warps (consumer only) = {mod_sched_plan['num_warps']} (IR: threadIdx.x extent {kernel_num_threads})')
+    num_warps = max(1, int(mod_sched_plan.get("num_warps", 1))) + 4  # SMT需要的 num_warps 为 producer+consumer 总数目
+    
+    # NVIDIA-H100 gpu上，单个SM 寄存器总量= 64K * 32bit reg = 64*1024 * 4bytes . 单个thread寄存器容量上限 255 * 32bit reg
+    # TMA producer 的WG一般设为 set_maxnreg(24)
+    
+    def _get_reg_limit_count() :
+        reg_max_count = int(mod_sched_plan.get("reg_limit", 240))  # threads 持有寄存器上限 255 32bit reg。这里略低于255
+        after_setmaxnreg = (64*1024 - 128 * 24) // kernel_num_threads
+        return min(reg_max_count, after_setmaxnreg)
+
+    reg_limit = int(mod_sched_plan.get("reg_limit", _get_reg_limit_count() * 4)) # bytes
     smem_limit = int(mod_sched_plan.get("smem_limit", 227 * 1024))  # h100 : 227 Kbytes for CTA
-    smem_allocations_by_buffer: Dict[str, int] = {}
-    for idx in ops:
-        info = infos[idx]
-        for region in list(info.reads) + list(info.writes):
-            if not _is_shared(region.buffer):
-                continue
-            footprint = _estimate_buffer_footprint_bytes(region.buffer)
-            if footprint <= 0:
-                continue
-            buffer_key = region.buffer.name
-            smem_allocations_by_buffer[buffer_key] = max(
-                smem_allocations_by_buffer.get(buffer_key, 0),
-                int(footprint),
-            )
+    smem_allocations_by_buffer: Dict[str, int] = {
+        name: int(buf_value.footprint_bytes)
+        for name, buf_value in buffer_values.items()
+        if buf_value.storage == StorageKind.SMEM and int(buf_value.footprint_bytes) > 0
+    }
     smem_allocation_floor = sum(smem_allocations_by_buffer.values())
     if smem_allocation_floor > smem_limit:
         print(
@@ -1252,9 +1504,11 @@ def _solve_smt_joint_optimize(
     window = max(base_L, base_max_time + 1, base_I)
 
     def _run_joint_solver(
-        *, solve_window: int, optimize: bool,
+        *, ii : int, solve_window: int, optimize: bool,
         solve_reg_limit: int, solve_smem_limit: int,
         enable_liveness: bool = True,
+        log_search_progress:bool = False,
+        not_all_same_warpgroup_sets: Optional[List[Tuple[str, ...]]] = None,
     ):
         solver = HeddleScheduler(
             nodes,
@@ -1264,16 +1518,20 @@ def _solve_smt_joint_optimize(
             num_warps=num_warps,
             timeout_ms=int(mod_sched_plan.get("timeout_ms", 15000)),
             enable_liveness=enable_liveness,
+            liveness_checkpoint_step=int(mod_sched_plan.get("liveness_checkpoint_step", 8)),
             start_hints={
                 f"s{idx}": int(t)
                 for idx, t in base_M.items()
                 if idx in node_by_idx
             },
             smem_allocations=smem_allocations_by_buffer,
+            log_search_progress=log_search_progress,
+            same_warpgroup_pairs=same_warpgroup_pairs,
+            not_all_same_warpgroup_sets=not_all_same_warpgroup_sets,
         )
         return solver.schedule_joint(
-            min_ii=base_I,
-            max_ii=base_I,
+            min_ii=ii,
+            max_ii=ii,
             window=solve_window,
             optimize=optimize,
         )
@@ -1399,13 +1657,27 @@ def _solve_smt_joint_optimize(
             for w, total in reg_total.items():
                 if total > reg_peak.get(w, 0):
                     reg_peak[w] = total
-                if check_reg_limit > 0 and total > check_reg_limit:
+                if check_reg_limit > 0 and total > check_reg_limit:  # reg_peak[w] 表示 perwarp的 寄存器用量(bytes)
+                    live_detail = sorted(
+                        (
+                            {
+                                "buffer": buffer_key,
+                                "iter_offset": iter_offset,
+                                "bytes": bytes_live,
+                            }
+                            for (buffer_key, iter_offset), bytes_live
+                            in reg_live_bytes.get(w, {}).items()
+                        ),
+                        key=lambda item: int(item["bytes"]),
+                        reverse=True,
+                    )
                     return False, {
                         "reason": "reg_limit",
                         "warp": w,
                         "tau": tau,
                         "usage": total,
                         "limit": check_reg_limit,
+                        "live_detail": live_detail[:12],
                         "reg_peak": reg_peak,
                     }
             smem_total = static_smem_total + sum(smem_live_bytes.values())
@@ -1422,64 +1694,25 @@ def _solve_smt_joint_optimize(
 
         return True, {"reg_peak": reg_peak, "smem_peak": smem_peak}
 
-    candidate_windows = []
-    for candidate in (window, window + base_I, window + 2 * base_I):
+    candidate_windows = []  # L 候选者
+    for candidate in (window, window + base_I, window + 2 * base_I, window + 3 * base_I):
         if candidate not in candidate_windows:
             candidate_windows.append(candidate)
 
-    reg_limit_candidates = []
-    for candidate in (reg_limit, reg_limit * 4, 10**9):
-        if candidate > 0 and candidate not in reg_limit_candidates:
-            reg_limit_candidates.append(candidate)
 
     smem_limit_candidates = []
-    for candidate in (smem_limit, smem_limit * 2, 233472):
+    for candidate in (smem_limit, ):
         if candidate > 0 and candidate not in smem_limit_candidates:
             smem_limit_candidates.append(candidate)
 
     sol = None
     solved_with_optimize = False
-    used_reg_limit = reg_limit
     used_smem_limit = smem_limit
     feasible_window = None
     liveness_info: Dict[str, object] = {}
-    # 1.先求可行解
-    for solve_window in candidate_windows:
-        for solve_reg_limit in reg_limit_candidates:
-            for solve_smem_limit in smem_limit_candidates:
-                used_reg_limit = solve_reg_limit
-                used_smem_limit = solve_smem_limit
-                sol = _run_joint_solver(
-                    solve_window=solve_window,
-                    optimize=False,
-                    solve_reg_limit=solve_reg_limit,
-                    solve_smem_limit=solve_smem_limit,
-                    enable_liveness=False,
-                )
-                if sol is not None:
-                    feasible_window = solve_window
-                    break
-                if solve_reg_limit != reg_limit or solve_smem_limit != smem_limit:
-                    print(
-                        f"---- SMT feasibility failed at window={solve_window}, "
-                        f"reg_limit={solve_reg_limit}, smem_limit={solve_smem_limit}",
-                        flush=True,
-                    )
-            if sol is not None:
-                break
-        if sol is not None:
-            break
-    # 2.若1成功，开启optimize求最优解。不启用liveliness约束
-    if sol is not None and feasible_window is not None:
-        feasible_sol = sol
-        opt_sol = _run_joint_solver(
-            solve_window=feasible_window,
-            optimize=True,
-            solve_reg_limit=used_reg_limit,
-            solve_smem_limit=used_smem_limit,
-            enable_liveness=False,
-        )
-        # 如果2成功，检查结果的liveliness、内存约束
+    
+    def _post_check_liveliness(opt_sol) :
+        nonlocal liveness_info
         if opt_sol is not None:
             opt_schedule = opt_sol.get("schedule", {})
             opt_warp_assign = opt_sol.get("warp_assign", {})
@@ -1499,63 +1732,133 @@ def _solve_smt_joint_optimize(
                 opt_schedule,
                 opt_warp_assign,
                 check_L=opt_L,
-                check_reg_limit=used_reg_limit,
+                check_reg_limit=reg_limit,
                 check_smem_limit=used_smem_limit,
             )
             if live_ok:
-                print(f"--- [0] SMT Optimize success !")
-                print(f"--- [0] SMT liveness check success: {live_info}", flush=True)
-                sol = opt_sol
+                print(f"--- SMT liveness check success: {live_info}", flush=True)
                 liveness_info = live_info
-                solved_with_optimize = True
+                return True, live_info
             else:
                 # 校验失败，fallback到可行解
-                print(
-                    f"---- [0] SMT liveness check failed for optimized solution: {live_info}; "
-                    "using feasibility solution",
-                    flush=True,
-                )
-                sol = feasible_sol
+                print(f"---- [0] SMT liveness check failed for solution: {live_info}; ",flush=True,)
+                return False, live_info
         else:
+            print("---- SMT solution=None. check Failed",flush=True,)
+            return False, {}
+
+    def _reg_feedback_from_live_info(live_info: Dict[str, object]) -> List[Tuple[str, ...]]:
+        if live_info.get("reason") != "reg_limit":
+            return []
+        total_raw_warpgroups = (num_warps + 3) // 4
+        has_variable_latency_role = any(
+            bool(getattr(node, "is_varialble_latency", False))
+            for node in nodes
+        )
+        non_variable_warpgroups = (
+            max(0, total_raw_warpgroups - 1)
+            if has_variable_latency_role else
+            total_raw_warpgroups
+        )
+        if non_variable_warpgroups < 2:
             print(
-                "---- SMT optimize failed; using feasibility solution",
+                f"---- Round2 reg feedback skipped: only {non_variable_warpgroups} "
+                f"non-variable WG available under TMA/non-TMA separation "
+                f"(raw_wg={total_raw_warpgroups}, num_warps={num_warps})",
                 flush=True,
             )
-    # 如果1失败，重试optimize 求解
-    if sol is None:
-        print("---- SMT feasibility failed; start retry optimize", flush=True)
-        for solve_window in candidate_windows:
-            for solve_reg_limit in reg_limit_candidates:
-                for solve_smem_limit in smem_limit_candidates:
-                    used_reg_limit = solve_reg_limit
-                    used_smem_limit = solve_smem_limit
-                    sol = _run_joint_solver(
-                        solve_window=solve_window,
-                        optimize=True,
-                        solve_reg_limit=solve_reg_limit,
-                        solve_smem_limit=solve_smem_limit,
-                        enable_liveness=False,
-                    )
-                    if sol is not None:
-                        solved_with_optimize = True
-                        break
-                    if solve_reg_limit != reg_limit or solve_smem_limit != smem_limit:
-                        print(
-                            f"---- SMT optimize failed at window={solve_window}, "
-                            f"reg_limit={solve_reg_limit}, smem_limit={solve_smem_limit}",
-                            flush=True,
-                        )
-                if sol is not None:
-                    break
-            if sol is not None:
+            return []
+        details = live_info.get("live_detail") or []
+        peak_buffers: List[str] = []
+        for item in details:
+            if not isinstance(item, dict):
+                continue
+            buffer_name = str(item.get("buffer", ""))
+            if buffer_name and buffer_name not in peak_buffers:
+                peak_buffers.append(buffer_name)
+            if len(peak_buffers) >= 3:
                 break
-    # 12都失败，表明联合求解失败。采用naive 模调度方案
-    if sol is None:
-        print('--- Retry failed. Fallback to naive sched plan')
-        fallback = dict(mod_sched_plan)
-        fallback.setdefault("status", "SMT_UNSAT")
-        return fallback
+
+        peak_producers: List[str] = []
+        for buffer_name in peak_buffers:
+            for idx in ops:
+                node = node_by_idx.get(idx)
+                if node is None:
+                    continue
+                if bool(getattr(node, "is_varialble_latency", False)):
+                    continue
+                if any(out.storage == StorageKind.RMEM and out.rmem_buffer_key() == buffer_name for out in node.outputs):
+                    if node.name not in peak_producers:
+                        peak_producers.append(node.name)
+                    break
+
+        if len(peak_producers) < 2:
+            return []
+        feedback_set = tuple(peak_producers)
+        print(
+            f"---- Round2 reg feedback: top_buffers={peak_buffers}, "
+            f"peak_producers={feedback_set}, constraint=not_all_same_warpgroup",
+            flush=True,
+        )
+        return [feedback_set]
+
     
+    def _find_solution_and_check_liveliness() :
+        for solve_window in candidate_windows:
+            print(f'[SMT] 遍历空间找最优解 : I= {base_I} L = {solve_window}',flush=True)
+            sol = _run_joint_solver(
+                ii=base_I,
+                solve_window=solve_window,
+                optimize=True,
+                solve_reg_limit=reg_limit,
+                solve_smem_limit=smem_limit,
+                enable_liveness=False,
+                log_search_progress=False
+            )
+            live_ok, live_info = _post_check_liveliness(sol)
+            if live_ok:
+                liveness_info = {
+                    "reg_peak": sol.get("reg_peak", {}),
+                    "smem_peak": sol.get("smem_peak"),
+                    "source": "smt_checkpoint_liveness",
+                }
+                print(f"最优解求解成功 I={base_I}, L={solve_window}")
+                return (sol, liveness_info)
+
+            feedback_sets = _reg_feedback_from_live_info(live_info)
+            if feedback_sets:
+                print(f'[SMT] Round2: 添加top3 reg peak producer分散约束后重试 L = {solve_window}', flush=True)
+                sol2 = _run_joint_solver(
+                    ii=base_I,
+                    solve_window=solve_window,
+                    optimize=True,
+                    solve_reg_limit=reg_limit,
+                    solve_smem_limit=smem_limit,
+                    enable_liveness=False,
+                    log_search_progress=False,
+                    not_all_same_warpgroup_sets=feedback_sets,
+                )
+                live_ok2, live_info2 = _post_check_liveliness(sol2)
+                if live_ok2:
+                    liveness_info = {
+                        "reg_peak": sol2.get("reg_peak", {}),
+                        "smem_peak": sol2.get("smem_peak"),
+                        "source": "round2_reg_feedback",
+                        "reg_feedback_sets": feedback_sets,
+                    }
+                    print(f"Round2 最优解求解成功 I={base_I}, L={solve_window}")
+                    return (sol2, liveness_info)
+                print(f"Round2 reg feedback 后仍失败: {live_info2}", flush=True)
+            else:
+                print(f"最优解求解失败，继续尝试更大的 L. ",flush=True)
+        print(f'I={base_I} L={candidate_windows} 下SMT无可行调度')
+        return None
+    
+    packed_sol = _find_solution_and_check_liveliness()
+    if packed_sol is None:
+        print(f'I= {base_I} 无可行解')
+        return None
+    (sol,liveness_info) = packed_sol
     # 如果未收集到liveliness信息，构造之并检查
     if not liveness_info:
         sol_schedule = sol.get("schedule", {})
@@ -1576,7 +1879,7 @@ def _solve_smt_joint_optimize(
             sol_schedule,
             sol_warp_assign,
             check_L=sol_L,
-            check_reg_limit=used_reg_limit,
+            check_reg_limit=reg_limit,
             check_smem_limit=used_smem_limit,
         )
         if live_ok:
@@ -1584,29 +1887,15 @@ def _solve_smt_joint_optimize(
             liveness_info = live_info
         else:
             print(f"---- SMT liveness check failed: {live_info}", flush=True)
-            if solved_with_optimize:
-                fallback = dict(mod_sched_plan)
-                fallback.setdefault("status", "SMT_LIVENESS_FAIL")
-                fallback["liveness_info"] = live_info
-                return fallback
-            liveness_info = live_info
+            fallback = dict(mod_sched_plan)
+            fallback["status"] = "SMT_LIVENESS_FAIL"
+            fallback["liveness_info"] = live_info
+            return fallback
 
-    if used_reg_limit != reg_limit:
-        print(
-            f"---- SMT joint succeeded with relaxed reg_limit={used_reg_limit} "
-            f"(original={reg_limit})",
-            flush=True,
-        )
-    if used_smem_limit != smem_limit:
-        print(
-            f"---- SMT joint succeeded with relaxed smem_limit={used_smem_limit} "
-            f"(original={smem_limit})",
-            flush=True,
-        )
-
+    # ------------ 结果整理 -----------
     schedule = sol.get("schedule", {})
     warp_assign = sol.get("warp_assign", {})
-    print(f"----{warp_assign=}")
+    variable_lifetimes = sol.get("variable_lifetimes",[])
     optimized_M = {
         idx: int(schedule[f"s{idx}"])
         for idx in ops
@@ -1624,10 +1913,12 @@ def _solve_smt_joint_optimize(
         ),
         default=0,
     )
+    print(f"---{warp_assign=}")
     print(f'---{optimized_L=}')
     print(f'---{base_I=}')
     print(f'---{optimized_M=}')
-
+    print(f'---{variable_lifetimes=}')
+    
     table = []
     for r in range(base_I):
         row = {"slot": f"{r} mod {base_I}"}
@@ -1662,6 +1953,7 @@ def _solve_smt_joint_optimize(
         },
         "reg_peak": liveness_info.get("reg_peak", sol.get("reg_peak", {})),
         "smem_peak": liveness_info.get("smem_peak"),
+        "variable_lifetimes": sol.get("variable_lifetimes", {}),
         "modular_rrt": table,
         "ordering": [idx for idx, _ in sorted(optimized_M.items(), key=lambda item: (item[1], item[0]))],
     })
@@ -2354,6 +2646,87 @@ def _evaluate_scheduling_cost_model(
 # Main pass logic
 # ---------------------------------------------------------------------------
 
+@dataclass
+class _KernelLaunchConfig:
+    bx: int = 1
+    by: int = 1
+    bz: int = 1
+    tx: int = 1
+    ty: int = 1
+    tz: int = 1
+
+    @property
+    def threads(self) -> int:
+        return self.tx * self.ty * self.tz
+
+
+def _extract_kernel_launch_config(func: tvm.tir.PrimFunc) -> _KernelLaunchConfig:
+    """Extract blockIdx/threadIdx launch extents from the pre-SMT PrimFunc."""
+    config = _KernelLaunchConfig()
+    tag_to_field = {
+        "blockIdx.x": "bx",
+        "blockIdx.y": "by",
+        "blockIdx.z": "bz",
+        "threadIdx.x": "tx",
+        "threadIdx.y": "ty",
+        "threadIdx.z": "tz",
+    }
+
+    def _as_int(value) -> Optional[int]:
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def _update(tag: str, value) -> None:
+        field = tag_to_field.get(tag)
+        extent = _as_int(value)
+        if field is None or extent is None or extent <= 0:
+            return
+        old = getattr(config, field)
+        setattr(config, field, max(old, extent))
+
+    try:
+        if func.attrs:
+            thread_extent = func.attrs.get("thread_extent")
+            if thread_extent is not None:
+                for tag in tag_to_field:
+                    try:
+                        value = thread_extent[tag]
+                    except Exception:
+                        try:
+                            value = thread_extent.get(tag)
+                        except Exception:
+                            value = None
+                    if value is not None:
+                        _update(tag, value)
+    except Exception:
+        pass
+
+    def _visit(stmt):
+        if isinstance(stmt, tvm.tir.For):
+            tb = stmt.thread_binding
+            if tb is not None:
+                try:
+                    _update(str(tb.thread_tag), stmt.extent)
+                except Exception:
+                    pass
+        if isinstance(stmt, tvm.tir.AttrStmt) and str(stmt.attr_key) == "thread_extent":
+            try:
+                node = stmt.node
+                tag = ""
+                if hasattr(node, "thread_tag") and node.thread_tag:
+                    tag = str(node.thread_tag)
+                elif hasattr(node, "var"):
+                    tag = str(node.var.name)
+                _update(tag, stmt.value)
+            except Exception:
+                pass
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, _visit)
+    return config
+
+
 def _transform_pipeline_loop(
     func: tvm.tir.PrimFunc,
     *,
@@ -2375,7 +2748,15 @@ def _transform_pipeline_loop(
     # fragment covers only half the M-tile on a single WG, so routing PV
     # to WG1 alone produces an incomplete output. We gate the auto-trigger
     # accordingly.
-    func_num_threads = _extract_num_threads(func)
+    launch_config = _extract_kernel_launch_config(func)
+    func_num_threads = launch_config.threads
+    # 注：考虑到后续分角色的 WG specialize，不同WG会承担整个kernel上的计算任务。因此初始IR中 threads必为128，这样产出的IR才是 WG 对所有计算任务的数据索引。
+    # 后续分角色时 （op摊派到不同WG），只需要做 threadidx 的 ifstmtbinding 就好（这里，threadidx 应该也要压缩回 0~127 的区间，即 tx % 128）
+    # 相当于：original code = WG0 承担所有计算任务 ABCD ; 后续 SMT规划后，newcode中 consumer 数目变多，则 WG0只承担AB, WG1 承担CD 就可。两者跨WG通过shm通信。
+    # 代码上，newcode 比 original 多了分角色的 if tx <= xxx , 以及新增WG if 分支内 tx = tx % 128 的设置（不压缩tx到单个WG的话，会造成索引计算错误）
+    
+    assert func_num_threads==128, "num_threads must == 128 ! (用于表达单个WG的计算任务)"
+    
     # Also look at the function attrs for the original kernel thread count
     # (set by T.Kernel(threads=...)). LowerOpaqueBlock and other early
     # passes may rewrite the threadIdx.x extent to the per-iteration
@@ -2394,38 +2775,12 @@ def _transform_pipeline_loop(
     except Exception:
         attr_threads = 0
     if attr_threads > 0:
-        func_num_threads = attr_threads
-    # Fallback: scan kernel block/iter_vars for the threadIdx.x extent at
-    # PrimFunc entry. Earlier passes (MultiVersionBuffer etc.) sometimes
-    # present per-iter thread extent (e.g. 128) in AttrStmt even when the
-    # user spec is 256; in that case we also look at the kernel-level
-    # block's iter_vars and pick the largest observed thread extent.
-    scan_max = [func_num_threads]
-    def _scan(stmt):
-        if isinstance(stmt, tvm.tir.For):
-            tb = stmt.thread_binding
-            if tb is not None:
-                try:
-                    tag = str(tb.thread_tag) if hasattr(tb, "thread_tag") else ""
-                    if tag == "threadIdx.x":
-                        v = int(stmt.extent)
-                        if v > scan_max[0]:
-                            scan_max[0] = v
-                except Exception:
-                    pass
-        if isinstance(stmt, tvm.tir.AttrStmt):
-            if str(stmt.attr_key) == "thread_extent":
-                try:
-                    if hasattr(stmt.node, "var") and stmt.node.var.name == "threadIdx.x":
-                        v = int(stmt.value)
-                        if v > scan_max[0]:
-                            scan_max[0] = v
-                except Exception:
-                    pass
-    tvm.tir.stmt_functor.post_order_visit(func.body, _scan)
-    func_num_threads = scan_max[0]
+        func_num_threads = max(func_num_threads, attr_threads)
     if debug:
-        print(f"[Heddle] func_num_threads={func_num_threads} (attr={attr_threads})",
+        print(f"[Heddle] launch_config: bx={launch_config.bx}, by={launch_config.by}, "
+              f"bz={launch_config.bz}, threads={func_num_threads} "
+              f"(tx={launch_config.tx}, ty={launch_config.ty}, tz={launch_config.tz}, "
+              f"attr={attr_threads})",
               file=sys.stderr, flush=True)
     changed = [False]
 
@@ -2657,6 +3012,7 @@ def _transform_pipeline_loop(
             infos_list, barrier_infos,
             relax_producer_boundary=relax_producer_boundary,
         )
+        print(f'--- user defined num_stages = {num_stages}')
         print(f'----{consumer_indices=} ')
         print(f'----{deps=} ')
         print(f'----{deps_all=} ')
@@ -2664,11 +3020,17 @@ def _transform_pipeline_loop(
         print('---- infos_list : ')
         for info in infos_list :
             msg = f"[{info.idx}] wr:"
+            bufinfo = ''
             for wr in info.writes :
-                msg += f"{wr.buffer.name}, "
+                shape_str = str( [int(x) for x in wr.buffer.shape] )
+                bufinfo = f"{wr.buffer.name}<{shape_str}>;"
+                msg += bufinfo
             msg += " / rd:"
+            bufinfo = ''
             for rd in info.reads :
-                msg += f"{rd.buffer.name}, "
+                shape_str = str( [int(x) for x in rd.buffer.shape] )
+                bufinfo = f"{rd.buffer.name}<{shape_str}>;"
+                msg += bufinfo
             print(msg)
 
         # ── Skip reordering for simple kernels ──
@@ -2709,9 +3071,6 @@ def _transform_pipeline_loop(
                 )
             return None
 
-        # ---- TWill : step 1 求解基础模调度M
-        mod_sched_plans = _solve_naive_modulo_sched(deps_all, infos_list, all_indices)
-        # ---- TWill : step 2 求解联合优化问题： 基础模调度M + warp_spec
         joint_phase_b_result = None
         joint_phase_b_source = None
 
@@ -2765,6 +3124,41 @@ def _transform_pipeline_loop(
 
             schedulable_indices = set(all_indices)
             stmt_positions = {info.idx: pos for pos, info in enumerate(infos_list)}
+
+            def _joint_wait_reader_pairs_for_elided() -> List[Tuple[int, int]]:
+                producer_written_shared = {
+                    wr.buffer.name
+                    for info in infos_list
+                    if getattr(info, "is_producer", False) or getattr(info, "is_true_tma", False)
+                    for wr in info.writes
+                    if _is_shared(wr.buffer)
+                }
+                pairs: List[Tuple[int, int]] = []
+                active_wait: Optional[int] = None
+                for info in infos_list:
+                    if getattr(info, "is_producer", False):
+                        continue
+                    is_wait = bool(getattr(info, "is_wait_barrier", False)) or (
+                        (getattr(info, "is_sync_top", False) or getattr(info, "is_sync_nested", False))
+                        and bool(_call_op_names(info.stmt) & {
+                            "tl.mbarrier_wait_parity",
+                            "tir.ptx_wait_barrier",
+                        })
+                    )
+                    if is_wait:
+                        active_wait = info.idx
+                        continue
+                    if active_wait is None:
+                        continue
+                    if any(rd.buffer.name in producer_written_shared for rd in info.reads):
+                        pair = (active_wait, info.idx)
+                        if pair not in pairs:
+                            pairs.append(pair)
+                return pairs
+
+            wait_to_reader_for_warp: Dict[int, List[int]] = {}
+            for wait_idx, reader_idx in _joint_wait_reader_pairs_for_elided():
+                wait_to_reader_for_warp.setdefault(wait_idx, []).append(reader_idx)
 
             def _is_joint_elided_consumer(ci: int) -> bool:
                 return ci not in schedulable_indices
@@ -2857,6 +3251,9 @@ def _transform_pipeline_loop(
                 }
 
                 def _derive_elided_warp(ci: int) -> Optional[int]:
+                    for reader_idx in wait_to_reader_for_warp.get(ci, []):
+                        if reader_idx in opt_warps:
+                            return int(opt_warps[reader_idx])
                     pos = joint_full_order_pos.get(ci)
                     if pos is not None:
                         for idx in reversed(joint_full_order[:pos]):
@@ -2898,12 +3295,20 @@ def _transform_pipeline_loop(
                 else:
                     # The joint solver assigns logical warp ids. FineGrainedWS
                     # per-op dispatch expects compact 128-thread warp-group ids.
+                    # 即 ： 如果consumer 占wgid=[1,2] , 则会被 compact成为 [0,1]， 进行紧凑编号。1->0 2->1
                     raw_groups = {ci: max(0, int(raw_warps[ci]) // 4) for ci in consumer_indices}
                     group_remap = {g: pos for pos, g in enumerate(sorted(set(raw_groups.values())))}
                     joint_warps = {
                         f"s{ci}": group_remap[raw_groups[ci]]
                         for ci in consumer_indices
                     }
+                    # Keep producer-side TMA assignments (for example K/V
+                    # loads) in the annotation as well.  FineGrainedWS uses
+                    # these only to route producer blocks; consumer WG ids
+                    # above remain compacted independently.
+                    for ci, warp in opt_warps.items():
+                        if ci not in raw_groups:
+                            joint_warps[f"s{ci}"] = max(0, int(warp) // 4)
 
             return (
                 joint_order,
@@ -2992,27 +3397,79 @@ def _transform_pipeline_loop(
                 "tl.debug_joint_pipeline_from_smt": tvm.tir.IntImm("int32", 1),
             }
 
-        for plan in mod_sched_plans :
-            print('----start  _solve_smt_joint_optimize', flush=True)
-            optimized =  _solve_smt_joint_optimize(
-                deps_all,
-                infos_list,
-                all_indices,
-                plan,
-                kernel_num_threads=func_num_threads,
-            )
-            if optimized is not None:
-                print(f'---{optimized=}',flush=True)
-            # if optimized and optimized['modular_rrt'] is not None :
-            #     for row in optimized['modular_rrt'] :
-            #         print(row)
-            if optimized and optimized.get("status") in ("SMT_OPTIMIZED", "SMT_FEASIBLE"):
-                candidate_phase_b_result = _joint_result_to_phase_b_result(optimized)
-                if candidate_phase_b_result is not None:
-                    if joint_phase_b_result is None or int(optimized.get("L", 10**18)) < int(joint_phase_b_source.get("L", 10**18)):
+        def get_best_mod_sched_plan() :
+            last_unfeasible_ii = 0
+            last_unfeasible_L = 0
+            feasible_ii = 0
+            feasible_L = 0
+            nonlocal joint_phase_b_result, joint_phase_b_source
+            # ---- TWill : step 1 求解基础模调度M
+            mod_sched_plans = _solve_naive_modulo_sched(deps_all, infos_list, all_indices, start_ii=1)  # start_ii=1292
+            # ---- TWill : step 2 求解联合优化问题： 基础模调度M + warp_spec
+            for plan in mod_sched_plans :
+                print('----start  _solve_smt_joint_optimize', flush=True)
+                plan['heddle_expect_consumer_warps'] = consumer_num_warps  # 传入用户期望的 consumer_warps 数目
+                optimized =  _solve_smt_joint_optimize( deps_all,infos_list,all_indices,plan, kernel_num_threads=func_num_threads,)
+                if optimized is None :
+                    last_unfeasible_ii = plan['I']
+                    last_unfeasible_L = plan['L']
+                elif optimized and optimized.get("status") in ("SMT_OPTIMIZED", "SMT_FEASIBLE"):
+                    feasible_ii = optimized['I']
+                    feasible_L = optimized['L']
+                # if optimized and optimized['modular_rrt'] is not None :
+                #     for row in optimized['modular_rrt'] :
+                #         print(row)
+                if optimized and optimized.get("status") in ("SMT_OPTIMIZED", "SMT_FEASIBLE"):
+                    candidate_phase_b_result = _joint_result_to_phase_b_result(optimized)
+                    if candidate_phase_b_result is not None:
+                        if joint_phase_b_result is None or int(optimized.get("L", 10**18)) < int(joint_phase_b_source.get("L", 10**18)):
+                            joint_phase_b_result = candidate_phase_b_result
+                            joint_phase_b_source = optimized
+                            break
+            if feasible_ii > 0 :
+                if last_unfeasible_ii <= 0 :
+                    return
+                print(f'---- 可行II搜索区间 : ({last_unfeasible_ii}, {feasible_ii}]')
+                # 二分法搜索 best plan:
+                ii_lb = last_unfeasible_ii
+                ii_ub = feasible_ii
+                
+                def _try_ii(ii : int) :
+                    naive_plans = _solve_naive_modulo_sched(
+                        deps_all, infos_list, all_indices, start_ii=ii)
+                    for naive_p in naive_plans:
+                        optimized_p = _solve_smt_joint_optimize(
+                            deps_all, infos_list, all_indices, naive_p,
+                            kernel_num_threads=func_num_threads,
+                        )
+                        if optimized_p and optimized_p.get("status") in ("SMT_OPTIMIZED", "SMT_FEASIBLE"):
+                            return optimized_p
+                    return None
+                
+                while True:
+                    print(f"--- finding minimal II : [{ii_lb}, {ii_ub}]")
+                    if ii_ub - ii_lb <= 5:
+                        break
+                    mid_ans = _try_ii((ii_ub + ii_lb) // 2)
+                    if mid_ans is not None :
+                        ii_ub = (ii_ub + ii_lb) // 2
+                    else:
+                        ii_lb = (ii_ub + ii_lb) // 2
+                
+                for ii in range(ii_lb, ii_ub+1, 1):
+                    ret = _try_ii(ii)
+                    if ret is not None :
+                        candidate_phase_b_result = _joint_result_to_phase_b_result(ret)
+                        if candidate_phase_b_result is None:
+                            continue
                         joint_phase_b_result = candidate_phase_b_result
-                        joint_phase_b_source = optimized
-
+                        joint_phase_b_source = ret
+                        return
+            else:
+                return
+            
+        get_best_mod_sched_plan()
+         
         # ── Phase B: SMT-based joint ordering ──
         # Policy: run Phase B if (a) explicitly enabled, or (b) ≥3 WGMMA
         # consumer ops detected (complex dependency → heuristic may produce
@@ -3083,14 +3540,22 @@ def _transform_pipeline_loop(
                           file=sys.stderr, flush=True)
 
             if consumer_num_warps > 1 and phase_b_order is not None:
-                warp_keys = {int(name[1:]) for name in phase_b_warps}
-                if phase_b_warps and warp_keys != set(consumer_indices):
+                consumer_set = set(consumer_indices)
+                filtered_warps = {
+                    name: warp
+                    for name, warp in phase_b_warps.items()
+                    if int(name[1:]) in consumer_set
+                }
+                warp_keys = {int(name[1:]) for name in filtered_warps}
+                if phase_b_warps and warp_keys != consumer_set:
                     phase_b_warps = {}
                     if debug:
-                        print(f"[Heddle] Phase B returned partial warp assigns; "
+                        print(f"[Heddle] Phase B returned incomplete warp assigns; "
                               f"skipping per-op dispatch and letting PCWS choose "
                               f"a structured consumer split",
                               file=sys.stderr, flush=True)
+                else:
+                    phase_b_warps = filtered_warps
 
             if debug:
                 status = "SAT" if phase_b_order is not None else "UNSAT/timeout"
@@ -3178,7 +3643,7 @@ def _transform_pipeline_loop(
                         except Exception:
                             old_num_stages_int = None
                     if old_num_stages_int != phase_b_num_stages:
-                        new_annotations["num_stages"] = phase_b_num_stages
+                        new_annotations["num_stages"] = tvm.tir.IntImm("int32", int(phase_b_num_stages))
                         annotations_changed = True
                         print(
                             f"[Heddle] Replacing num_stages: "

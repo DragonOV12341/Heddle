@@ -90,7 +90,8 @@ def test_gemm():
 def test_fa_fwd():
     B, H, Tseq, D = 1, 32, 4096, 128
     print(f"\n=== FlashAttention FWD ({B=} {H=} {Tseq=} {D=}) ===")
-    bM, bN, stages, threads = 128, 64, 3, 128
+    bM, bN, stages, threads = 128, 64, 1, 256
+    # bM, bN, stages, threads = 128, 64, 3, 128
     scale = (1.0 / D) ** 0.5 * 1.44269504
     shape = [B, Tseq, H, D]
     flops = 4.0 * B * H * Tseq * Tseq * D
@@ -117,11 +118,11 @@ def test_fa_fwd():
             PassConfigKey.TL_HEDDLE_USE_PHASE_B: True,
             PassConfigKey.TL_HEDDLE_USE_PRECISE_LATENCY: True,
             PassConfigKey.TL_HEDDLE_USE_ALAP_PRIORITY: True,
-            PassConfigKey.TL_HEDDLE_CONSUMER_NUM_WARPS: 8,
+            PassConfigKey.TL_HEDDLE_CONSUMER_NUM_WARPS: 2,
         }),
     ]:
         try:
-            @tilelang.jit(out_idx=[3], pass_configs=pc)
+            @tilelang.jit(out_idx=[3], target="cuda -arch=sm_90", pass_configs=pc)
             def kern(B, H, Tseq, D, bM, bN, stages, threads, scale):
                 @T.prim_func
                 def main(Q: T.Tensor(shape, T.float16), K_: T.Tensor(shape, T.float16),
@@ -131,13 +132,15 @@ def test_fa_fwd():
                         Ks = T.alloc_shared([bN, D], T.float16)
                         Vs = T.alloc_shared([bN, D], T.float16)
                         acc_s = T.alloc_fragment([bM, bN], T.float32)
-                        acc_s_c = T.alloc_fragment([bM, bN], T.float16)
+                        acc_s_c = T.alloc_shared([bM, bN], T.float16)
                         acc_o = T.alloc_fragment([bM, D], T.float32)
                         sm = T.alloc_fragment([bM], T.float32)
                         smp = T.alloc_fragment([bM], T.float32)
                         ss = T.alloc_fragment([bM], T.float32)
                         ssum = T.alloc_fragment([bM], T.float32)
                         ls = T.alloc_fragment([bM], T.float32)
+                        ss_shared = T.alloc_shared([bM], T.float32)
+                        ls_shared = T.alloc_shared([bM], T.float32)
                         T.copy(Q[bz, bx*bM:(bx+1)*bM, by, :], Qs)
                         T.fill(acc_o, 0); T.fill(ls, 0); T.fill(sm, -T.infinity(T.float32))
                         for k in T.Pipelined(T.ceildiv(Tseq, bN), num_stages=stages):
@@ -153,13 +156,14 @@ def test_fa_fwd():
                             for i in T.Parallel(bM):
                                 # 根据新旧max 计算缩放因子 ss[i]
                                 ss[i] = T.exp2(smp[i] * scale - sm[i] * scale)
+                                ss_shared[i] = ss[i]
                             for i, j in T.Parallel(bM, bN):
                                 # acc_s = exp((QK - 行max)*scale)
                                 acc_s[i, j] = T.exp2(acc_s[i, j] * scale - sm[i] * scale)
                             # X方向reduce sum , 存入 ssum
                             T.reduce_sum(acc_s, ssum, dim=1)
                             for i, j in T.Parallel(bM, D):
-                                acc_o[i, j] *= ss[i]
+                                acc_o[i, j] *= ss_shared[i]
                             for i in T.Parallel(bM):
                                 # ssum 累加，放进 ls（分母） （考虑每轮做缩放 ）
                                 ls[i] = ls[i] * ss[i] + ssum[i]
@@ -168,9 +172,11 @@ def test_fa_fwd():
                             T.copy(V[bz, k*bN:(k+1)*bN, by, :], Vs)
                             # acc_o += acc_s_c @ Vs
                             T.gemm(acc_s_c, Vs, acc_o)
+                        for i in T.Parallel(bM):
+                            ls_shared[i] = ls[i]
                         for i, j in T.Parallel(bM, D):
                             # acc_o 除以分母
-                            acc_o[i, j] /= ls[i]
+                            acc_o[i, j] /= ls_shared[i]
                         T.copy(acc_o, O[bz, bx*bM:(bx+1)*bM, by, :])
                 return main
 
@@ -185,9 +191,8 @@ def test_fa_fwd():
     assert len(rets) == 2
     baseline = inner_baseline(Q,K,V)
     isEqual0 = torch.allclose(rets[0], baseline, atol=1e-2, rtol=1e-2)
-    isEqual1 = torch.allclose(rets[0], baseline, atol=1e-2, rtol=1e-2)
-    print(f"{isEqual0=}")
-    print(f"{isEqual1=}")
+    isEqual1 = torch.allclose(rets[1], baseline, atol=1e-2, rtol=1e-2)
+    print(f"{isEqual0=}  {isEqual1=}")
     
 if __name__ == "__main__":
     # test_gemm()
