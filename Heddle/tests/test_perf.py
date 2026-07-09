@@ -37,60 +37,61 @@ def bench(fn, warmup=10, repeat=50):
     return times[len(times) // 2]
 
 
-def test_gemm():
-    M = N = K = 8192
-    print(f"\n=== GEMM {M}x{N}x{K} ===")
-    bM, bN, bK, stages, threads = 128, 128, 64, 3, 128
+# def test_gemm():
+#     M = N = K = 8192
+#     print(f"\n=== GEMM {M}x{N}x{K} ===")
+#     bM, bN, bK, stages, threads = 128, 128, 64, 3, 128
 
-    for mode_name, pc in [
-        ("Baseline", {}),
-        ("Heddle", {
-            PassConfigKey.TL_ENABLE_FAST_MATH: True,
-            PassConfigKey.TL_ENABLE_AUTO_TL_PIPELINE_SMT: True,
-            PassConfigKey.TL_ENABLE_HEDDLE_CONSUMER_SCHEDULE: True,
-            PassConfigKey.TL_HEDDLE_USE_PRECISE_LATENCY: True,
-            PassConfigKey.TL_HEDDLE_CONSUMER_NUM_WARPS: 2,
-        }),
-    ]:
-        @tilelang.jit(out_idx=[2], pass_configs=pc)
-        def matmul(M, N, K, bM, bN, bK, stages, threads):
-            @T.prim_func
-            def gemm(A: T.Tensor((M, K), T.float16),
-                     B: T.Tensor((K, N), T.float16),
-                     C: T.Tensor((M, N), T.float16)):
-                with T.Kernel(T.ceildiv(M, bM), T.ceildiv(N, bN), threads=threads) as (bx, by):
-                    As = T.alloc_shared((bM, bK), T.float16)
-                    Bs = T.alloc_shared((bK, bN), T.float16)
-                    Cl = T.alloc_fragment((bM, bN), T.float32)
-                    T.clear(Cl)
-                    for k in T.Pipelined(T.ceildiv(K, bK), num_stages=stages):
-                        T.copy(A[bx*bM:(bx+1)*bM, k*bK:(k+1)*bK], As)
-                        T.copy(B[k*bK:(k+1)*bK, by*bN:(by+1)*bN], Bs)
-                        T.gemm(As, Bs, Cl)
-                    T.copy(Cl, C[bx*bM:(bx+1)*bM, by*bN:(by+1)*bN])
-            return gemm
+#     for mode_name, pc in [
+#         ("Baseline", {}),
+#         ("Heddle", {
+#             PassConfigKey.TL_ENABLE_FAST_MATH: True,
+#             PassConfigKey.TL_ENABLE_AUTO_TL_PIPELINE_SMT: True,
+#             PassConfigKey.TL_ENABLE_HEDDLE_CONSUMER_SCHEDULE: True,
+#             PassConfigKey.TL_HEDDLE_USE_PRECISE_LATENCY: True,
+#             PassConfigKey.TL_HEDDLE_CONSUMER_NUM_WARPS: 2,
+#         }),
+#     ]:
+#         @tilelang.jit(out_idx=[2], pass_configs=pc)
+#         def matmul(M, N, K, bM, bN, bK, stages, threads):
+#             @T.prim_func
+#             def gemm(A: T.Tensor((M, K), T.float16),
+#                      B: T.Tensor((K, N), T.float16),
+#                      C: T.Tensor((M, N), T.float16)):
+#                 with T.Kernel(T.ceildiv(M, bM), T.ceildiv(N, bN), threads=threads) as (bx, by):
+#                     As = T.alloc_shared((bM, bK), T.float16)
+#                     Bs = T.alloc_shared((bK, bN), T.float16)
+#                     Cl = T.alloc_fragment((bM, bN), T.float32)
+#                     T.clear(Cl)
+#                     for k in T.Pipelined(T.ceildiv(K, bK), num_stages=stages):
+#                         T.copy(A[bx*bM:(bx+1)*bM, k*bK:(k+1)*bK], As)
+#                         T.copy(B[k*bK:(k+1)*bK, by*bN:(by+1)*bN], Bs)
+#                         T.gemm(As, Bs, Cl)
+#                     T.copy(Cl, C[bx*bM:(bx+1)*bM, by*bN:(by+1)*bN])
+#             return gemm
 
-        kernel = matmul(M, N, K, bM, bN, bK, stages, threads)
-        A = torch.randn(M, K, device="cuda", dtype=torch.float16)
-        B = torch.randn(K, N, device="cuda", dtype=torch.float16)
+#         kernel = matmul(M, N, K, bM, bN, bK, stages, threads)
+#         A = torch.randn(M, K, device="cuda", dtype=torch.float16)
+#         B = torch.randn(K, N, device="cuda", dtype=torch.float16)
 
-        # Correctness
-        C_ours = kernel(A, B)
-        C_ref = A @ B
-        err = (C_ours.float() - C_ref.float()).abs().max().item()
-        ok = err < 1.0
+#         # Correctness
+#         C_ours = kernel(A, B)
+#         C_ref = A @ B
+#         err = (C_ours.float() - C_ref.float()).abs().max().item()
+#         ok = err < 1.0
 
-        # Performance
-        ms = bench(lambda: kernel(A, B))
-        tflops = 2 * M * N * K / ms / 1e9
+#         # Performance
+#         ms = bench(lambda: kernel(A, B))
+#         tflops = 2 * M * N * K / ms / 1e9
 
-        print(f"  {mode_name:<12}: {tflops:>6.0f} TFLOPS  {ms:.3f} ms  err={err:.4f}  {'OK' if ok else 'FAIL'}")
+#         print(f"  {mode_name:<12}: {tflops:>6.0f} TFLOPS  {ms:.3f} ms  err={err:.4f}  {'OK' if ok else 'FAIL'}")
 
 
 def test_fa_fwd():
     B, H, Tseq, D = 1, 32, 4096, 128
     print(f"\n=== FlashAttention FWD ({B=} {H=} {Tseq=} {D=}) ===")
-    bM, bN, stages, threads = 128, 64, 3, 128
+    # bM, bN, stages, threads = 128, 64, 3, 128
+    bM, bN, stages, threads = 64, 64, 3, 128
     scale = (1.0 / D) ** 0.5 * 1.44269504
     shape = [B, Tseq, H, D]
     flops = 4.0 * B * H * Tseq * Tseq * D

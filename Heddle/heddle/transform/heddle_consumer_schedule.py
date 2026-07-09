@@ -458,8 +458,33 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
     if not ops:
         return None
 
+    instance_count: Dict[int, int] = {
+        idx: max(1, int(getattr(infos[idx], "op_instance_count", 1)))
+        for idx in ops
+    }
+    expanded_ops: List[Tuple[int, int]] = [
+        (idx, inst)
+        for idx in ops
+        for inst in range(instance_count[idx])
+    ]
+
+    def _children(idx: int) -> List[Tuple[int, int]]:
+        return [(idx, inst) for inst in range(instance_count.get(idx, 1))]
+
+    def _first_child(idx: int) -> Tuple[int, int]:
+        return (idx, 0)
+
+    def _last_child(idx: int) -> Tuple[int, int]:
+        return (idx, instance_count.get(idx, 1) - 1)
+
+    def _single_instance_latency(info: _StmtInfo, total_latency: int, total_issue: int) -> int:
+        count = max(1, int(getattr(info, "op_instance_count", 1)))
+        unit_issue = max(1, (max(int(total_issue), 1) + count - 1) // count)
+        execute = max(int(total_latency) - max(int(total_issue), 1), 0)
+        return unit_issue + execute
+
     # duration 代表发射占用时长（Issue Cycle），单发射模型下统一为 1
-    duration = { key : 1 for key in ops }
+    duration = { key : 1 for key in expanded_ops }
     
     # 硬件发射槽位容量模型 （TMA暂且认为无发射限制。其受带宽影响）
     # H100 一个SM有4个subcore，每个SM上有: 1TMA, 4Tensorcore(但在实际使用时，其需要4个warp协作，一般需要跨subcore), 故总体建模为1个；
@@ -474,29 +499,40 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         # 跨迭代 self hazard 在这里表达的是发射/顺序间隔。
         # 如果对这类边使用完整数据就绪 latency，会强行要求
         # I >= latency，导致后续 joint SMT refine 根本没有机会运行。
-        return max(int(duration.get(idx, 1)), 1)
+        return max(int(duration.get(_first_child(idx), 1)), 1)
+
+    def _has_ordered_issue_slices(info: _StmtInfo) -> bool:
+        semantic = getattr(info, "op_instance_semantic", None)
+        if semantic is not None:
+            return str(semantic) == "issue_slices"
+        return bool(getattr(info, "is_wgmma", False) or getattr(info, "is_true_tma", False))
     
     for idx in ops:
         info = infos[idx]
+        children = _children(idx)
         if info.is_wait_barrier:
             # mbarrier_wait 使用一个独立同步 issue slot；它不能和任意
             # 其它 op 同槽发射，但不能伪装成占满所有 FU。
-            rrt[info.idx] = [{"BARRIER": 1}]
-            latencies[info.idx] = 1  # 屏障等待本身阻塞发射或紧邻同步，设为 1
-            estimated_total_latency += 1
+            unit_duration = 1
+            unit_latency = 1
+            unit_rrt = [{"BARRIER": 1}]
         else:
             if info.is_wgmma:
                 issue_cycles = _detect_wgmma_issue_cycles(info.stmt)
-                duration[info.idx] = issue_cycles  # 指令发射所占的时钟周期
-                rrt[info.idx] = [{"TC": 1} for _ in range(issue_cycles)]
+                unit_duration = max(1, (int(issue_cycles) + len(children) - 1) // len(children))
+                unit_rrt = [{"TC": 1} for _ in range(unit_duration)]
                 latency, _ = _detect_op_latency_and_resource(info.stmt)
             else:
                 latency, rty = _detect_op_latency_and_resource(info.stmt)
                 issue_cycles = _detect_op_issue_cycles(info.stmt)
-                duration[info.idx] = issue_cycles  # 指令发射所占的时钟周期
-                rrt[info.idx] = [{rty.value : 1} for _ in range(issue_cycles)]  # 展开 rrt为 issue 周期数对应的表
-            latencies[info.idx] = latency  # 记录 op总体的 issue+execute 延迟
-            estimated_total_latency += latency
+                unit_duration = max(1, (int(issue_cycles) + len(children) - 1) // len(children))
+                unit_rrt = [{rty.value : 1} for _ in range(unit_duration)]  # 展开 rrt为 issue 周期数对应的表
+            unit_latency = _single_instance_latency(info, int(latency), int(issue_cycles))
+        for child in children:
+            duration[child] = unit_duration  # 指令发射所占的时钟周期
+            rrt[child] = list(unit_rrt)
+            latencies[child] = unit_latency  # 单个展开实例的 issue+execute 延迟
+        estimated_total_latency += unit_latency * len(children)
 
 
     print(f"-------- {latencies=}")
@@ -512,12 +548,21 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         for v, deps in op_deps.items():
             if v not in ops:
                 continue
+            if _has_ordered_issue_slices(infos[v]):
+                for prev_child, next_child in zip(_children(v), _children(v)[1:]):
+                    edges.append((prev_child, next_child, _issue_delay_for_self_edge(v), 0))
             for u in deps:
                 if u not in ops:
                     continue
-                # 消费者 v 必须等生产者 u 的真实计算时延（latencies[u]）结束后才能发射
-                edges.append((u, v, latencies[u], 0))
-                
+                u_children = _children(u)
+                v_children = _children(v)
+                if len(u_children) == len(v_children):
+                    for uc, vc in zip(u_children, v_children):
+                        edges.append((uc, vc, latencies[uc], 0))
+                else:
+                    # 展开倍数不一致时保持保守：消费者首实例等待生产者末实例。
+                    edges.append((_last_child(u), _first_child(v), latencies[_last_child(u)], 0))
+
             # 跨循环依赖关系: 如果读写同一 buffer 则自己存在跨循环依赖
             write_buf_names = set()
             read_buf_names = set()
@@ -527,9 +572,9 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
                 read_buf_names.add(buf.buffer.name)
             intersect = write_buf_names & read_buf_names
             if intersect:
-                edges.append((v, v, _issue_delay_for_self_edge(v), 1))
+                edges.append((_last_child(v), _first_child(v), _issue_delay_for_self_edge(v), 1))
             if infos[v].is_sync_top and infos[v].is_sync_nested:
-                edges.append((v, v, _issue_delay_for_self_edge(v), 1))
+                edges.append((_last_child(v), _first_child(v), _issue_delay_for_self_edge(v), 1))
 
         model = cp_model.CpModel()
 
@@ -538,12 +583,12 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         # (op, absolute_time) 建 BoolVar；WGMMA issue duration 展开后会导致
         # H * duration * I 级别的资源约束爆炸。
         M = {}
-        for v in ops:
+        for v in expanded_ops:
             latest_start = max(0, H - duration[v])
             M[v] = model.NewIntVar(0, latest_start, f"M_{v}")
 
         # Symmetry breaking
-        model.Add(M[ops[0]] == 0)
+        model.Add(M[_first_child(ops[0])] == 0)
         
         # Dependency constraints:
         # M[v] - M[u] + δ*I >= d (此时 d 已经是真实的硬件 latency)
@@ -555,7 +600,7 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         # 模 I 环上不重叠”表达，避免逐时间点枚举 Bool。WGMMA 和 SFU
         # 都会连续占用多个 issue slot。
         phase = {}
-        for v in ops:
+        for v in expanded_ops:
             phase[v] = model.NewIntVar(0, I - 1, f"phase_{v}")
             model.AddModuloEquality(phase[v], M[v], I)
 
@@ -578,7 +623,7 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
             if int(cap) != 1:
                 continue
             resource_ops = [
-                v for v in ops
+                v for v in expanded_ops
                 if any(per_cycle.get(resource_name, 0) for per_cycle in rrt[v])
             ]
             for pos, u in enumerate(resource_ops):
@@ -602,31 +647,32 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
             if getattr(infos[v], "is_wait_barrier", False)
         ]
         barrier_exclusive_pairs = set()
-        for b in barrier_ops:
-            for v in ops:
-                if v == b:
-                    continue
-                u0, v0 = (b, v) if b < v else (v, b)
-                if (u0, v0) in barrier_exclusive_pairs:
-                    continue
-                barrier_exclusive_pairs.add((u0, v0))
-                if not _add_modular_no_overlap(u0, v0, "barrier_slot"):
-                    return None
+        for b_idx in barrier_ops:
+            for b in _children(b_idx):
+                for v in expanded_ops:
+                    if v[0] == b_idx:
+                        continue
+                    u0, v0 = (b, v) if b < v else (v, b)
+                    if (u0, v0) in barrier_exclusive_pairs:
+                        continue
+                    barrier_exclusive_pairs.add((u0, v0))
+                    if not _add_modular_no_overlap(u0, v0, "barrier_slot"):
+                        return None
         
         # Schedule length L = max(M[v] + duration[v]).
         # 注：如果你希望 L 代表全流水线完全排空（包含最后一条指令执行完）的长度，
         # 可以把这里的 duration[v] 替换为 latencies[v]。
         # 目前保持 duration[v] 代表“所有指令发射完毕所需的总周期数”。
         end = {}
-        for v in ops:
+        for v in expanded_ops:
             end[v] = model.NewIntVar(0, H + duration[v], f"end_{v}")
             model.Add(end[v] == M[v] + duration[v])
 
         L = model.NewIntVar(0, H + max(duration.values()), "L")
-        model.AddMaxEquality(L, [end[v] for v in ops])
+        model.AddMaxEquality(L, [end[v] for v in expanded_ops])
 
         BIG = 100
-        model.Minimize(BIG * L - sum(M[v] for v in ops))
+        model.Minimize(BIG * L - sum(M[v] for v in expanded_ops))
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = 5
@@ -635,10 +681,12 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             return None
 
+        expanded_M = {v: solver.Value(M[v]) for v in expanded_ops}
         result = {
             "I": I,
             "L": solver.Value(L),
-            "M": {v: solver.Value(M[v]) for v in ops},
+            "M": {v: min(expanded_M[c] for c in _children(v)) for v in ops},
+            "expanded_M": expanded_M,
         }
 
         # Build modular RRT table for printing.
@@ -648,14 +696,14 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
             row = {"slot": f"{r} mod {I}"}
             for f in capacity:
                 row[f] = []
-            for v in ops:
-                t = result["M"][v]
+            for v in expanded_ops:
+                t = expanded_M[v]
                 for c in range(duration[v]):
                     slot = (t + c) % I
                     if slot == r:
                         for f in capacity:
                             if rrt[v][c].get(f, 0):
-                                row[f].append(v)
+                                row[f].append(v[0] if instance_count.get(v[0], 1) == 1 else f"{v[0]}.{v[1]}")
                                 modified = True
             if modified:
                 table.append(row)
@@ -704,11 +752,13 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
                 ans_lb = None
         stages = 0
         min_ii_plan = None
+        LL = 0
         for i in range(lb,ub+1) :
             print(f"\r[Modulo Sched] Trying : I = {i} ...", end="", flush=True)
             ans = cached_solve_for_I(i)
             if ans is not None :
                 stages = (ans['L'] + ans['I'] - 1) // ans['I']
+                LL = ans['L']
                 ans["num_stages"] = stages
                 min_ii_plan = ans
                 rets.append(ans);break
@@ -716,8 +766,8 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         print(f"--- naive mod sched : 最大stage = {stages}")
         if start_ii <= 1 :
             # --------- 补充其他 I ： estimated_total_latency 取 不同分位
-            for delta in [0.6, 0.7, 0.8 ,0.9] :
-                ii = delta * estimated_total_latency
+            for delta in [0.5, 1] :
+                ii = delta * LL
                 ans = cached_solve_for_I(int(ii))
                 if ans is not None:
                     stages = (ans['L'] + ans['I'] - 1) // ans['I']
@@ -1077,6 +1127,39 @@ def _solve_smt_joint_optimize(
     ops = list(all_indices)
     if not ops:
         return None
+
+    instance_count: Dict[int, int] = {
+        idx: max(1, int(getattr(infos[idx], "op_instance_count", 1)))
+        for idx in ops
+    }
+
+    def _children(idx: int) -> List[Tuple[int, int]]:
+        return [(idx, inst) for inst in range(instance_count.get(idx, 1))]
+
+    def _first_child(idx: int) -> Tuple[int, int]:
+        return (idx, 0)
+
+    def _last_child(idx: int) -> Tuple[int, int]:
+        return (idx, instance_count.get(idx, 1) - 1)
+
+    def _child_name(child: Tuple[int, int]) -> str:
+        idx, inst = child
+        if instance_count.get(idx, 1) == 1:
+            return f"s{idx}"
+        return f"s{idx}__u{inst}"
+
+    def _child_stmt_idx(name: str) -> Optional[int]:
+        if not isinstance(name, str) or not name.startswith("s"):
+            return None
+        body = name[1:].split("__u", 1)[0]
+        try:
+            return int(body)
+        except ValueError:
+            return None
+
+    expanded_ops: List[Tuple[int, int]] = [
+        child for idx in ops for child in _children(idx)
+    ]
     
     expect_consumer_warps = int(mod_sched_plan.get('heddle_expect_consumer_warps', 4))
     print(f"heddle expected consumer_warps = {expect_consumer_warps}")
@@ -1092,8 +1175,20 @@ def _solve_smt_joint_optimize(
     if base_I <= 0:
         return dict(mod_sched_plan)
     
-    expect_num_stage = (base_L + base_I - 1) // base_I  # ceil(L/I) 预计stages
-    print(f'{expect_num_stage=}')
+    expect_num_stage = (base_L + base_I - 1) // base_I  # ceil(L/I) naive window stages
+    try:
+        original_num_stages = int(mod_sched_plan.get("heddle_original_num_stages", 0))
+    except (TypeError, ValueError):
+        original_num_stages = 0
+    smem_estimate_num_stage = (
+        min(expect_num_stage, original_num_stages)
+        if original_num_stages > 0 else
+        expect_num_stage
+    )
+    print(
+        f"{expect_num_stage=} smem_estimate_num_stage={smem_estimate_num_stage}",
+        flush=True,
+    )
     _rtype_map = {
         "TMA": ResourceType.TMA,
         "TC": ResourceType.TensorCore,
@@ -1109,6 +1204,10 @@ def _solve_smt_joint_optimize(
         ResourceType.SFU: 16,
         ResourceType.Barrier: 1,
     }
+    subcore_capacity = {
+        ResourceType.ALU: int(capacity[ResourceType.ALU]),
+        ResourceType.SFU: int(capacity[ResourceType.SFU]),
+    }
     
     def _resource_for_info(info: _StmtInfo) -> ResourceType:
         if getattr(info, "is_wait_barrier", False):
@@ -1118,29 +1217,44 @@ def _solve_smt_joint_optimize(
         _, rty = _detect_op_latency_and_resource(info.stmt)
         return _rtype_map.get(getattr(rty, "value", str(rty)), ResourceType.ALU)
 
+    def _single_instance_latency(info: _StmtInfo) -> int:
+        total_latency, _ = _detect_op_latency_and_resource(info.stmt)
+        if getattr(info, "is_wgmma", False):
+            total_issue = _detect_wgmma_issue_cycles(info.stmt)
+        else:
+            total_issue = _detect_op_issue_cycles(info.stmt)
+        count = max(1, int(getattr(info, "op_instance_count", 1)))
+        unit_issue = max(1, (max(int(total_issue), 1) + count - 1) // count)
+        execute = max(int(total_latency) - max(int(total_issue), 1), 0)
+        return unit_issue + execute
+
     def _latency_for_info(info: _StmtInfo) -> int:
-        # Keep the joint solver at the same abstraction level as
-        # _solve_naive_modulo_sched: TMA and wait barriers consume one issue
-        # slot here. Their long data-ready / synchronization semantics are
-        # represented by explicit barrier ordering and resource constraints,
-        # not by turning every dependent edge into a long latency edge.
-        if getattr(info, "is_wait_barrier", False) or getattr(info, "is_true_tma", False):
+        # Match _solve_naive_modulo_sched: each expanded child uses one leaf
+        # op's issue latency plus the execute latency from the table.
+        if getattr(info, "is_wait_barrier", False):
             return 1
-        latency, _ = _detect_op_latency_and_resource(info.stmt)
-        return max(int(latency), 1)
+        return _single_instance_latency(info)
 
     def _dependency_delay_for_info(info: _StmtInfo) -> int:
         if getattr(info, "is_wait_barrier", False):
             return 1
-        latency, _ = _detect_op_latency_and_resource(info.stmt)
-        return max(int(latency), 1)
+        return _single_instance_latency(info)
 
     def _issue_delay_for_self_edge(info: _StmtInfo) -> int:
         if getattr(info, "is_wait_barrier", False):
             return 1
         if getattr(info, "is_wgmma", False):
-            return max(int(_detect_wgmma_issue_cycles(info.stmt)), 1)
-        return max(int(_detect_op_issue_cycles(info.stmt)), 1)
+            total = max(int(_detect_wgmma_issue_cycles(info.stmt)), 1)
+        else:
+            total = max(int(_detect_op_issue_cycles(info.stmt)), 1)
+        count = max(1, int(getattr(info, "op_instance_count", 1)))
+        return max(1, (total + count - 1) // count)
+
+    def _has_ordered_issue_slices(info: _StmtInfo) -> bool:
+        semantic = getattr(info, "op_instance_semantic", None)
+        if semantic is not None:
+            return str(semantic) == "issue_slices"
+        return bool(getattr(info, "is_wgmma", False) or getattr(info, "is_true_tma", False))
 
     def _reservation_for_info(info: _StmtInfo, rty: ResourceType) -> List[Dict[ResourceType, int]]:
         # wait/try_wait barrier 会阻塞当前发射 warp；这里把它建模成
@@ -1149,9 +1263,9 @@ def _solve_smt_joint_optimize(
         if getattr(info, "is_wait_barrier", False):
             return [{ResourceType.Barrier: 1}]
         if getattr(info, "is_wgmma", False):
-            issue_cycles = _detect_wgmma_issue_cycles(info.stmt)
+            issue_cycles = _issue_delay_for_self_edge(info)
             return [{ResourceType.TensorCore: 1} for _ in range(issue_cycles)]
-        issue_cycles = _detect_op_issue_cycles(info.stmt)
+        issue_cycles = _issue_delay_for_self_edge(info)
         return [{rty: 1} for _ in range(max(int(issue_cycles), 1))]
     
     def _is_multiversioned_smem_buffer(buf: tvm.tir.Buffer) -> bool:
@@ -1276,7 +1390,7 @@ def _solve_smt_joint_optimize(
 
     wait_reader_pairs = _shared_wait_reader_pairs()
     same_warpgroup_pairs = [
-        (f"s{wait_idx}", f"s{reader_idx}")
+        (_child_name(_first_child(wait_idx)), _child_name(_first_child(reader_idx)))
         for wait_idx, reader_idx in wait_reader_pairs
         if wait_idx in all_indices and reader_idx in all_indices
     ]
@@ -1296,7 +1410,7 @@ def _solve_smt_joint_optimize(
         pipeline stage count; reflect that expansion in the solver's SMEM
         footprint instead of waiting for the IR rewrite.
         """
-        if expect_num_stage <= 1 or base_I <= 0:
+        if smem_estimate_num_stage <= 1 or base_I <= 0:
             return {}
 
         buffer_events: Dict[str, Dict[str, object]] = {}
@@ -1325,7 +1439,7 @@ def _solve_smt_joint_optimize(
             writes = list(entry.get("writes", []))
             reads = list(entry.get("reads", []))
             if bool(entry.get("is_barrier")) and not writes:
-                factors[buffer_name] = max(1, int(expect_num_stage))
+                factors[buffer_name] = max(1, int(smem_estimate_num_stage))
                 continue
             if not writes:
                 continue
@@ -1341,11 +1455,12 @@ def _solve_smt_joint_optimize(
                 continue
 
             # Count how many logical loop iterations keep this buffer live in
-            # the naive modulo window.  This is bounded by expect_num_stage,
-            # matching MultiVersionBuffer's physical ring-buffer size.
+            # the naive modulo window.  This is bounded by the physical stage
+            # estimate, matching MultiVersionBuffer's ring-buffer size rather
+            # than the larger baseline search window.
             max_live_copies = 1
-            iter_span = range(-expect_num_stage, expect_num_stage + 1)
-            version_window = max(base_L, base_I * max(expect_num_stage, 1), base_I)
+            iter_span = range(-smem_estimate_num_stage, smem_estimate_num_stage + 1)
+            version_window = max(base_L, base_I * max(smem_estimate_num_stage, 1), base_I)
             for tau in range(version_window):
                 live_iters: Set[int] = set()
                 for _, write_t, _ in writes:
@@ -1368,7 +1483,7 @@ def _solve_smt_joint_optimize(
                 if len(live_iters) > max_live_copies:
                     max_live_copies = len(live_iters)
 
-            factors[buffer_name] = max(1, min(int(expect_num_stage), max_live_copies))
+            factors[buffer_name] = max(1, min(int(smem_estimate_num_stage), max_live_copies))
 
         return factors
 
@@ -1379,27 +1494,32 @@ def _solve_smt_joint_optimize(
     
     nodes: List[OpNode] = []
     node_by_idx: Dict[int, OpNode] = {}
-    for idx in ops:
+    node_by_child: Dict[Tuple[int, int], OpNode] = {}
+    child_by_name: Dict[str, Tuple[int, int]] = {}
+    for child in expanded_ops:
+        idx, inst = child
         info = infos[idx]
         rty = _resource_for_info(info)
         latency = _latency_for_info(info)
         outputs: List[OutputValue] = []
-        for buffer_name in op_buffer_writes.get(idx, []):
-            buf_value = buffer_values[buffer_name]
-            outputs.append(OutputValue(
-                name=f"s{idx}_w_{buffer_name}",
-                storage=buf_value.storage,
-                footprint_bytes=buf_value.footprint_bytes,
-                lifetime=LifetimeSemantic.DEAD_ON_ENTRY,
-                buffer_name=buffer_name,
-            ))
+        if child == _last_child(idx):
+            for buffer_name in op_buffer_writes.get(idx, []):
+                buf_value = buffer_values[buffer_name]
+                outputs.append(OutputValue(
+                    name=f"{_child_name(child)}_w_{buffer_name}",
+                    storage=buf_value.storage,
+                    footprint_bytes=buf_value.footprint_bytes,
+                    lifetime=LifetimeSemantic.DEAD_ON_ENTRY,
+                    buffer_name=buffer_name,
+                ))
         
         need_warpgroup = info.is_wgmma
         single_warp_eligible = info.is_true_tma
         wc = 4 if need_warpgroup else 1  # producer consumer 都按WG安排；barrier可能需要特殊处理
         _is_variable_latency = info.is_true_tma  # 只有真正的 TMA load 按 variable latency 建模
+        name = _child_name(child)
         node = OpNode(
-            name=f"s{idx}",
+            name=name,
             resource_type=rty,
             latency=latency,
             reservation=_reservation_for_info(info, rty),
@@ -1410,14 +1530,29 @@ def _solve_smt_joint_optimize(
             replicable=single_warp_eligible
         )
         nodes.append(node)
-        node_by_idx[idx] = node
+        node_by_child[child] = node
+        child_by_name[name] = child
+        if inst == 0:
+            node_by_idx[idx] = node
 
     # 同一轮迭代内的依赖边，来自 IR 分析得到的 op_deps 图。
     for v, deps in op_deps.items():
-        if v not in node_by_idx:
+        if v not in ops:
             continue
+        v_children = _children(v)
+        if _has_ordered_issue_slices(infos[v]):
+            for prev_child, next_child in zip(v_children, v_children[1:]):
+                # Hardware issue slices from one TIR statement are one
+                # instruction stream, so hints are not enough: keep them
+                # ordered. Element/data lanes such as softmax unrolls are
+                # intentionally not serialized here.
+                node_by_child[next_child].add_dependency(
+                    node_by_child[prev_child],
+                    distance=0,
+                    delay=_issue_delay_for_self_edge(infos[v]),
+                )
         for u in deps:
-            if u not in node_by_idx:
+            if u not in ops:
                 continue
             # deps_all already contains the conservative ordering needed for
             # sync/barrier statements. Do not upgrade every sync parent edge to
@@ -1425,11 +1560,18 @@ def _solve_smt_joint_optimize(
             # warp and a long active-window exclusion, which is stronger than
             # the issue-slot model used by the modulo scheduler and makes real
             # producer/consumer graphs presolve UNSAT.
-            node_by_idx[v].add_dependency(
-                node_by_idx[u],
-                distance=0,
-                delay=_dependency_delay_for_info(infos[u]),
-            )
+            u_children = _children(u)
+            v_children = _children(v)
+            if len(u_children) == len(v_children):
+                pairs = list(zip(u_children, v_children))
+            else:
+                pairs = [(_last_child(u), _first_child(v))]
+            for u_child, v_child in pairs:
+                node_by_child[v_child].add_dependency(
+                    node_by_child[u_child],
+                    distance=0,
+                    delay=_dependency_delay_for_info(infos[u]),
+                )
 
     # 跨迭代 hazard 与 _solve_naive_modulo_sched 保持一致：
     # 如果一个 stmt 同时读写同一个 buffer，或者它是 sync-like 阻塞语句，
@@ -1439,14 +1581,14 @@ def _solve_smt_joint_optimize(
         write_bufs = set(op_buffer_writes.get(idx, []))
         read_bufs = set(op_buffer_reads.get(idx, []))
         if write_bufs & read_bufs:
-            node_by_idx[idx].add_dependency(
-                node_by_idx[idx],
+            node_by_child[_first_child(idx)].add_dependency(
+                node_by_child[_last_child(idx)],
                 distance=1,
                 delay=_issue_delay_for_self_edge(info),
             )
         if info.is_wait_barrier :
-            node_by_idx[idx].add_dependency(
-                node_by_idx[idx],
+            node_by_child[_first_child(idx)].add_dependency(
+                node_by_child[_last_child(idx)],
                 distance=1,
                 delay=_issue_delay_for_self_edge(info),
             )
@@ -1489,19 +1631,62 @@ def _solve_smt_joint_optimize(
         for name, buf_value in buffer_values.items()
         if buf_value.storage == StorageKind.SMEM and int(buf_value.footprint_bytes) > 0
     }
+    # 初筛：如果shm 或 reg 超过限制太多，则直接判fail
     smem_allocation_floor = sum(smem_allocations_by_buffer.values())
-    if smem_allocation_floor > smem_limit:
+    if smem_allocation_floor > smem_limit :
         print(
-            f"---- SHM 到达 smem_limit 限制（按 input/output bufferName 聚合）: {smem_limit} -> {smem_allocation_floor}",
+            f"---- [Fail] SHM 到达 smem_limit 限制（按 input/output bufferName 聚合）: {smem_limit} -> {smem_allocation_floor}",
             flush=True,
         )
-        smem_limit = smem_allocation_floor
-        print(f"--- 调整 smem_limit 为 {smem_limit}")
+        return None
 
     # SMT 优化器使用 naive plan 的基础窗口；如果 naive 的绝对调度时间
     # 比记录的 L 更宽，则补一点 slack，避免可行解被窗口截断。
     base_max_time = max((int(base_M.get(v, 0)) for v in ops), default=0)
     window = max(base_L, base_max_time + 1, base_I)
+
+    def _expanded_start_hints() -> Dict[str, int]:
+        hints: Dict[str, int] = {}
+        expanded_hint = mod_sched_plan.get("expanded_M", {})
+        for child in expanded_ops:
+            if child in expanded_hint:
+                hints[_child_name(child)] = int(expanded_hint[child])
+                continue
+            idx, inst = child
+            base_t = int(base_M.get(idx, 0))
+            step = _issue_delay_for_self_edge(infos[idx])
+            hints[_child_name(child)] = base_t + inst * step
+        return hints
+
+    def _collapse_schedule(schedule: Dict[str, int]) -> Dict[int, int]:
+        collapsed: Dict[int, int] = {}
+        for idx in ops:
+            vals = [
+                int(schedule[_child_name(child)])
+                for child in _children(idx)
+                if _child_name(child) in schedule
+            ]
+            if vals:
+                collapsed[idx] = min(vals)
+        return collapsed
+
+    def _collapse_warp_assign(warp_assign: Dict[str, int]) -> Dict[int, int]:
+        collapsed: Dict[int, int] = {}
+        for idx in ops:
+            for child in _children(idx):
+                name = _child_name(child)
+                if name in warp_assign:
+                    collapsed[idx] = int(warp_assign[name])
+                    break
+        return collapsed
+
+    def _collapsed_end_time(idx: int, start_time: int) -> int:
+        total_issue = sum(
+            max(len(node_by_child[child].reservation), 1)
+            for child in _children(idx)
+            if child in node_by_child
+        )
+        return int(start_time) + max(1, total_issue)
 
     def _run_joint_solver(
         *, ii : int, solve_window: int, optimize: bool,
@@ -1509,6 +1694,7 @@ def _solve_smt_joint_optimize(
         enable_liveness: bool = True,
         log_search_progress:bool = False,
         not_all_same_warpgroup_sets: Optional[List[Tuple[str, ...]]] = None,
+        same_subcore_exclusion_pairs: Optional[List[Tuple[str, str]]] = None,
     ):
         solver = HeddleScheduler(
             nodes,
@@ -1516,18 +1702,19 @@ def _solve_smt_joint_optimize(
             reg_limit=solve_reg_limit,
             smem_limit=solve_smem_limit,
             num_warps=num_warps,
-            timeout_ms=int(mod_sched_plan.get("timeout_ms", 15000)),
+            timeout_ms=int(mod_sched_plan.get("timeout_ms", 30000)),
             enable_liveness=enable_liveness,
             liveness_checkpoint_step=int(mod_sched_plan.get("liveness_checkpoint_step", 8)),
             start_hints={
-                f"s{idx}": int(t)
-                for idx, t in base_M.items()
-                if idx in node_by_idx
+                name: int(t)
+                for name, t in _expanded_start_hints().items()
+                if name in child_by_name
             },
             smem_allocations=smem_allocations_by_buffer,
             log_search_progress=log_search_progress,
             same_warpgroup_pairs=same_warpgroup_pairs,
             not_all_same_warpgroup_sets=not_all_same_warpgroup_sets,
+            same_subcore_exclusion_pairs=same_subcore_exclusion_pairs,
         )
         return solver.schedule_joint(
             min_ii=ii,
@@ -1553,54 +1740,120 @@ def _solve_smt_joint_optimize(
         check_smem_limit: int,
     ) -> Tuple[bool, Dict[str, object]]:
         fixed_M = {
-            idx: int(schedule[f"s{idx}"])
-            for idx in ops
-            if f"s{idx}" in schedule
+            child: int(schedule[_child_name(child)])
+            for child in expanded_ops
+            if _child_name(child) in schedule
         }
-        if len(fixed_M) != len(ops):
-            missing = [idx for idx in ops if idx not in fixed_M]
+        if len(fixed_M) != len(expanded_ops):
+            missing = [_child_name(child) for child in expanded_ops if child not in fixed_M]
             return False, {"reason": f"missing schedule for {missing}"}
 
         fixed_warps = {
-            idx: _selected_warps_for_node(node_by_idx[idx], int(warp_assign.get(f"s{idx}", 0)))
-            for idx in ops
-            if idx in node_by_idx
+            child: _selected_warps_for_node(node_by_child[child], int(warp_assign.get(_child_name(child), 0)))
+            for child in expanded_ops
+            if child in node_by_child
         }
+
+        def _resource_name(rty: ResourceType) -> str:
+            value = getattr(rty, "value", None)
+            if value is not None:
+                return str(value)
+            name = getattr(rty, "name", None)
+            if name is not None:
+                return str(name)
+            return str(rty)
+
+        def _check_fixed_issue_resources() -> Optional[Dict[str, object]]:
+            fu_usage: Dict[Tuple[int, ResourceType], int] = {}
+            fu_users: Dict[Tuple[int, ResourceType], List[str]] = {}
+            fu_subcore_usage: Dict[Tuple[int, int, ResourceType], int] = {}
+            fu_subcore_users: Dict[Tuple[int, int, ResourceType], List[str]] = {}
+            for child in expanded_ops:
+                node = node_by_child[child]
+                start = fixed_M[child]
+                child_name = _child_name(child)
+                for off, per_cycle in enumerate(node.reservation):
+                    phase = (start + off) % base_I
+                    for rty, used in per_cycle.items():
+                        used_count = int(used)
+                        if used_count <= 0:
+                            continue
+                        key = (phase, rty)
+                        fu_usage[key] = fu_usage.get(key, 0) + used_count
+                        fu_users.setdefault(key, []).append(child_name)
+                        limit = int(capacity.get(rty, 0))
+                        if limit > 0 and fu_usage[key] > limit:
+                            return {
+                                "reason": "fu_limit",
+                                "phase": phase,
+                                "resource": _resource_name(rty),
+                                "usage": fu_usage[key],
+                                "limit": limit,
+                                "users": fu_users.get(key, [])[:12],
+                            }
+
+                        subcore_limit = int(subcore_capacity.get(rty, 0))
+                        if subcore_limit <= 0:
+                            continue
+                        for warp_id in fixed_warps.get(child, [0]):
+                            subcore = int(warp_id) % 4
+                            subcore_key = (phase, subcore, rty)
+                            fu_subcore_usage[subcore_key] = (
+                                fu_subcore_usage.get(subcore_key, 0) + used_count
+                            )
+                            fu_subcore_users.setdefault(subcore_key, []).append(child_name)
+                            if fu_subcore_usage[subcore_key] > subcore_limit:
+                                return {
+                                    "reason": "fu_subcore_limit",
+                                    "phase": phase,
+                                    "subcore": subcore,
+                                    "resource": _resource_name(rty),
+                                    "usage": fu_subcore_usage[subcore_key],
+                                    "limit": subcore_limit,
+                                    "users": fu_subcore_users.get(subcore_key, [])[:12],
+                                }
+            return None
+
+        resource_error = _check_fixed_issue_resources()
+        if resource_error is not None:
+            resource_error["base_I"] = base_I
+            return False, resource_error
 
         all_outputs: List[Tuple[int, OutputValue]] = []
         output_name_to_xi: Dict[str, int] = {}
-        for idx in ops:
-            node = node_by_idx[idx]
+        for child in expanded_ops:
+            node = node_by_child[child]
             for out in node.outputs:
                 output_name_to_xi[out.name] = len(all_outputs)
-                all_outputs.append((idx, out))
+                all_outputs.append((child, out))
 
         consumers_of: Dict[int, List[Tuple[int, int]]] = {}
         for v_node in nodes:
-            vi = int(v_node.name[1:])
+            v_child = child_by_name.get(v_node.name)
+            if v_child is None:
+                continue
             for par in v_node.parents:
-                ui = int(par.name[1:])
                 delta = int(v_node.dependency_distance.get(par.name, 0))
                 for oval in par.outputs:
                     xi = output_name_to_xi.get(oval.name)
                     if xi is not None:
-                        consumers_of.setdefault(xi, []).append((vi, delta))
+                        consumers_of.setdefault(xi, []).append((v_child, delta))
 
         max_iter_overlap = (max(int(check_L), 1) - 1) // max(int(base_I), 1)
         iter_offsets = range(-max_iter_overlap, max_iter_overlap + 1)
 
         def _copy_live(xi: int, iter_offset: int, tau: int) -> bool:
-            producer_idx, oval = all_outputs[xi]
-            if fixed_M[producer_idx] + iter_offset * base_I > tau:
+            producer_child, oval = all_outputs[xi]
+            if fixed_M[producer_child] + iter_offset * base_I > tau:
                 return False
             if oval.lifetime != LifetimeSemantic.DEAD_ON_ENTRY:
                 return True
             consumers = consumers_of.get(xi, [])
             if not consumers:
                 return False
-            producer_lat = int(node_by_idx[producer_idx].latency)
-            for consumer_idx, distance in consumers:
-                consume_time = fixed_M[consumer_idx] + (iter_offset + distance) * base_I
+            producer_lat = int(node_by_child[producer_child].latency)
+            for consumer_child, distance in consumers:
+                consume_time = fixed_M[consumer_child] + (iter_offset + distance) * base_I
                 if producer_lat == 0:
                     consume_time += 1
                 if consume_time > tau:
@@ -1619,7 +1872,7 @@ def _solve_smt_joint_optimize(
             reg_live_bytes: Dict[int, Dict[Tuple[str, int], int]] = {
                 w: {} for w in range(num_warps)
             }
-            for xi, (producer_idx, oval) in enumerate(all_outputs):
+            for xi, (producer_child, oval) in enumerate(all_outputs):
                 if oval.footprint_bytes <= 0:
                     continue
                 live_any_copy = False
@@ -1635,7 +1888,7 @@ def _solve_smt_joint_optimize(
                     if oval.storage == StorageKind.RMEM:
                         buffer_key = oval.rmem_buffer_key()
                         copy_key = (buffer_key, int(iter_offset))
-                        for w in fixed_warps.get(producer_idx, [0]):
+                        for w in fixed_warps.get(producer_child, [0]):
                             reg_live_bytes.setdefault(w, {})
                             reg_live_bytes[w][copy_key] = max(
                                 reg_live_bytes[w].get(copy_key, 0),
@@ -1716,14 +1969,10 @@ def _solve_smt_joint_optimize(
         if opt_sol is not None:
             opt_schedule = opt_sol.get("schedule", {})
             opt_warp_assign = opt_sol.get("warp_assign", {})
-            opt_M = {
-                idx: int(opt_schedule[f"s{idx}"])
-                for idx in ops
-                if f"s{idx}" in opt_schedule and idx in node_by_idx
-            }
+            opt_M = _collapse_schedule(opt_schedule)
             opt_L = max(
                 (
-                    t + max(len(node_by_idx[idx].reservation), 1)
+                    _collapsed_end_time(idx, t)
                     for idx, t in opt_M.items()
                 ),
                 default=feasible_window,
@@ -1781,8 +2030,8 @@ def _solve_smt_joint_optimize(
 
         peak_producers: List[str] = []
         for buffer_name in peak_buffers:
-            for idx in ops:
-                node = node_by_idx.get(idx)
+            for child in expanded_ops:
+                node = node_by_child.get(child)
                 if node is None:
                     continue
                 if bool(getattr(node, "is_varialble_latency", False)):
@@ -1802,8 +2051,27 @@ def _solve_smt_joint_optimize(
         )
         return [feedback_set]
 
+    def _subcore_feedback_from_live_info(live_info: Dict[str, object]) -> List[Tuple[str, str]]:
+        if live_info.get("reason") != "fu_subcore_limit":
+            return []
+        users = [
+            str(user)
+            for user in (live_info.get("users") or [])
+            if isinstance(user, str)
+        ]
+        if len(users) < 2:
+            return []
+        pair = tuple(sorted((users[0], users[1])))
+        print(
+            f"---- Round2 subcore feedback: conflict_pair={pair}, "
+            f"constraint=same_subcore_no_overlap",
+            flush=True,
+        )
+        return [pair]
+
     
     def _find_solution_and_check_liveliness() :
+        subcore_feedback_pairs: List[Tuple[str, str]] = []
         for solve_window in candidate_windows:
             print(f'[SMT] 遍历空间找最优解 : I= {base_I} L = {solve_window}',flush=True)
             sol = _run_joint_solver(
@@ -1813,7 +2081,8 @@ def _solve_smt_joint_optimize(
                 solve_reg_limit=reg_limit,
                 solve_smem_limit=smem_limit,
                 enable_liveness=False,
-                log_search_progress=False
+                log_search_progress=False,
+                same_subcore_exclusion_pairs=subcore_feedback_pairs,
             )
             live_ok, live_info = _post_check_liveliness(sol)
             if live_ok:
@@ -1824,6 +2093,35 @@ def _solve_smt_joint_optimize(
                 }
                 print(f"最优解求解成功 I={base_I}, L={solve_window}")
                 return (sol, liveness_info)
+
+            new_subcore_pairs = _subcore_feedback_from_live_info(live_info)
+            if new_subcore_pairs:
+                for pair in new_subcore_pairs:
+                    if pair not in subcore_feedback_pairs:
+                        subcore_feedback_pairs.append(pair)
+                print(f'[SMT] Round2: 添加subcore冲突pair约束后重试 L = {solve_window}', flush=True)
+                sol_subcore = _run_joint_solver(
+                    ii=base_I,
+                    solve_window=solve_window,
+                    optimize=True,
+                    solve_reg_limit=reg_limit,
+                    solve_smem_limit=smem_limit,
+                    enable_liveness=False,
+                    log_search_progress=False,
+                    same_subcore_exclusion_pairs=subcore_feedback_pairs,
+                )
+                live_ok_subcore, live_info_subcore = _post_check_liveliness(sol_subcore)
+                if live_ok_subcore:
+                    liveness_info = {
+                        "reg_peak": sol_subcore.get("reg_peak", {}),
+                        "smem_peak": sol_subcore.get("smem_peak"),
+                        "source": "round2_subcore_feedback",
+                        "subcore_feedback_pairs": subcore_feedback_pairs,
+                    }
+                    print(f"Round2 subcore feedback 求解成功 I={base_I}, L={solve_window}")
+                    return (sol_subcore, liveness_info)
+                print(f"Round2 subcore feedback 后仍失败: {live_info_subcore}", flush=True)
+                live_info = live_info_subcore
 
             feedback_sets = _reg_feedback_from_live_info(live_info)
             if feedback_sets:
@@ -1863,14 +2161,10 @@ def _solve_smt_joint_optimize(
     if not liveness_info:
         sol_schedule = sol.get("schedule", {})
         sol_warp_assign = sol.get("warp_assign", {})
-        sol_M = {
-            idx: int(sol_schedule[f"s{idx}"])
-            for idx in ops
-            if f"s{idx}" in sol_schedule and idx in node_by_idx
-        }
+        sol_M = _collapse_schedule(sol_schedule)
         sol_L = max(
             (
-                t + max(len(node_by_idx[idx].reservation), 1)
+                _collapsed_end_time(idx, t)
                 for idx, t in sol_M.items()
             ),
             default=window,
@@ -1896,20 +2190,16 @@ def _solve_smt_joint_optimize(
     schedule = sol.get("schedule", {})
     warp_assign = sol.get("warp_assign", {})
     variable_lifetimes = sol.get("variable_lifetimes",[])
-    optimized_M = {
-        idx: int(schedule[f"s{idx}"])
-        for idx in ops
-        if f"s{idx}" in schedule
-    }
+    optimized_M = _collapse_schedule(schedule)
     for idx in ops:
         if idx not in optimized_M and idx in base_M:
             optimized_M[idx] = int(base_M[idx])
 
     optimized_L = max(
         (
-            t + max(len(node_by_idx[idx].reservation), 1)
+            _collapsed_end_time(idx, t)
             for idx, t in optimized_M.items()
-            if idx in node_by_idx
+            if idx in ops
         ),
         default=0,
     )
@@ -1925,16 +2215,20 @@ def _solve_smt_joint_optimize(
         for f in ("TMA", "TC", "ALU", "SFU", "BARRIER"):
             row[f] = []
         modified=False
-        for idx in ops:
-            t = optimized_M.get(idx)
-            if t is None or idx not in node_by_idx:
+        for child in expanded_ops:
+            name = _child_name(child)
+            t = schedule.get(name)
+            if t is None or child not in node_by_child:
                 continue
-            for c, per_cycle in enumerate(node_by_idx[idx].reservation):
-                if (t + c) % base_I != r:
+            for c, per_cycle in enumerate(node_by_child[child].reservation):
+                if (int(t) + c) % base_I != r:
                     continue
                 for rty, used in per_cycle.items():
                     if int(used):
-                        row.setdefault(rty.value, []).append(idx)
+                        idx = child[0]
+                        row.setdefault(rty.value, []).append(
+                            idx if instance_count.get(idx, 1) == 1 else f"{idx}.{child[1]}"
+                        )
                         modified=True
         if modified:
             table.append(row)
@@ -1946,11 +2240,7 @@ def _solve_smt_joint_optimize(
         "M": optimized_M,
         "status": "SMT_OPTIMIZED" if solved_with_optimize else "SMT_FEASIBLE",
         "window": int(sol.get("window", window)),
-        "warp_assign": {
-            int(name[1:]): int(w)
-            for name, w in warp_assign.items()
-            if isinstance(name, str) and name.startswith("s") and name[1:].isdigit()
-        },
+        "warp_assign": _collapse_warp_assign(warp_assign),
         "reg_peak": liveness_info.get("reg_peak", sol.get("reg_peak", {})),
         "smem_peak": liveness_info.get("smem_peak"),
         "variable_lifetimes": sol.get("variable_lifetimes", {}),
@@ -3409,6 +3699,7 @@ def _transform_pipeline_loop(
             for plan in mod_sched_plans :
                 print('----start  _solve_smt_joint_optimize', flush=True)
                 plan['heddle_expect_consumer_warps'] = consumer_num_warps  # 传入用户期望的 consumer_warps 数目
+                plan['heddle_original_num_stages'] = num_stages
                 optimized =  _solve_smt_joint_optimize( deps_all,infos_list,all_indices,plan, kernel_num_threads=func_num_threads,)
                 if optimized is None :
                     last_unfeasible_ii = plan['I']
@@ -3438,6 +3729,8 @@ def _transform_pipeline_loop(
                     naive_plans = _solve_naive_modulo_sched(
                         deps_all, infos_list, all_indices, start_ii=ii)
                     for naive_p in naive_plans:
+                        naive_p['heddle_expect_consumer_warps'] = consumer_num_warps
+                        naive_p['heddle_original_num_stages'] = num_stages
                         optimized_p = _solve_smt_joint_optimize(
                             deps_all, infos_list, all_indices, naive_p,
                             kernel_num_threads=func_num_threads,

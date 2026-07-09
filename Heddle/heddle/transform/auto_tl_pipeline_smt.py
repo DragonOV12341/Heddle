@@ -321,6 +321,10 @@ def _is_tma_call(call: tvm.tir.Call) -> bool:
     return call.op.name in {"tl.tma_load", "tl.tma_load_im2col", "tir.tma_load"}
 
 
+def _is_unrolled_for(op: tvm.tir.For) -> bool:
+    return op.kind == tvm.tir.ForKind.UNROLLED
+
+
 def _count_calls_with_static_loop_multiplier(stmt: tvm.tir.Stmt, pred) -> int:
     count = 0
     loop_multiplier = 1
@@ -330,7 +334,7 @@ def _count_calls_with_static_loop_multiplier(stmt: tvm.tir.Stmt, pred) -> int:
         def visit_for_(self, op):
             nonlocal loop_multiplier
             extent = _static_positive_int(op.extent)
-            if extent is None:
+            if extent is None or not _is_unrolled_for(op):
                 super().visit_for_(op)
                 return
 
@@ -358,7 +362,7 @@ def _count_stmt_ops_with_static_loop_multiplier(stmt: tvm.tir.Stmt, pred) -> int
         def visit_for_(self, op):
             nonlocal loop_multiplier
             extent = _static_positive_int(op.extent)
-            if extent is None:
+            if extent is None or not _is_unrolled_for(op):
                 super().visit_for_(op)
                 return
 
@@ -381,6 +385,117 @@ def _count_stmt_ops_with_static_loop_multiplier(stmt: tvm.tir.Stmt, pred) -> int
 
     CountVisitor().visit_stmt(stmt)
     return count
+
+
+def _contains_returning_extern_call(expr: tvm.tir.PrimExpr) -> bool:
+    found = False
+
+    def _visit(node):
+        nonlocal found
+        if found:
+            return
+        if not isinstance(node, tvm.tir.Call):
+            return
+        try:
+            if not isinstance(node.op, tvm.ir.Op):
+                return
+            if node.op.name == "tir.call_extern":
+                found = True
+        except Exception:
+            return
+
+    tvm.tir.stmt_functor.post_order_visit(expr, _visit)
+    return found
+
+
+def _last_returning_store_static_unroll_multiplier(stmt: tvm.tir.Stmt) -> Optional[int]:
+    """Find the static-unroll multiplicity for the last returned-value store.
+
+    Some softmax/reduction fragments are one top-level op whose useful result is
+    produced by a nested extern call, e.g. an AllReduce inside ``T.unroll(2)``.
+    Treat those as two op instances instead of counting every internal leaf in
+    the reduction tree.
+    """
+    loop_multiplier = 1
+    last_multiplier: Optional[int] = None
+
+    @tir.functor.visitor
+    class StoreVisitor(tir.PyStmtExprVisitor):
+        def visit_for_(self, op):
+            nonlocal loop_multiplier
+            extent = _static_positive_int(op.extent)
+            if extent is None or not _is_unrolled_for(op):
+                super().visit_for_(op)
+                return
+
+            prev = loop_multiplier
+            loop_multiplier *= extent
+            super().visit_for_(op)
+            loop_multiplier = prev
+
+        def visit_buffer_store_(self, op):
+            nonlocal last_multiplier
+            if _contains_returning_extern_call(op.value):
+                last_multiplier = loop_multiplier
+            super().visit_buffer_store_(op)
+
+    StoreVisitor().visit_stmt(stmt)
+    return last_multiplier
+
+
+def _estimate_stmt_instance_count(
+    stmt: tvm.tir.Stmt,
+    *,
+    is_wgmma: bool = False,
+    is_true_tma: bool = False,
+) -> int:
+    """Estimate how many independent leaf ops a static loop-wrapped stmt contains.
+
+    The scheduler still rewrites/reorders at top-level statement granularity,
+    but SMT can model a statement such as ``for i in T.unroll(8): op(i)`` as
+    eight ordered issue instances.
+
+    For ordered hardware-issue statements, count only the relevant issue call:
+    TMA statements are expanded by the static loops wrapping ``tma_load`` only,
+    and WGMMA statements are expanded by the static loops wrapping WGMMA calls
+    only.  Barrier bookkeeping in the same top-level statement must not inflate
+    the producer issue count.
+
+    For ordinary consumer statements, count BufferStore and Evaluate leaves with
+    static unroll extents folded in.  For reduction-like tree fragments whose
+    result is returned by a nested extern call, use that returning child op's
+    surrounding static-unroll multiplicity instead of every internal leaf.
+    Vectorized lanes are data lanes, not issue instances. Fall back to one
+    instance for structural statements that do not expose either leaf kind.
+    """
+    if is_true_tma:
+        return max(1, int(_count_tma_ops_with_static_loop_multiplier(stmt)))
+    if is_wgmma:
+        return max(1, int(_count_wgmma_ops_with_static_loop_multiplier(stmt)))
+    returning_store_count = _last_returning_store_static_unroll_multiplier(stmt)
+    if returning_store_count is not None:
+        return max(1, int(returning_store_count))
+    count = _count_stmt_ops_with_static_loop_multiplier(stmt, lambda _op: True)
+    return max(1, int(count))
+
+
+def _infer_stmt_instance_semantic(
+    stmt: tvm.tir.Stmt,
+    *,
+    is_wgmma: bool,
+    is_true_tma: bool,
+) -> str:
+    """Classify what ``op_instance_count`` represents for this statement.
+
+    WGMMA/TMA loops represent a sequence of hardware issues from the same
+    instruction stream, so their expanded instances must remain ordered.  Most
+    other static unroll/vectorized leaves in the consumer body are element/data
+    lanes, e.g. softmax rows or accumulator elements, and should not be
+    serialized merely because they came from one top-level statement.
+    """
+    if is_wgmma or is_true_tma:
+        return "issue_slices"
+    return "element_lanes"
 
 
 def _count_wgmma_ops_with_static_loop_multiplier(stmt: tvm.tir.Stmt) -> int:
@@ -946,6 +1061,8 @@ class _StmtInfo:
     touches_local: bool
     touches_external_local: bool
     is_wait_barrier : bool
+    op_instance_count: int = 1
+    op_instance_semantic: str = "element_lanes"
 
 
 import tvm
@@ -1044,6 +1161,7 @@ def _build_stmt_infos(
         # 一个代表 `k % 2 + 1` (控制 K 矩阵的 TMA)
         # 一个代表 `k % 2 + 3` (控制 V 矩阵的 TMA)
 
+        is_wgmma = _is_wgmma_like(s)
         infos.append(
             _StmtInfo(
                 idx=i,
@@ -1054,12 +1172,22 @@ def _build_stmt_infos(
                 is_true_tma=is_true_tma,
                 is_sync_top=_is_sync_like(s, nested=False),
                 is_sync_nested=_is_sync_like(s, nested=True),
-                is_wgmma=_is_wgmma_like(s),
+                is_wgmma=is_wgmma,
                 touches_local=_touches_non_shared_global(reads, writes),
                 touches_external_local=_touches_external_non_shared_global(
                     s, reads, writes, func_alloc_vars
                 ),
-                is_wait_barrier=is_wait_barrier
+                is_wait_barrier=is_wait_barrier,
+                op_instance_count=_estimate_stmt_instance_count(
+                    s,
+                    is_wgmma=is_wgmma,
+                    is_true_tma=is_true_tma,
+                ),
+                op_instance_semantic=_infer_stmt_instance_semantic(
+                    s,
+                    is_wgmma=is_wgmma,
+                    is_true_tma=is_true_tma,
+                ),
             )
         )
     return infos, grouped_barriers

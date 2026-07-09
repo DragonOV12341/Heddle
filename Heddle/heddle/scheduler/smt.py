@@ -174,6 +174,7 @@ class HeddleScheduler:
         log_search_progress : bool = False,
         same_warpgroup_pairs: Optional[List[Tuple[str, str]]] = None,
         not_all_same_warpgroup_sets: Optional[List[Tuple[str, ...]]] = None,
+        same_subcore_exclusion_pairs: Optional[List[Tuple[str, str]]] = None,
     ):
         self.nodes = nodes
         self.fu_caps = fu_caps or {
@@ -195,6 +196,7 @@ class HeddleScheduler:
         self.log_search_progress = log_search_progress
         self.same_warpgroup_pairs = list(same_warpgroup_pairs or [])
         self.not_all_same_warpgroup_sets = list(not_all_same_warpgroup_sets or [])
+        self.same_subcore_exclusion_pairs = list(same_subcore_exclusion_pairs or [])
 
     # ------------------------------------------------------------------ #
     # Phase A  (unchanged API)
@@ -690,37 +692,47 @@ class HeddleScheduler:
             phase_eq_cache[key] = b
             return b
 
-        # Hopper 每个 warpgroup 内的同号 warp 共享一个 subcore issue 槽：
-        # subcoreId = warpId % 4。同 subcore 上的两个 op 不能在同一个
-        # modulo issue interval 内重叠；不同 subcore 的 warp 组合不加限制。
-        issue_spans = [
-            (v, 0, max(len(node.reservation), 1))
-            for v, node in enumerate(self.nodes)
-        ]
-        for i, (u, off_u, dur_u) in enumerate(issue_spans):
-            for v, off_v, dur_v in issue_spans[i + 1:]:
-                for wu in range(W):
-                    for wv in range(W):
-                        if wu % 4 != wv % 4:
-                            continue
-                        same_subcore = _and_var(
-                            f"same_subcore_u={u}_v={v}_wu={wu}_wv={wv}",
-                            [issue_warp[(u, wu)], issue_warp[(v, wv)]],
-                        )
-                        if dur_u + dur_v > ii:
-                            model.add(same_subcore == 0)
-                            continue
-                        delta_uv = model.new_int_var(
-                            0, ii - 1,
-                            f"subcore_delta_u={u}_v={v}_wu={wu}_wv={wv}",
-                        )
-                        model.add_modulo_equality(
-                            delta_uv,
-                            phase[v] + off_v - phase[u] - off_u + ii,
-                            ii,
-                        )
-                        model.add(delta_uv >= dur_u).only_enforce_if(same_subcore)
-                        model.add(delta_uv <= ii - dur_v).only_enforce_if(same_subcore)
+        # Hopper 每个 warpgroup 内的同号 warp 共享一个 subcore issue 槽。
+        # 不在首次求解里对所有 op pair 全局展开；log4 这类 expanded op
+        # 数量较大时，这会在进入 CP-SAT 前制造百万级 Python 侧建模开销。
+        # 只对 post-check 反馈回来的少量冲突 pair 加同 subcore 排斥。
+        seen_subcore_pairs: set[tuple[int, int]] = set()
+        for left_name, right_name in self.same_subcore_exclusion_pairs:
+            if left_name not in idx or right_name not in idx:
+                continue
+            u = idx[left_name]
+            v = idx[right_name]
+            if u == v:
+                continue
+            if u > v:
+                u, v = v, u
+            if (u, v) in seen_subcore_pairs:
+                continue
+            seen_subcore_pairs.add((u, v))
+            dur_u = max(len(self.nodes[u].reservation), 1)
+            dur_v = max(len(self.nodes[v].reservation), 1)
+            for wu in range(W):
+                for wv in range(W):
+                    if wu % 4 != wv % 4:
+                        continue
+                    same_subcore = _and_var(
+                        f"same_subcore_feedback_u={u}_v={v}_wu={wu}_wv={wv}",
+                        [issue_warp[(u, wu)], issue_warp[(v, wv)]],
+                    )
+                    if dur_u + dur_v > ii:
+                        model.add(same_subcore == 0)
+                        continue
+                    delta_uv = model.new_int_var(
+                        0, ii - 1,
+                        f"subcore_feedback_delta_u={u}_v={v}_wu={wu}_wv={wv}",
+                    )
+                    model.add_modulo_equality(
+                        delta_uv,
+                        phase[v] - phase[u] + ii,
+                        ii,
+                    )
+                    model.add(delta_uv >= dur_u).only_enforce_if(same_subcore)
+                    model.add(delta_uv <= ii - dur_v).only_enforce_if(same_subcore)
 
         interval_mode_resources: set[ResourceType] = set()
         resource_spans: dict[ResourceType, list[tuple[int, int, int]]] = {}
@@ -820,17 +832,42 @@ class HeddleScheduler:
                     model.add(delta_uv >= dur_u0)
                     model.add(delta_uv <= ii - dur_v0)
 
-        expanded = self._fold_reservations(ii)
+        resource_has_usage: dict[ResourceType, bool] = {
+            r: any(
+                int(per_cycle.get(r, 0)) > 0
+                for node in self.nodes
+                for per_cycle in node.reservation
+            )
+            for r in self.fu_caps
+        }
+        exact_fallback_resources: list[tuple[ResourceType, int]] = []
         for r, cap in self.fu_caps.items():
             if r in interval_mode_resources:
                 continue
+            if not resource_has_usage.get(r, False):
+                continue
+            exact_fallback_resources.append((r, int(cap)))
+        for r, cap in exact_fallback_resources:
+            usage_by_node: list[list[tuple[int, int]]] = []
+            max_possible_usage = 0
+            for node in self.nodes:
+                usage: dict[int, int] = {}
+                for off, per_cycle in enumerate(node.reservation):
+                    c = int(per_cycle.get(r, 0))
+                    if c:
+                        folded_off = int(off) % ii
+                        usage[folded_off] = usage.get(folded_off, 0) + c
+                node_usage = sorted(usage.items())
+                usage_by_node.append(node_usage)
+                if node_usage:
+                    max_possible_usage += max(c for _, c in node_usage)
+            if max_possible_usage <= int(cap):
+                continue
             for q in range(ii):
                 terms = []
-                for v in range(N):
-                    for l in range(ii):
-                        c = int(expanded[v][l].get(r, 0))
-                        if c:
-                            terms.append(c * _phase_eq_var(v, q - l))
+                for v, node_usage in enumerate(usage_by_node):
+                    for off, c in node_usage:
+                        terms.append(c * _phase_eq_var(v, q - off))
                 if terms:
                     model.add(sum(terms) <= int(cap))  # 每个 modulo 相位上的 FU 使用量不得超过上限。
 
@@ -877,59 +914,61 @@ class HeddleScheduler:
             for footprint in self.smem_allocations.values()
             if int(footprint) > 0
         ]
+        if static_smem_terms:
+            model.add(sum(static_smem_terms) <= self.smem_limit)
 
         # ---- SMEM 容量约束（全局统计，基于区间简化） -------------------------------
         # 针对 SMEM，我们将传统的逐 tau 枚举替换为轻量的绝对时间跨度区间检查，缩减变量规模
-        for tau in range(L):
-            smem_live_by_buffer: dict[str, list] = defaultdict(list)
-            smem_footprint_by_buffer: dict[str, int] = {}
-            for xi, (pv, oval) in enumerate(all_outputs):
-                if oval.storage != StorageKind.SMEM or oval.footprint_bytes <= 0:
-                    continue
-                buffer_key = oval.smem_buffer_key()
-                if buffer_key in self.smem_allocations:
-                    continue
-                
-                producer_lat = int(self.nodes[pv].latency)
-                consumers = consumers_of[xi] if self.include_incoming_live else [(cv, d) for cv, d in consumers_of[xi] if d == 0]
-                
-                any_copy_live_terms = []
-                for iter_offset in iter_offsets:
-                    p_start = Tv[pv] + iter_offset * ii
-                    is_produced = model.new_bool_var(f"smem_p_x={xi}_k={iter_offset}_t={tau}")
-                    model.add(p_start <= tau).only_enforce_if(is_produced)
-                    model.add(p_start > tau).only_enforce_if(is_produced.negated())
+        if self.enable_liveness:
+            for tau in range(L):
+                smem_live_by_buffer: dict[str, list] = defaultdict(list)
+                smem_footprint_by_buffer: dict[str, int] = {}
+                for xi, (pv, oval) in enumerate(all_outputs):
+                    if oval.storage != StorageKind.SMEM or oval.footprint_bytes <= 0:
+                        continue
+                    buffer_key = oval.smem_buffer_key()
+                    if buffer_key in self.smem_allocations:
+                        continue
                     
-                    if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY and consumers:
-                        all_c_done = model.new_bool_var(f"smem_c_x={xi}_k={iter_offset}_t={tau}")
-                        c_terms = []
-                        for cv, d in consumers:
-                            c_bound = tau - d * ii - (1 if producer_lat == 0 else 0)
-                            c_started = model.new_bool_var(f"smem_cv={cv}_t={tau}")
-                            model.add(Tv[cv] + iter_offset * ii <= c_bound).only_enforce_if(c_started)
-                            model.add(Tv[cv] + iter_offset * ii > c_bound).only_enforce_if(c_started.negated())
-                            c_terms.append(c_started)
-                        model.add_bool_and(c_terms).only_enforce_if(all_c_done)
-                        model.add_bool_or([t.negated() for t in c_terms]).only_enforce_if(all_c_done.negated())
+                    producer_lat = int(self.nodes[pv].latency)
+                    consumers = consumers_of[xi] if self.include_incoming_live else [(cv, d) for cv, d in consumers_of[xi] if d == 0]
+                    
+                    any_copy_live_terms = []
+                    for iter_offset in iter_offsets:
+                        p_start = Tv[pv] + iter_offset * ii
+                        is_produced = model.new_bool_var(f"smem_p_x={xi}_k={iter_offset}_t={tau}")
+                        model.add(p_start <= tau).only_enforce_if(is_produced)
+                        model.add(p_start > tau).only_enforce_if(is_produced.negated())
                         
-                        live_var = model.new_bool_var(f"smem_l_x={xi}_k={iter_offset}_t={tau}")
-                        model.add_bool_and([is_produced, all_c_done.negated()]).only_enforce_if(live_var)
-                        model.add_bool_or([is_produced.negated(), all_c_done]).only_enforce_if(live_var.negated())
-                        any_copy_live_terms.append(live_var)
-                    else:
-                        any_copy_live_terms.append(is_produced)
-                        
-                any_copy_live = _or_var(f"smem_live_x={xi}_t={tau}", any_copy_live_terms)
-                smem_live_by_buffer[buffer_key].append(any_copy_live)
-                smem_footprint_by_buffer[buffer_key] = max(smem_footprint_by_buffer.get(buffer_key, 0), int(oval.footprint_bytes))
-                
-            smem_terms = []
-            for buffer_key, live_terms in smem_live_by_buffer.items():
-                buffer_live = _or_var(f"smem_live_buf={buffer_key}_t={tau}", live_terms)
-                smem_terms.append(smem_footprint_by_buffer[buffer_key] * buffer_live)
-            smem_total_terms = static_smem_terms + smem_terms
-            if smem_total_terms:
-                model.add(sum(smem_total_terms) <= self.smem_limit)
+                        if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY and consumers:
+                            all_c_done = model.new_bool_var(f"smem_c_x={xi}_k={iter_offset}_t={tau}")
+                            c_terms = []
+                            for cv, d in consumers:
+                                c_bound = tau - d * ii - (1 if producer_lat == 0 else 0)
+                                c_started = model.new_bool_var(f"smem_cv={cv}_t={tau}")
+                                model.add(Tv[cv] + iter_offset * ii <= c_bound).only_enforce_if(c_started)
+                                model.add(Tv[cv] + iter_offset * ii > c_bound).only_enforce_if(c_started.negated())
+                                c_terms.append(c_started)
+                            model.add_bool_and(c_terms).only_enforce_if(all_c_done)
+                            model.add_bool_or([t.negated() for t in c_terms]).only_enforce_if(all_c_done.negated())
+                            
+                            live_var = model.new_bool_var(f"smem_l_x={xi}_k={iter_offset}_t={tau}")
+                            model.add_bool_and([is_produced, all_c_done.negated()]).only_enforce_if(live_var)
+                            model.add_bool_or([is_produced.negated(), all_c_done]).only_enforce_if(live_var.negated())
+                            any_copy_live_terms.append(live_var)
+                        else:
+                            any_copy_live_terms.append(is_produced)
+                            
+                    any_copy_live = _or_var(f"smem_live_x={xi}_t={tau}", any_copy_live_terms)
+                    smem_live_by_buffer[buffer_key].append(any_copy_live)
+                    smem_footprint_by_buffer[buffer_key] = max(smem_footprint_by_buffer.get(buffer_key, 0), int(oval.footprint_bytes))
+                    
+                smem_terms = []
+                for buffer_key, live_terms in smem_live_by_buffer.items():
+                    buffer_live = _or_var(f"smem_live_buf={buffer_key}_t={tau}", live_terms)
+                    smem_terms.append(smem_footprint_by_buffer[buffer_key] * buffer_live)
+                if smem_terms:
+                    model.add(sum(static_smem_terms + smem_terms) <= self.smem_limit)
 
         # ---- RMEM liveness 容量约束（稀疏 checkpoint） --------------------
         # 不再把每个 live range 建成 OptionalInterval + Cumulative。那种
@@ -1072,6 +1111,21 @@ class HeddleScheduler:
         solver.parameters.max_time_in_seconds = max(float(self.timeout_ms) / 1000.0, 1)
         solver.parameters.num_workers = 4
         solver.parameters.log_search_progress = self.log_search_progress
+        try:
+            proto_getter = getattr(model, "proto", None)
+            if callable(proto_getter):
+                proto = proto_getter()
+            elif proto_getter is not None:
+                proto = proto_getter
+            else:
+                proto = model.Proto()
+            print(
+                f"----- HeddleScheduler model built: "
+                f"vars={len(proto.variables)} constraints={len(proto.constraints)}",
+                flush=True,
+            )
+        except Exception:
+            pass
         status = solver.solve(model)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             status_name = {
