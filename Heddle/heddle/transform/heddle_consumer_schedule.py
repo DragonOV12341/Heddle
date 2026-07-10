@@ -60,6 +60,8 @@ from heddle.transform.auto_tl_pipeline_smt import (
     _estimate_buffer_footprint_bytes,
     _buf_scope_str,
     _is_shared,
+    _AccessInterval,
+    _ChildAccess,
     _StmtInfo,
     _unwrap_to_seqstmt,
 )
@@ -505,8 +507,54 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         semantic = getattr(info, "op_instance_semantic", None)
         if semantic is not None:
             return str(semantic) == "issue_slices"
-        return bool(getattr(info, "is_wgmma", False) or getattr(info, "is_true_tma", False))
-    
+        return bool(getattr(info, "is_true_tma", False))
+
+    def _child_accesses(idx: int, inst: int) -> Optional[List[_ChildAccess]]:
+        accesses = getattr(infos[idx], "child_accesses", None)
+        if not accesses or inst >= len(accesses):
+            return None
+        return accesses[inst]
+
+    def _intervals_may_overlap(a: _AccessInterval, b: _AccessInterval) -> bool:
+        analyzer = tvm.arith.Analyzer()
+        try:
+            if analyzer.can_prove(a.end <= b.start) or analyzer.can_prove(b.end <= a.start):
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _accesses_may_overlap(a: _ChildAccess, b: _ChildAccess) -> bool:
+        if a.buffer_name != b.buffer_name:
+            return False
+        if len(a.intervals) != len(b.intervals):
+            return True
+        return all(_intervals_may_overlap(x, y) for x, y in zip(a.intervals, b.intervals))
+
+    def _child_may_conflict(a_child: Tuple[int, int], b_child: Tuple[int, int]) -> Optional[bool]:
+        a_acc = _child_accesses(*a_child)
+        b_acc = _child_accesses(*b_child)
+        if a_acc is None or b_acc is None:
+            return None
+        for a in a_acc:
+            for b in b_acc:
+                if a.kind == "read" and b.kind == "read":
+                    continue
+                if _accesses_may_overlap(a, b):
+                    return True
+        return False
+
+    def _intra_child_edges(idx: int) -> List[Tuple[Tuple[int, int], Tuple[int, int], int]]:
+        info = infos[idx]
+        out: List[Tuple[Tuple[int, int], Tuple[int, int], int]] = []
+        for prev_child, next_child in zip(_children(idx), _children(idx)[1:]):
+            conflict = _child_may_conflict(prev_child, next_child)
+            if _has_ordered_issue_slices(info):
+                out.append((prev_child, next_child, _issue_delay_for_self_edge(idx)))
+            elif conflict is True or (conflict is None and getattr(info, "is_wgmma", False)):
+                out.append((prev_child, next_child, latencies[prev_child]))
+        return out
+
     for idx in ops:
         info = infos[idx]
         children = _children(idx)
@@ -548,9 +596,8 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         for v, deps in op_deps.items():
             if v not in ops:
                 continue
-            if _has_ordered_issue_slices(infos[v]):
-                for prev_child, next_child in zip(_children(v), _children(v)[1:]):
-                    edges.append((prev_child, next_child, _issue_delay_for_self_edge(v), 0))
+            for prev_child, next_child, delay in _intra_child_edges(v):
+                edges.append((prev_child, next_child, delay, 0))
             for u in deps:
                 if u not in ops:
                     continue
@@ -561,17 +608,16 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
                         edges.append((uc, vc, latencies[uc], 0))
                 else:
                     # 展开倍数不一致时保持保守：消费者首实例等待生产者末实例。
-                    edges.append((_last_child(u), _first_child(v), latencies[_last_child(u)], 0))
+                    uc, vc = _last_child(u), _first_child(v)
+                    edges.append((uc, vc, latencies[uc], 0))
 
             # 跨循环依赖关系: 如果读写同一 buffer 则自己存在跨循环依赖
-            write_buf_names = set()
-            read_buf_names = set()
-            for buf in infos[v].writes:
-                write_buf_names.add(buf.buffer.name)
-            for buf in infos[v].reads:
-                read_buf_names.add(buf.buffer.name)
-            intersect = write_buf_names & read_buf_names
-            if intersect:
+            self_conflict = _child_may_conflict(_last_child(v), _first_child(v))
+            if self_conflict is None:
+                write_buf_names = {buf.buffer.name for buf in infos[v].writes}
+                read_buf_names = {buf.buffer.name for buf in infos[v].reads}
+                self_conflict = bool(write_buf_names & read_buf_names)
+            if self_conflict is True:
                 edges.append((_last_child(v), _first_child(v), _issue_delay_for_self_edge(v), 1))
             if infos[v].is_sync_top and infos[v].is_sync_nested:
                 edges.append((_last_child(v), _first_child(v), _issue_delay_for_self_edge(v), 1))
@@ -1254,7 +1300,53 @@ def _solve_smt_joint_optimize(
         semantic = getattr(info, "op_instance_semantic", None)
         if semantic is not None:
             return str(semantic) == "issue_slices"
-        return bool(getattr(info, "is_wgmma", False) or getattr(info, "is_true_tma", False))
+        return bool(getattr(info, "is_true_tma", False))
+
+    def _child_accesses(idx: int, inst: int) -> Optional[List[_ChildAccess]]:
+        accesses = getattr(infos[idx], "child_accesses", None)
+        if not accesses or inst >= len(accesses):
+            return None
+        return accesses[inst]
+
+    def _intervals_may_overlap(a: _AccessInterval, b: _AccessInterval) -> bool:
+        analyzer = tvm.arith.Analyzer()
+        try:
+            if analyzer.can_prove(a.end <= b.start) or analyzer.can_prove(b.end <= a.start):
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _accesses_may_overlap(a: _ChildAccess, b: _ChildAccess) -> bool:
+        if a.buffer_name != b.buffer_name:
+            return False
+        if len(a.intervals) != len(b.intervals):
+            return True
+        return all(_intervals_may_overlap(x, y) for x, y in zip(a.intervals, b.intervals))
+
+    def _child_may_conflict(a_child: Tuple[int, int], b_child: Tuple[int, int]) -> Optional[bool]:
+        a_acc = _child_accesses(*a_child)
+        b_acc = _child_accesses(*b_child)
+        if a_acc is None or b_acc is None:
+            return None
+        for a in a_acc:
+            for b in b_acc:
+                if a.kind == "read" and b.kind == "read":
+                    continue
+                if _accesses_may_overlap(a, b):
+                    return True
+        return False
+
+    def _intra_child_edges(idx: int) -> List[Tuple[Tuple[int, int], Tuple[int, int], int]]:
+        info = infos[idx]
+        out: List[Tuple[Tuple[int, int], Tuple[int, int], int]] = []
+        for prev_child, next_child in zip(_children(idx), _children(idx)[1:]):
+            conflict = _child_may_conflict(prev_child, next_child)
+            if _has_ordered_issue_slices(info):
+                out.append((prev_child, next_child, _issue_delay_for_self_edge(info)))
+            elif conflict is True or (conflict is None and getattr(info, "is_wgmma", False)):
+                out.append((prev_child, next_child, _dependency_delay_for_info(info)))
+        return out
 
     def _reservation_for_info(info: _StmtInfo, rty: ResourceType) -> List[Dict[ResourceType, int]]:
         # wait/try_wait barrier 会阻塞当前发射 warp；这里把它建模成
@@ -1294,6 +1386,12 @@ def _solve_smt_joint_optimize(
 
     def _storage_for_buffer(buf: tvm.tir.Buffer) -> StorageKind:
         return StorageKind.SMEM if _is_multiversioned_smem_buffer(buf) else StorageKind.RMEM
+
+    def _spill_cost_for_output(info: _StmtInfo, storage: StorageKind) -> int:
+        if storage != StorageKind.RMEM:
+            return 0
+        multiplier = max(int(mod_sched_plan.get("rmem_spill_cost_multiplier", 4)), 1)
+        return multiplier * max(1, int(_dependency_delay_for_info(info)))
 
     def _collect_buffer_registry() -> Tuple[
         Dict[str, _JointBufferValue],
@@ -1509,6 +1607,7 @@ def _solve_smt_joint_optimize(
                     name=f"{_child_name(child)}_w_{buffer_name}",
                     storage=buf_value.storage,
                     footprint_bytes=buf_value.footprint_bytes,
+                    spill_cost=_spill_cost_for_output(info, buf_value.storage),
                     lifetime=LifetimeSemantic.DEAD_ON_ENTRY,
                     buffer_name=buffer_name,
                 ))
@@ -1535,22 +1634,37 @@ def _solve_smt_joint_optimize(
         if inst == 0:
             node_by_idx[idx] = node
 
+    def _dependency_child_pairs(
+        u_children: List[Tuple[int, int]],
+        v_children: List[Tuple[int, int]],
+    ) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
+        """Map a stmt-level dependency to expanded child dependencies."""
+        if not u_children or not v_children:
+            return []
+        if len(u_children) == len(v_children):
+            return list(zip(u_children, v_children))
+        if len(u_children) < len(v_children):
+            producer = u_children[-1]
+            return [(producer, v_child) for v_child in v_children]
+        if len(v_children) == 1:
+            consumer = v_children[0]
+            return [(u_child, consumer) for u_child in u_children]
+        pairs: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
+        for i, u_child in enumerate(u_children):
+            pairs.append((u_child, v_children[min(i, len(v_children) - 1)]))
+        return pairs
+
     # 同一轮迭代内的依赖边，来自 IR 分析得到的 op_deps 图。
     for v, deps in op_deps.items():
         if v not in ops:
             continue
         v_children = _children(v)
-        if _has_ordered_issue_slices(infos[v]):
-            for prev_child, next_child in zip(v_children, v_children[1:]):
-                # Hardware issue slices from one TIR statement are one
-                # instruction stream, so hints are not enough: keep them
-                # ordered. Element/data lanes such as softmax unrolls are
-                # intentionally not serialized here.
-                node_by_child[next_child].add_dependency(
-                    node_by_child[prev_child],
-                    distance=0,
-                    delay=_issue_delay_for_self_edge(infos[v]),
-                )
+        for prev_child, next_child, delay in _intra_child_edges(v):
+            node_by_child[next_child].add_dependency(
+                node_by_child[prev_child],
+                distance=0,
+                delay=delay,
+            )
         for u in deps:
             if u not in ops:
                 continue
@@ -1562,11 +1676,7 @@ def _solve_smt_joint_optimize(
             # producer/consumer graphs presolve UNSAT.
             u_children = _children(u)
             v_children = _children(v)
-            if len(u_children) == len(v_children):
-                pairs = list(zip(u_children, v_children))
-            else:
-                pairs = [(_last_child(u), _first_child(v))]
-            for u_child, v_child in pairs:
+            for u_child, v_child in _dependency_child_pairs(u_children, v_children):
                 node_by_child[v_child].add_dependency(
                     node_by_child[u_child],
                     distance=0,
@@ -1580,7 +1690,10 @@ def _solve_smt_joint_optimize(
         info = infos[idx]
         write_bufs = set(op_buffer_writes.get(idx, []))
         read_bufs = set(op_buffer_reads.get(idx, []))
-        if write_bufs & read_bufs:
+        self_conflict = _child_may_conflict(_last_child(idx), _first_child(idx))
+        if self_conflict is None:
+            self_conflict = bool(write_bufs & read_bufs)
+        if self_conflict:
             node_by_child[_first_child(idx)].add_dependency(
                 node_by_child[_last_child(idx)],
                 distance=1,
@@ -1704,6 +1817,7 @@ def _solve_smt_joint_optimize(
             num_warps=num_warps,
             timeout_ms=int(mod_sched_plan.get("timeout_ms", 30000)),
             enable_liveness=enable_liveness,
+            use_spill_concurrency=False,
             liveness_checkpoint_step=int(mod_sched_plan.get("liveness_checkpoint_step", 8)),
             start_hints={
                 name: int(t)
@@ -1715,6 +1829,7 @@ def _solve_smt_joint_optimize(
             same_warpgroup_pairs=same_warpgroup_pairs,
             not_all_same_warpgroup_sets=not_all_same_warpgroup_sets,
             same_subcore_exclusion_pairs=same_subcore_exclusion_pairs,
+            cross_wg_rmem_penalty=int(mod_sched_plan.get("cross_wg_rmem_penalty", 4096)),
         )
         return solver.schedule_joint(
             min_ii=ii,
@@ -1869,6 +1984,7 @@ def _solve_smt_joint_optimize(
         )
         for tau in range(max(int(check_L), 0)):
             smem_live_bytes: Dict[str, int] = {}
+            spill_smem_live_bytes: Dict[Tuple[str, int, int], int] = {}
             reg_live_bytes: Dict[int, Dict[Tuple[str, int], int]] = {
                 w: {} for w in range(num_warps)
             }
@@ -1894,6 +2010,27 @@ def _solve_smt_joint_optimize(
                                 reg_live_bytes[w].get(copy_key, 0),
                                 int(oval.footprint_bytes),
                             )
+                        if int(oval.spill_cost) > 0:
+                            producer_warps = set(fixed_warps.get(producer_child, [0]))
+                            for consumer_child, distance in consumers_of.get(xi, []):
+                                consume_time = (
+                                    fixed_M[consumer_child]
+                                    + (iter_offset + distance) * base_I
+                                )
+                                if not (consume_time - int(oval.spill_cost) <= tau < consume_time):
+                                    continue
+                                consumer_warps = set(fixed_warps.get(consumer_child, [0]))
+                                if producer_warps & consumer_warps:
+                                    continue
+                                spill_key = (
+                                    buffer_key,
+                                    int(iter_offset),
+                                    int(fixed_M[consumer_child]),
+                                )
+                                spill_smem_live_bytes[spill_key] = max(
+                                    spill_smem_live_bytes.get(spill_key, 0),
+                                    int(oval.footprint_bytes),
+                                )
                 if oval.storage == StorageKind.SMEM and live_any_copy:
                     buffer_key = oval.smem_buffer_key()
                     if buffer_key in smem_allocations_by_buffer:
@@ -1933,7 +2070,11 @@ def _solve_smt_joint_optimize(
                         "live_detail": live_detail[:12],
                         "reg_peak": reg_peak,
                     }
-            smem_total = static_smem_total + sum(smem_live_bytes.values())
+            smem_total = (
+                static_smem_total
+                + sum(smem_live_bytes.values())
+                + sum(spill_smem_live_bytes.values())
+            )
             smem_peak = max(smem_peak, smem_total)
             if check_smem_limit > 0 and smem_total > check_smem_limit:
                 return False, {
@@ -1943,6 +2084,7 @@ def _solve_smt_joint_optimize(
                     "limit": check_smem_limit,
                     "reg_peak": reg_peak,
                     "smem_peak": smem_peak,
+                    "spill_smem_bytes": sum(spill_smem_live_bytes.values()),
                 }
 
         return True, {"reg_peak": reg_peak, "smem_peak": smem_peak}
@@ -2190,6 +2332,11 @@ def _solve_smt_joint_optimize(
     schedule = sol.get("schedule", {})
     warp_assign = sol.get("warp_assign", {})
     variable_lifetimes = sol.get("variable_lifetimes",[])
+    expanded_M = {
+        name: int(t)
+        for name, t in schedule.items()
+        if name in child_by_name
+    }
     optimized_M = _collapse_schedule(schedule)
     for idx in ops:
         if idx not in optimized_M and idx in base_M:
@@ -2207,6 +2354,7 @@ def _solve_smt_joint_optimize(
     print(f'---{optimized_L=}')
     print(f'---{base_I=}')
     print(f'---{optimized_M=}')
+    print(f'---{expanded_M=}')
     print(f'---{variable_lifetimes=}')
     
     table = []
@@ -2238,6 +2386,7 @@ def _solve_smt_joint_optimize(
         "I": base_I,
         "L": optimized_L,
         "M": optimized_M,
+        "expanded_M": expanded_M,
         "status": "SMT_OPTIMIZED" if solved_with_optimize else "SMT_FEASIBLE",
         "window": int(sol.get("window", window)),
         "warp_assign": _collapse_warp_assign(warp_assign),

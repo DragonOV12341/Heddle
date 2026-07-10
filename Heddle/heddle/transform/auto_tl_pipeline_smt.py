@@ -5,7 +5,7 @@ from itertools import permutations
 import os
 import re
 import sys
-from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from tvm import tir
 
@@ -387,6 +387,251 @@ def _count_stmt_ops_with_static_loop_multiplier(stmt: tvm.tir.Stmt, pred) -> int
     return count
 
 
+@dataclass
+class _AccessInterval:
+    start: tvm.tir.PrimExpr
+    end: tvm.tir.PrimExpr  # exclusive
+
+
+@dataclass
+class _ChildAccess:
+    buffer_name: str
+    intervals: Tuple[_AccessInterval, ...]
+    kind: str  # "read" or "write"
+
+
+def _substitute_and_simplify(
+    expr: tvm.tir.PrimExpr,
+    bindings: Dict[tvm.tir.Var, tvm.tir.PrimExpr],
+    analyzer: Optional[tvm.arith.Analyzer] = None,
+) -> tvm.tir.PrimExpr:
+    analyzer = analyzer or tvm.arith.Analyzer()
+    try:
+        if bindings:
+            expr = tvm.tir.stmt_functor.substitute(expr, bindings)
+        return analyzer.simplify(expr)
+    except Exception:
+        return expr
+
+
+def _collect_buffer_data_map(buffer_var_map: Dict[tvm.tir.Var, tvm.tir.Buffer]) -> Dict[tvm.tir.Var, tvm.tir.Buffer]:
+    out: Dict[tvm.tir.Var, tvm.tir.Buffer] = {}
+    for buf in buffer_var_map.values():
+        try:
+            out[buf.data] = buf
+        except Exception:
+            pass
+    return out
+
+
+def _buffer_access(
+    buf: tvm.tir.Buffer,
+    indices: List[tvm.tir.PrimExpr],
+    *,
+    kind: str,
+    bindings: Dict[tvm.tir.Var, tvm.tir.PrimExpr],
+    vector_bounds: Dict[tvm.tir.Var, Tuple[tvm.tir.PrimExpr, tvm.tir.PrimExpr]],
+    analyzer: tvm.arith.Analyzer,
+) -> _ChildAccess:
+    intervals: List[_AccessInterval] = []
+    for idx in indices:
+        used_vec = None
+        for v in vector_bounds:
+            found = False
+            def _find(node):
+                nonlocal found
+                if isinstance(node, tvm.tir.Var) and tvm.ir.structural_equal(node, v):
+                    found = True
+            tvm.tir.stmt_functor.post_order_visit(idx, _find)
+            if found:
+                used_vec = v
+                break
+        if used_vec is not None:
+            lo, hi_inclusive = vector_bounds[used_vec]
+            lo_expr = _substitute_and_simplify(idx, {**bindings, used_vec: lo}, analyzer)
+            hi_expr = _substitute_and_simplify(idx, {**bindings, used_vec: hi_inclusive}, analyzer)
+            intervals.append(_AccessInterval(lo_expr, analyzer.simplify(hi_expr + 1)))
+        else:
+            start = _substitute_and_simplify(idx, bindings, analyzer)
+            intervals.append(_AccessInterval(start, analyzer.simplify(start + 1)))
+    return _ChildAccess(buf.name, tuple(intervals), kind)
+
+
+def _collect_child_accesses(
+    stmt: tvm.tir.Stmt,
+    buffer_var_map: Dict[tvm.tir.Var, tvm.tir.Buffer],
+    *,
+    is_wgmma: bool = False,
+    is_true_tma: bool = False,
+) -> List[List[_ChildAccess]]:
+    """Collect per-static-unroll-child buffer accesses.
+
+    Static ``T.unroll`` loops create independent children. ``T.vectorized``
+    loops do not create children; their lanes widen the accessed interval, with
+    lane upper bound ``extent - 1``.
+    """
+    if is_true_tma:
+        return []
+
+    analyzer = tvm.arith.Analyzer()
+    data_to_buffer = _collect_buffer_data_map(buffer_var_map)
+    child_accesses: List[List[_ChildAccess]] = []
+    group_by_outer_unroll = (not is_wgmma) and (_last_returning_store_static_unroll_multiplier(stmt) is not None)
+
+    def _append_child_access(accesses: List[_ChildAccess]) -> None:
+        child_accesses.append(accesses)
+
+    def _collect_expr_reads(
+        expr: tvm.tir.PrimExpr,
+        accesses: List[_ChildAccess],
+        bindings: Dict[tvm.tir.Var, tvm.tir.PrimExpr],
+        vector_bounds: Dict[tvm.tir.Var, Tuple[tvm.tir.PrimExpr, tvm.tir.PrimExpr]],
+    ) -> None:
+        def _visit(node):
+            if isinstance(node, tvm.tir.BufferLoad):
+                accesses.append(
+                    _buffer_access(
+                        node.buffer,
+                        list(node.indices),
+                        kind="read",
+                        bindings=bindings,
+                        vector_bounds=vector_bounds,
+                        analyzer=analyzer,
+                    )
+                )
+        tvm.tir.stmt_functor.post_order_visit(expr, _visit)
+
+    def _collect_wgmma_summary(
+        call: tvm.tir.Call,
+        accesses: List[_ChildAccess],
+    ) -> bool:
+        kind = _wgmma_call_kind(call)
+        if kind is None or not isinstance(call.op, tvm.ir.Op):
+            return False
+        op_name = call.op.name
+        args = list(call.args)
+        # tl.ptx_wgmma_ss(..., desc_a.data, off_a, desc_b.data, off_b, acc.data, ...)
+        # tl.ptx_wgmma_rs(..., acc_a.data, off_a, desc_b.data, off_b, acc_o.data, ...)
+        if op_name == "tl.ptx_wgmma_ss" and len(args) > 10:
+            acc_arg = args[10]
+        elif op_name == "tl.ptx_wgmma_rs" and len(args) > 10:
+            acc_arg = args[10]
+            a_arg = args[6] if len(args) > 6 else None
+            if isinstance(a_arg, tvm.tir.Var) and a_arg in data_to_buffer:
+                a_buf = data_to_buffer[a_arg]
+                elems = _static_positive_int(a_buf.shape[0]) or 1
+                accesses.append(_ChildAccess(
+                    a_buf.name,
+                    (_AccessInterval(tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", elems)),),
+                    "read",
+                ))
+        else:
+            return False
+        if isinstance(acc_arg, tvm.tir.Var) and acc_arg in data_to_buffer:
+            acc_buf = data_to_buffer[acc_arg]
+            elems = _static_positive_int(acc_buf.shape[0]) or 1
+            accesses.append(_ChildAccess(
+                acc_buf.name,
+                (_AccessInterval(tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", elems)),),
+                "write",
+            ))
+            return True
+        return False
+
+    def _walk(
+        node: Any,
+        bindings: Dict[tvm.tir.Var, tvm.tir.PrimExpr],
+        vector_bounds: Dict[tvm.tir.Var, Tuple[tvm.tir.PrimExpr, tvm.tir.PrimExpr]],
+        current_accesses: Optional[List[_ChildAccess]] = None,
+    ) -> None:
+        if isinstance(node, tvm.tir.SeqStmt):
+            for s in node.seq:
+                _walk(s, bindings, vector_bounds, current_accesses)
+            return
+        if isinstance(node, tvm.tir.Block):
+            _walk(node.body, bindings, vector_bounds, current_accesses)
+            return
+        if isinstance(node, tvm.tir.Allocate):
+            _walk(node.body, bindings, vector_bounds, current_accesses)
+            return
+        if isinstance(node, tvm.tir.AttrStmt):
+            _walk(node.body, bindings, vector_bounds, current_accesses)
+            return
+        if isinstance(node, tvm.tir.IfThenElse):
+            _walk(node.then_case, bindings, vector_bounds, current_accesses)
+            if node.else_case is not None:
+                _walk(node.else_case, bindings, vector_bounds, current_accesses)
+            return
+        if isinstance(node, tvm.tir.LetStmt):
+            _walk(
+                node.body,
+                {**bindings, node.var: _substitute_and_simplify(node.value, bindings, analyzer)},
+                vector_bounds,
+                current_accesses,
+            )
+            return
+        if isinstance(node, tvm.tir.For):
+            extent = _static_positive_int(node.extent)
+            if extent is not None and _is_unrolled_for(node):
+                base = _substitute_and_simplify(node.min, bindings, analyzer)
+                for i in range(extent):
+                    val = analyzer.simplify(base + i)
+                    if group_by_outer_unroll and current_accesses is None:
+                        grouped: List[_ChildAccess] = []
+                        _walk(node.body, {**bindings, node.loop_var: val}, vector_bounds, grouped)
+                        _append_child_access(grouped)
+                    else:
+                        _walk(node.body, {**bindings, node.loop_var: val}, vector_bounds, current_accesses)
+                return
+            if extent is not None and node.kind == tvm.tir.ForKind.VECTORIZED:
+                base = _substitute_and_simplify(node.min, bindings, analyzer)
+                hi = analyzer.simplify(base + extent - 1)
+                _walk(node.body, bindings, {**vector_bounds, node.loop_var: (base, hi)}, current_accesses)
+                return
+            _walk(node.body, bindings, vector_bounds, current_accesses)
+            return
+        if isinstance(node, tvm.tir.BufferStore):
+            if is_wgmma:
+                return
+            accesses: List[_ChildAccess] = [
+                _buffer_access(
+                    node.buffer,
+                    list(node.indices),
+                    kind="write",
+                    bindings=bindings,
+                    vector_bounds=vector_bounds,
+                    analyzer=analyzer,
+                )
+            ]
+            _collect_expr_reads(node.value, accesses, bindings, vector_bounds)
+            if current_accesses is not None:
+                current_accesses.extend(accesses)
+            else:
+                _append_child_access(accesses)
+            return
+        if isinstance(node, tvm.tir.Evaluate):
+            accesses = []
+            if isinstance(node.value, tvm.tir.Call):
+                if is_wgmma:
+                    if not _collect_wgmma_summary(node.value, accesses):
+                        return
+                else:
+                    _collect_wgmma_summary(node.value, accesses)
+            _collect_expr_reads(node.value, accesses, bindings, vector_bounds)
+            if accesses:
+                if current_accesses is not None:
+                    current_accesses.extend(accesses)
+                else:
+                    _append_child_access(accesses)
+            return
+        # Generic fallback: visit nested statements exposed by TVM nodes through
+        # post_order_visit only for expressions handled above. Unknown statement
+        # forms remain represented by stmt-level regions.
+
+    _walk(stmt, {}, {})
+    return child_accesses
+
+
 def _contains_returning_extern_call(expr: tvm.tir.PrimExpr) -> bool:
     found = False
 
@@ -487,14 +732,14 @@ def _infer_stmt_instance_semantic(
 ) -> str:
     """Classify what ``op_instance_count`` represents for this statement.
 
-    WGMMA/TMA loops represent a sequence of hardware issues from the same
-    instruction stream, so their expanded instances must remain ordered.  Most
-    other static unroll/vectorized leaves in the consumer body are element/data
-    lanes, e.g. softmax rows or accumulator elements, and should not be
-    serialized merely because they came from one top-level statement.
+    TMA loops represent ordered issue slices from one producer stream. WGMMA
+    children are ordered only by accumulator hazards, so they are not tagged as
+    unconditional issue slices here.
     """
-    if is_wgmma or is_true_tma:
+    if is_true_tma:
         return "issue_slices"
+    if is_wgmma:
+        return "accumulator_hazard"
     return "element_lanes"
 
 
@@ -1063,6 +1308,7 @@ class _StmtInfo:
     is_wait_barrier : bool
     op_instance_count: int = 1
     op_instance_semantic: str = "element_lanes"
+    child_accesses: Optional[List[List[_ChildAccess]]] = None
 
 
 import tvm
@@ -1162,6 +1408,15 @@ def _build_stmt_infos(
         # 一个代表 `k % 2 + 3` (控制 V 矩阵的 TMA)
 
         is_wgmma = _is_wgmma_like(s)
+        try:
+            child_accesses = _collect_child_accesses(
+                s,
+                buffer_var_map,
+                is_wgmma=is_wgmma,
+                is_true_tma=is_true_tma,
+            )
+        except Exception:
+            child_accesses = None
         infos.append(
             _StmtInfo(
                 idx=i,
@@ -1188,6 +1443,7 @@ def _build_stmt_infos(
                     is_wgmma=is_wgmma,
                     is_true_tma=is_true_tma,
                 ),
+                child_accesses=child_accesses,
             )
         )
     return infos, grouped_barriers

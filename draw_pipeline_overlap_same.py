@@ -69,22 +69,32 @@ configure_chinese_font()
 # base_I=512
 # optimized_M={0: 0, 2: 8, 3: 4, 4: 12, 5: 282, 6: 434, 7: 440, 8: 448, 9: 448, 10: 978, 11: 498, 12: 984, 13: 978, 14: 2, 16: 1046}
 
-warp_assign={'s0': 0, 's2': 6, 's3': 8, 's4': 7, 's5': 8, 's6': 7, 's7': 10, 's8': 6, 's9': 5, 's10': 11, 's11': 7, 's12': 4, 's13': 8, 's14': 3, 's16': 8}
-optimized_L=726
-base_I=256
-optimized_M={0: 0, 2: 0, 3: 6, 4: 2, 5: 282, 6: 370, 7: 374, 8: 380, 9: 380, 10: 654, 11: 414, 12: 658, 13: 654, 14: 0, 16: 662}
-variable_lifetimes={'Ks': {'name': 'Ks', 'storage': 'SMEM', 'buffer': 'Ks', 'footprint_bytes': 32768, 'lifetime': 'dead_on_entry', 'producers': ['s0'], 'copies': [{'producer': 's0', 'producer_warp': 0, 'iter_offset': -2, 'live_start': -512, 'live_end': -231, 'live_end_exclusive': -230, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': -230}]}, {'producer': 's0', 'producer_warp': 0, 'iter_offset': -1, 'live_start': -256, 'live_end': 25, 'live_end_exclusive': 26, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 26}]}, {'producer': 's0', 'producer_warp': 0, 'iter_offset': 0, 'live_start': 0, 'live_end': 281, 'live_end_exclusive': 282, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 282}]}, {'producer': 's0', 'producer_warp': 0, 'iter_offset': 1, 'live_start': 256, 'live_end': 537, 'live_end_exclusive': 538, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 538}]}, {'producer': 's0', 'producer_warp': 0, 'iter_offset': 2, 'live_start': 512, 'live_end': 793, 'live_end_exclusive': 794, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 794}]}]}, 'smp': {'name': 'smp', 'storage': 'RMEM', 'buffer': 'smp', 'footprint_bytes': 8, 'lifetime': 'dead_on_entry', 'producers': ['s2'], 'copies': [{'producer': 's2', 'producer_warp': 6, 'iter_offset': -2, 'live_start': -512, 'live_end': -133, 'live_end_exclusive': -132, 'consumers': [{'consumer': 's3', 'distance': 0, 'consume_time': -506}, {'consumer': 's7', 'distance': 0, 'consume_time': -138}, {'consumer': 's8', 'distance': 0, 'consume_time': -132}]}, {'producer': 's2', 'producer_warp': 6, 'iter_offset': -1, 'live_start': -256, 'live_end': 123, 'live_end_exclusive': 124, 'consumers': [{'consumer': 's3', 'distance': 0, 'consume_time': -250}, {'consumer': 's7', 'distance': 0, 'consume_time': 118}, {'consumer': 's8', 'distance': 0, 'consume_time': 124}]}, {'producer': 's2', 'producer_warp': 6, 'iter_offset': 0, 'live_start': 0, 'live_end': 379, 'live_end_exclusive': 380, 'consumers': [{'consumer': 's3', 'distance': 0, 'consume_time': 6}, {'consumer': 's7', 'distance': 0, 'consume_time': 374}, {'consumer': 's8', 'distance': 0, 'consume_time': 380}]}, {'producer': 's2', 'producer_warp': 6, 'iter_offset': 1, 'live_start': 256, 'live_end': 635, 'live_end_exclusive': 636, 'consumers': [{'consumer': 's3', 'distance': 0, 'consume_time': 262}, {'consumer': 's7', 'distance': 0, 'consume_time': 630}, {'consumer': 's8', 'distance': 0, 'consume_time': 636}]}, {'producer': 's2', 'producer_warp': 6, 'iter_offset': 2, 'live_start': 512, 'live_end': 891, 'live_end_exclusive': 892, 'consumers': [{'consumer': 's3', 'distance': 0, 'consume_time': 518}, {'consumer': 's7', 'distance': 0, 'consume_time': 886}, {'consumer': 's8', 'distance': 0, 'consume_time': 892}]}]}, 'sm': {'name': 'sm', 'storage': 'RMEM', 'buffer': 'sm', 'footprint_bytes': 8, 'lifetime': 'dead_on_entry', 'producers': ['s3', 's6', 's7'], 'copies': [{'producer': 's3', 'producer_warp': 8, 'iter_offset': -2, 'live_start': -506, 'live_end': -143, 'live_end_exclusive': -142, 'consumers': [{'consumer': 's6', 'distance': 0, 'consume_time': -142}]}, {'producer': 's3', 'producer_warp': 8, 'iter_offset': -1, 'live_start': -250, 'live_end': 113, 'live_end_exclusive': 114, 'consumers': [{'consumer': 's6', 'distance': 0, 'consume_time': 114}]}, {'producer': 's3', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 6, 'live_end': 369, 'live_end_exclusive': 370, 'consumers': [{'consumer': 's6', 'distance': 0, 'consume_time': 370}]}, {'producer': 's3', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 262, 'live_end': 625, 'live_end_exclusive': 626, 'consumers': [{'consumer': 's6', 'distance': 0, 'consume_time': 626}]}, {'producer': 's3', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 518, 'live_end': 881, 'live_end_exclusive': 882, 'consumers': [{'consumer': 's6', 'distance': 0, 'consume_time': 882}]}, {'producer': 's6', 'producer_warp': 7, 'iter_offset': -2, 'live_start': -142, 'live_end': 113, 'live_end_exclusive': 114, 'consumers': [{'consumer': 's6', 'distance': 1, 'consume_time': 114}, {'consumer': 's7', 'distance': 0, 'consume_time': -138}, {'consumer': 's9', 'distance': 0, 'consume_time': -132}]}, {'producer': 's6', 'producer_warp': 7, 'iter_offset': -1, 'live_start': 114, 'live_end': 369, 'live_end_exclusive': 370, 'consumers': [{'consumer': 's6', 'distance': 1, 'consume_time': 370}, {'consumer': 's7', 'distance': 0, 'consume_time': 118}, {'consumer': 's9', 'distance': 0, 'consume_time': 124}]}, {'producer': 's6', 'producer_warp': 7, 'iter_offset': 0, 'live_start': 370, 'live_end': 625, 'live_end_exclusive': 626, 'consumers': [{'consumer': 's6', 'distance': 1, 'consume_time': 626}, {'consumer': 's7', 'distance': 0, 'consume_time': 374}, {'consumer': 's9', 'distance': 0, 'consume_time': 380}]}, {'producer': 's6', 'producer_warp': 7, 'iter_offset': 1, 'live_start': 626, 'live_end': 881, 'live_end_exclusive': 882, 'consumers': [{'consumer': 's6', 'distance': 1, 'consume_time': 882}, {'consumer': 's7', 'distance': 0, 'consume_time': 630}, {'consumer': 's9', 'distance': 0, 'consume_time': 636}]}, {'producer': 's6', 'producer_warp': 7, 'iter_offset': 2, 'live_start': 882, 'live_end': 1137, 'live_end_exclusive': 1138, 'consumers': [{'consumer': 's6', 'distance': 1, 'consume_time': 1138}, {'consumer': 's7', 'distance': 0, 'consume_time': 886}, {'consumer': 's9', 'distance': 0, 'consume_time': 892}]}, {'producer': 's7', 'producer_warp': 10, 'iter_offset': -2, 'live_start': -138, 'live_end': 117, 'live_end_exclusive': 118, 'consumers': [{'consumer': 's7', 'distance': 1, 'consume_time': 118}, {'consumer': 's8', 'distance': 0, 'consume_time': -132}, {'consumer': 's9', 'distance': 0, 'consume_time': -132}]}, {'producer': 's7', 'producer_warp': 10, 'iter_offset': -1, 'live_start': 118, 'live_end': 373, 'live_end_exclusive': 374, 'consumers': [{'consumer': 's7', 'distance': 1, 'consume_time': 374}, {'consumer': 's8', 'distance': 0, 'consume_time': 124}, {'consumer': 's9', 'distance': 0, 'consume_time': 124}]}, {'producer': 's7', 'producer_warp': 10, 'iter_offset': 0, 'live_start': 374, 'live_end': 629, 'live_end_exclusive': 630, 'consumers': [{'consumer': 's7', 'distance': 1, 'consume_time': 630}, {'consumer': 's8', 'distance': 0, 'consume_time': 380}, {'consumer': 's9', 'distance': 0, 'consume_time': 380}]}, {'producer': 's7', 'producer_warp': 10, 'iter_offset': 1, 'live_start': 630, 'live_end': 885, 'live_end_exclusive': 886, 'consumers': [{'consumer': 's7', 'distance': 1, 'consume_time': 886}, {'consumer': 's8', 'distance': 0, 'consume_time': 636}, {'consumer': 's9', 'distance': 0, 'consume_time': 636}]}, {'producer': 's7', 'producer_warp': 10, 'iter_offset': 2, 'live_start': 886, 'live_end': 1141, 'live_end_exclusive': 1142, 'consumers': [{'consumer': 's7', 'distance': 1, 'consume_time': 1142}, {'consumer': 's8', 'distance': 0, 'consume_time': 892}, {'consumer': 's9', 'distance': 0, 'consume_time': 892}]}]}, 'acc_s': {'name': 'acc_s', 'storage': 'RMEM', 'buffer': 'acc_s', 'footprint_bytes': 128, 'lifetime': 'dead_on_entry', 'producers': ['s4', 's5', 's9'], 'copies': [{'producer': 's4', 'producer_warp': 7, 'iter_offset': -2, 'live_start': -510, 'live_end': -231, 'live_end_exclusive': -230, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': -230}]}, {'producer': 's4', 'producer_warp': 7, 'iter_offset': -1, 'live_start': -254, 'live_end': 25, 'live_end_exclusive': 26, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 26}]}, {'producer': 's4', 'producer_warp': 7, 'iter_offset': 0, 'live_start': 2, 'live_end': 281, 'live_end_exclusive': 282, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 282}]}, {'producer': 's4', 'producer_warp': 7, 'iter_offset': 1, 'live_start': 258, 'live_end': 537, 'live_end_exclusive': 538, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 538}]}, {'producer': 's4', 'producer_warp': 7, 'iter_offset': 2, 'live_start': 514, 'live_end': 793, 'live_end_exclusive': 794, 'consumers': [{'consumer': 's5', 'distance': 0, 'consume_time': 794}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': -2, 'live_start': -230, 'live_end': 25, 'live_end_exclusive': 26, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 26}, {'consumer': 's6', 'distance': 0, 'consume_time': -142}, {'consumer': 's9', 'distance': 0, 'consume_time': -132}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': -1, 'live_start': 26, 'live_end': 281, 'live_end_exclusive': 282, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 282}, {'consumer': 's6', 'distance': 0, 'consume_time': 114}, {'consumer': 's9', 'distance': 0, 'consume_time': 124}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 282, 'live_end': 537, 'live_end_exclusive': 538, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 538}, {'consumer': 's6', 'distance': 0, 'consume_time': 370}, {'consumer': 's9', 'distance': 0, 'consume_time': 380}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 538, 'live_end': 793, 'live_end_exclusive': 794, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 794}, {'consumer': 's6', 'distance': 0, 'consume_time': 626}, {'consumer': 's9', 'distance': 0, 'consume_time': 636}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 794, 'live_end': 1049, 'live_end_exclusive': 1050, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 1050}, {'consumer': 's6', 'distance': 0, 'consume_time': 882}, {'consumer': 's9', 'distance': 0, 'consume_time': 892}]}, {'producer': 's9', 'producer_warp': 5, 'iter_offset': -2, 'live_start': -132, 'live_end': 141, 'live_end_exclusive': 142, 'consumers': [{'consumer': 's9', 'distance': 1, 'consume_time': 124}, {'consumer': 's10', 'distance': 0, 'consume_time': 142}, {'consumer': 's13', 'distance': 0, 'consume_time': 142}]}, {'producer': 's9', 'producer_warp': 5, 'iter_offset': -1, 'live_start': 124, 'live_end': 397, 'live_end_exclusive': 398, 'consumers': [{'consumer': 's9', 'distance': 1, 'consume_time': 380}, {'consumer': 's10', 'distance': 0, 'consume_time': 398}, {'consumer': 's13', 'distance': 0, 'consume_time': 398}]}, {'producer': 's9', 'producer_warp': 5, 'iter_offset': 0, 'live_start': 380, 'live_end': 653, 'live_end_exclusive': 654, 'consumers': [{'consumer': 's9', 'distance': 1, 'consume_time': 636}, {'consumer': 's10', 'distance': 0, 'consume_time': 654}, {'consumer': 's13', 'distance': 0, 'consume_time': 654}]}, {'producer': 's9', 'producer_warp': 5, 'iter_offset': 1, 'live_start': 636, 'live_end': 909, 'live_end_exclusive': 910, 'consumers': [{'consumer': 's9', 'distance': 1, 'consume_time': 892}, {'consumer': 's10', 'distance': 0, 'consume_time': 910}, {'consumer': 's13', 'distance': 0, 'consume_time': 910}]}, {'producer': 's9', 'producer_warp': 5, 'iter_offset': 2, 'live_start': 892, 'live_end': 1165, 'live_end_exclusive': 1166, 'consumers': [{'consumer': 's9', 'distance': 1, 'consume_time': 1148}, {'consumer': 's10', 'distance': 0, 'consume_time': 1166}, {'consumer': 's13', 'distance': 0, 'consume_time': 1166}]}]}, 'desc_a': {'name': 'desc_a', 'storage': 'RMEM', 'buffer': 'desc_a', 'footprint_bytes': 2, 'lifetime': 'dead_on_entry', 'producers': ['s5', 's16'], 'copies': [{'producer': 's5', 'producer_warp': 8, 'iter_offset': -2, 'live_start': -230, 'live_end': 25, 'live_end_exclusive': 26, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 26}, {'consumer': 's6', 'distance': 0, 'consume_time': -142}, {'consumer': 's9', 'distance': 0, 'consume_time': -132}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': -1, 'live_start': 26, 'live_end': 281, 'live_end_exclusive': 282, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 282}, {'consumer': 's6', 'distance': 0, 'consume_time': 114}, {'consumer': 's9', 'distance': 0, 'consume_time': 124}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 282, 'live_end': 537, 'live_end_exclusive': 538, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 538}, {'consumer': 's6', 'distance': 0, 'consume_time': 370}, {'consumer': 's9', 'distance': 0, 'consume_time': 380}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 538, 'live_end': 793, 'live_end_exclusive': 794, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 794}, {'consumer': 's6', 'distance': 0, 'consume_time': 626}, {'consumer': 's9', 'distance': 0, 'consume_time': 636}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 794, 'live_end': 1049, 'live_end_exclusive': 1050, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 1050}, {'consumer': 's6', 'distance': 0, 'consume_time': 882}, {'consumer': 's9', 'distance': 0, 'consume_time': 892}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': -2, 'live_start': 150, 'live_end': 405, 'live_end_exclusive': 406, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 406}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': -1, 'live_start': 406, 'live_end': 661, 'live_end_exclusive': 662, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 662}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 662, 'live_end': 917, 'live_end_exclusive': 918, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 918}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 918, 'live_end': 1173, 'live_end_exclusive': 1174, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 1174}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 1174, 'live_end': 1429, 'live_end_exclusive': 1430, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 1430}]}]}, 'desc_b': {'name': 'desc_b', 'storage': 'RMEM', 'buffer': 'desc_b', 'footprint_bytes': 2, 'lifetime': 'dead_on_entry', 'producers': ['s5', 's16'], 'copies': [{'producer': 's5', 'producer_warp': 8, 'iter_offset': -2, 'live_start': -230, 'live_end': 25, 'live_end_exclusive': 26, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 26}, {'consumer': 's6', 'distance': 0, 'consume_time': -142}, {'consumer': 's9', 'distance': 0, 'consume_time': -132}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': -1, 'live_start': 26, 'live_end': 281, 'live_end_exclusive': 282, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 282}, {'consumer': 's6', 'distance': 0, 'consume_time': 114}, {'consumer': 's9', 'distance': 0, 'consume_time': 124}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 282, 'live_end': 537, 'live_end_exclusive': 538, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 538}, {'consumer': 's6', 'distance': 0, 'consume_time': 370}, {'consumer': 's9', 'distance': 0, 'consume_time': 380}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 538, 'live_end': 793, 'live_end_exclusive': 794, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 794}, {'consumer': 's6', 'distance': 0, 'consume_time': 626}, {'consumer': 's9', 'distance': 0, 'consume_time': 636}]}, {'producer': 's5', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 794, 'live_end': 1049, 'live_end_exclusive': 1050, 'consumers': [{'consumer': 's5', 'distance': 1, 'consume_time': 1050}, {'consumer': 's6', 'distance': 0, 'consume_time': 882}, {'consumer': 's9', 'distance': 0, 'consume_time': 892}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': -2, 'live_start': 150, 'live_end': 405, 'live_end_exclusive': 406, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 406}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': -1, 'live_start': 406, 'live_end': 661, 'live_end_exclusive': 662, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 662}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 662, 'live_end': 917, 'live_end_exclusive': 918, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 918}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 918, 'live_end': 1173, 'live_end_exclusive': 1174, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 1174}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 1174, 'live_end': 1429, 'live_end_exclusive': 1430, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 1430}]}]}, 'ss': {'name': 'ss', 'storage': 'RMEM', 'buffer': 'ss', 'footprint_bytes': 8, 'lifetime': 'dead_on_entry', 'producers': ['s8'], 'copies': [{'producer': 's8', 'producer_warp': 6, 'iter_offset': -2, 'live_start': -132, 'live_end': 145, 'live_end_exclusive': 146, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 124}, {'consumer': 's11', 'distance': 0, 'consume_time': -98}, {'consumer': 's12', 'distance': 0, 'consume_time': 146}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': -1, 'live_start': 124, 'live_end': 401, 'live_end_exclusive': 402, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 380}, {'consumer': 's11', 'distance': 0, 'consume_time': 158}, {'consumer': 's12', 'distance': 0, 'consume_time': 402}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': 0, 'live_start': 380, 'live_end': 657, 'live_end_exclusive': 658, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 636}, {'consumer': 's11', 'distance': 0, 'consume_time': 414}, {'consumer': 's12', 'distance': 0, 'consume_time': 658}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': 1, 'live_start': 636, 'live_end': 913, 'live_end_exclusive': 914, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 892}, {'consumer': 's11', 'distance': 0, 'consume_time': 670}, {'consumer': 's12', 'distance': 0, 'consume_time': 914}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': 2, 'live_start': 892, 'live_end': 1169, 'live_end_exclusive': 1170, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 1148}, {'consumer': 's11', 'distance': 0, 'consume_time': 926}, {'consumer': 's12', 'distance': 0, 'consume_time': 1170}]}]}, 'ss_shared': {'name': 'ss_shared', 'storage': 'SMEM', 'buffer': 'ss_shared', 'footprint_bytes': 512, 'lifetime': 'dead_on_entry', 'producers': ['s8'], 'copies': [{'producer': 's8', 'producer_warp': 6, 'iter_offset': -2, 'live_start': -132, 'live_end': 145, 'live_end_exclusive': 146, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 124}, {'consumer': 's11', 'distance': 0, 'consume_time': -98}, {'consumer': 's12', 'distance': 0, 'consume_time': 146}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': -1, 'live_start': 124, 'live_end': 401, 'live_end_exclusive': 402, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 380}, {'consumer': 's11', 'distance': 0, 'consume_time': 158}, {'consumer': 's12', 'distance': 0, 'consume_time': 402}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': 0, 'live_start': 380, 'live_end': 657, 'live_end_exclusive': 658, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 636}, {'consumer': 's11', 'distance': 0, 'consume_time': 414}, {'consumer': 's12', 'distance': 0, 'consume_time': 658}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': 1, 'live_start': 636, 'live_end': 913, 'live_end_exclusive': 914, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 892}, {'consumer': 's11', 'distance': 0, 'consume_time': 670}, {'consumer': 's12', 'distance': 0, 'consume_time': 914}]}, {'producer': 's8', 'producer_warp': 6, 'iter_offset': 2, 'live_start': 892, 'live_end': 1169, 'live_end_exclusive': 1170, 'consumers': [{'consumer': 's8', 'distance': 1, 'consume_time': 1148}, {'consumer': 's11', 'distance': 0, 'consume_time': 926}, {'consumer': 's12', 'distance': 0, 'consume_time': 1170}]}]}, 'ssum': {'name': 'ssum', 'storage': 'RMEM', 'buffer': 'ssum', 'footprint_bytes': 8, 'lifetime': 'dead_on_entry', 'producers': ['s10'], 'copies': [{'producer': 's10', 'producer_warp': 11, 'iter_offset': -2, 'live_start': 142, 'live_end': 397, 'live_end_exclusive': 398, 'consumers': [{'consumer': 's10', 'distance': 1, 'consume_time': 398}, {'consumer': 's12', 'distance': 0, 'consume_time': 146}]}, {'producer': 's10', 'producer_warp': 11, 'iter_offset': -1, 'live_start': 398, 'live_end': 653, 'live_end_exclusive': 654, 'consumers': [{'consumer': 's10', 'distance': 1, 'consume_time': 654}, {'consumer': 's12', 'distance': 0, 'consume_time': 402}]}, {'producer': 's10', 'producer_warp': 11, 'iter_offset': 0, 'live_start': 654, 'live_end': 909, 'live_end_exclusive': 910, 'consumers': [{'consumer': 's10', 'distance': 1, 'consume_time': 910}, {'consumer': 's12', 'distance': 0, 'consume_time': 658}]}, {'producer': 's10', 'producer_warp': 11, 'iter_offset': 1, 'live_start': 910, 'live_end': 1165, 'live_end_exclusive': 1166, 'consumers': [{'consumer': 's10', 'distance': 1, 'consume_time': 1166}, {'consumer': 's12', 'distance': 0, 'consume_time': 914}]}, {'producer': 's10', 'producer_warp': 11, 'iter_offset': 2, 'live_start': 1166, 'live_end': 1421, 'live_end_exclusive': 1422, 'consumers': [{'consumer': 's10', 'distance': 1, 'consume_time': 1422}, {'consumer': 's12', 'distance': 0, 'consume_time': 1170}]}]}, 'acc_o': {'name': 'acc_o', 'storage': 'RMEM', 'buffer': 'acc_o', 'footprint_bytes': 256, 'lifetime': 'dead_on_entry', 'producers': ['s11', 's16'], 'copies': [{'producer': 's11', 'producer_warp': 7, 'iter_offset': -2, 'live_start': -98, 'live_end': 157, 'live_end_exclusive': 158, 'consumers': [{'consumer': 's11', 'distance': 1, 'consume_time': 158}, {'consumer': 's16', 'distance': 0, 'consume_time': 150}]}, {'producer': 's11', 'producer_warp': 7, 'iter_offset': -1, 'live_start': 158, 'live_end': 413, 'live_end_exclusive': 414, 'consumers': [{'consumer': 's11', 'distance': 1, 'consume_time': 414}, {'consumer': 's16', 'distance': 0, 'consume_time': 406}]}, {'producer': 's11', 'producer_warp': 7, 'iter_offset': 0, 'live_start': 414, 'live_end': 669, 'live_end_exclusive': 670, 'consumers': [{'consumer': 's11', 'distance': 1, 'consume_time': 670}, {'consumer': 's16', 'distance': 0, 'consume_time': 662}]}, {'producer': 's11', 'producer_warp': 7, 'iter_offset': 1, 'live_start': 670, 'live_end': 925, 'live_end_exclusive': 926, 'consumers': [{'consumer': 's11', 'distance': 1, 'consume_time': 926}, {'consumer': 's16', 'distance': 0, 'consume_time': 918}]}, {'producer': 's11', 'producer_warp': 7, 'iter_offset': 2, 'live_start': 926, 'live_end': 1181, 'live_end_exclusive': 1182, 'consumers': [{'consumer': 's11', 'distance': 1, 'consume_time': 1182}, {'consumer': 's16', 'distance': 0, 'consume_time': 1174}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': -2, 'live_start': 150, 'live_end': 405, 'live_end_exclusive': 406, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 406}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': -1, 'live_start': 406, 'live_end': 661, 'live_end_exclusive': 662, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 662}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 662, 'live_end': 917, 'live_end_exclusive': 918, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 918}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 918, 'live_end': 1173, 'live_end_exclusive': 1174, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 1174}]}, {'producer': 's16', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 1174, 'live_end': 1429, 'live_end_exclusive': 1430, 'consumers': [{'consumer': 's16', 'distance': 1, 'consume_time': 1430}]}]}, 'ls': {'name': 'ls', 'storage': 'RMEM', 'buffer': 'ls', 'footprint_bytes': 8, 'lifetime': 'dead_on_entry', 'producers': ['s12'], 'copies': [{'producer': 's12', 'producer_warp': 4, 'iter_offset': -2, 'live_start': 146, 'live_end': 401, 'live_end_exclusive': 402, 'consumers': [{'consumer': 's12', 'distance': 1, 'consume_time': 402}]}, {'producer': 's12', 'producer_warp': 4, 'iter_offset': -1, 'live_start': 402, 'live_end': 657, 'live_end_exclusive': 658, 'consumers': [{'consumer': 's12', 'distance': 1, 'consume_time': 658}]}, {'producer': 's12', 'producer_warp': 4, 'iter_offset': 0, 'live_start': 658, 'live_end': 913, 'live_end_exclusive': 914, 'consumers': [{'consumer': 's12', 'distance': 1, 'consume_time': 914}]}, {'producer': 's12', 'producer_warp': 4, 'iter_offset': 1, 'live_start': 914, 'live_end': 1169, 'live_end_exclusive': 1170, 'consumers': [{'consumer': 's12', 'distance': 1, 'consume_time': 1170}]}, {'producer': 's12', 'producer_warp': 4, 'iter_offset': 2, 'live_start': 1170, 'live_end': 1425, 'live_end_exclusive': 1426, 'consumers': [{'consumer': 's12', 'distance': 1, 'consume_time': 1426}]}]}, 'acc_s_c': {'name': 'acc_s_c', 'storage': 'SMEM', 'buffer': 'acc_s_c', 'footprint_bytes': 16384, 'lifetime': 'dead_on_entry', 'producers': ['s13'], 'copies': [{'producer': 's13', 'producer_warp': 8, 'iter_offset': -2, 'live_start': 142, 'live_end': 149, 'live_end_exclusive': 150, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 150}]}, {'producer': 's13', 'producer_warp': 8, 'iter_offset': -1, 'live_start': 398, 'live_end': 405, 'live_end_exclusive': 406, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 406}]}, {'producer': 's13', 'producer_warp': 8, 'iter_offset': 0, 'live_start': 654, 'live_end': 661, 'live_end_exclusive': 662, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 662}]}, {'producer': 's13', 'producer_warp': 8, 'iter_offset': 1, 'live_start': 910, 'live_end': 917, 'live_end_exclusive': 918, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 918}]}, {'producer': 's13', 'producer_warp': 8, 'iter_offset': 2, 'live_start': 1166, 'live_end': 1173, 'live_end_exclusive': 1174, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 1174}]}]}, 'Vs': {'name': 'Vs', 'storage': 'SMEM', 'buffer': 'Vs', 'footprint_bytes': 32768, 'lifetime': 'dead_on_entry', 'producers': ['s14'], 'copies': [{'producer': 's14', 'producer_warp': 3, 'iter_offset': -2, 'live_start': -512, 'live_end': 149, 'live_end_exclusive': 150, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 150}]}, {'producer': 's14', 'producer_warp': 3, 'iter_offset': -1, 'live_start': -256, 'live_end': 405, 'live_end_exclusive': 406, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 406}]}, {'producer': 's14', 'producer_warp': 3, 'iter_offset': 0, 'live_start': 0, 'live_end': 661, 'live_end_exclusive': 662, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 662}]}, {'producer': 's14', 'producer_warp': 3, 'iter_offset': 1, 'live_start': 256, 'live_end': 917, 'live_end_exclusive': 918, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 918}]}, {'producer': 's14', 'producer_warp': 3, 'iter_offset': 2, 'live_start': 512, 'live_end': 1173, 'live_end_exclusive': 1174, 'consumers': [{'consumer': 's16', 'distance': 0, 'consume_time': 1174}]}]}}
+# warp_assign={'s0': 1, 's2': 11, 's3': 8, 's4': 7, 's5': 8, 's6': 11, 's7': 11, 's8': 5, 's9': 10, 's10': 9, 's11': 9, 's12': 9, 's13': 11, 's14': 0, 's16': 4}
+# optimized_L=754
+# base_I=257
+# optimized_M={0: 0, 2: 0, 3: 6, 4: 2, 5: 282, 6: 370, 7: 374, 8: 380, 9: 380, 10: 654, 11: 414, 12: 658, 13: 654, 14: 0, 16: 690}
+
+warp_assign={'s0__u0': 7, 's0__u1': 7, 's2': 3, 's3': 3, 's4__u0': 3, 's4__u1': 3, 's4__u2': 3, 's4__u3': 3, 's4__u4': 3, 's4__u5': 3, 's4__u6': 3, 's4__u7': 3, 's5__u0': 0, 's5__u1': 0, 's5__u2': 0, 's5__u3': 0, 's5__u4': 0, 's5__u5': 0, 's5__u6': 0, 's5__u7': 0, 's6__u0': 1, 's6__u1': 1, 's7__u0': 0, 's7__u1': 1, 's8__u0': 3, 's8__u1': 1, 's9__u0': 1, 's9__u1': 1, 's9__u2': 1, 's9__u3': 1, 's9__u4': 1, 's9__u5': 1, 's9__u6': 1, 's9__u7': 1, 's9__u8': 1, 's9__u9': 1, 's9__u10': 1, 's9__u11': 1, 's9__u12': 1, 's9__u13': 1, 's9__u14': 1, 's9__u15': 1, 's9__u16': 1, 's9__u17': 1, 's9__u18': 1, 's9__u19': 1, 's9__u20': 1, 's9__u21': 1, 's9__u22': 1, 's9__u23': 1, 's9__u24': 1, 's9__u25': 1, 's9__u26': 1, 's9__u27': 1, 's9__u28': 1, 's9__u29': 1, 's9__u30': 1, 's9__u31': 1, 's10__u0': 3, 's10__u1': 1, 's11__u0': 1, 's11__u1': 1, 's11__u2': 1, 's11__u3': 1, 's11__u4': 1, 's11__u5': 1, 's11__u6': 1, 's11__u7': 1, 's11__u8': 1, 's11__u9': 1, 's11__u10': 1, 's11__u11': 1, 's11__u12': 1, 's11__u13': 1, 's11__u14': 1, 's11__u15': 1, 's11__u16': 1, 's11__u17': 1, 's11__u18': 1, 's11__u19': 1, 's11__u20': 1, 's11__u21': 1, 's11__u22': 1, 's11__u23': 1, 's11__u24': 1, 's11__u25': 1, 's11__u26': 1, 's11__u27': 1, 's11__u28': 1, 's11__u29': 1, 's11__u30': 1, 's11__u31': 1, 's11__u32': 1, 's11__u33': 1, 's11__u34': 1, 's11__u35': 1, 's11__u36': 1, 's11__u37': 1, 's11__u38': 1, 's11__u39': 1, 's11__u40': 1, 's11__u41': 1, 's11__u42': 1, 's11__u43': 1, 's11__u44': 1, 's11__u45': 1, 's11__u46': 1, 's11__u47': 1, 's11__u48': 1, 's11__u49': 1, 's11__u50': 1, 's11__u51': 1, 's11__u52': 1, 's11__u53': 1, 's11__u54': 1, 's11__u55': 1, 's11__u56': 1, 's11__u57': 1, 's11__u58': 1, 's11__u59': 1, 's11__u60': 1, 's11__u61': 1, 's11__u62': 1, 's11__u63': 1, 's12__u0': 3, 's12__u1': 1, 's13__u0': 3, 's13__u1': 3, 's13__u2': 3, 's13__u3': 3, 's13__u4': 3, 's13__u5': 3, 's13__u6': 3, 's13__u7': 1, 's14__u0': 7, 's14__u1': 7, 's16__u0': 0, 's16__u1': 0, 's16__u2': 0, 's16__u3': 0}
+optimized_L=802
+base_I=232
+optimized_M={0: 0, 2: 0, 3: 5, 4: 0, 5: 282, 6: 314, 7: 317, 8: 322, 9: 546, 10: 572, 11: 572, 12: 575, 13: 572, 14: 0, 16: 586}
+expanded_M={'s0__u0': 0, 's0__u1': 1, 's2': 0, 's3': 5, 's4__u0': 0, 's4__u1': 0, 's4__u2': 0, 's4__u3': 0, 's4__u4': 0, 's4__u5': 0, 's4__u6': 0, 's4__u7': 0, 's5__u0': 282, 's5__u1': 314, 's5__u2': 346, 's5__u3': 378, 's5__u4': 410, 's5__u5': 442, 's5__u6': 474, 's5__u7': 506, 's6__u0': 314, 's6__u1': 538, 's7__u0': 317, 's7__u1': 541, 's8__u0': 322, 's8__u1': 546, 's9__u0': 546, 's9__u1': 546, 's9__u2': 546, 's9__u3': 546, 's9__u4': 546, 's9__u5': 554, 's9__u6': 546, 's9__u7': 546, 's9__u8': 554, 's9__u9': 546, 's9__u10': 546, 's9__u11': 546, 's9__u12': 562, 's9__u13': 562, 's9__u14': 546, 's9__u15': 546, 's9__u16': 546, 's9__u17': 546, 's9__u18': 554, 's9__u19': 554, 's9__u20': 546, 's9__u21': 554, 's9__u22': 554, 's9__u23': 554, 's9__u24': 554, 's9__u25': 554, 's9__u26': 554, 's9__u27': 554, 's9__u28': 554, 's9__u29': 554, 's9__u30': 554, 's9__u31': 554, 's10__u0': 572, 's10__u1': 588, 's11__u0': 572, 's11__u1': 572, 's11__u2': 572, 's11__u3': 572, 's11__u4': 573, 's11__u5': 572, 's11__u6': 572, 's11__u7': 572, 's11__u8': 572, 's11__u9': 572, 's11__u10': 572, 's11__u11': 572, 's11__u12': 572, 's11__u13': 572, 's11__u14': 572, 's11__u15': 572, 's11__u16': 572, 's11__u17': 572, 's11__u18': 572, 's11__u19': 572, 's11__u20': 572, 's11__u21': 572, 's11__u22': 572, 's11__u23': 572, 's11__u24': 572, 's11__u25': 572, 's11__u26': 572, 's11__u27': 573, 's11__u28': 572, 's11__u29': 572, 's11__u30': 572, 's11__u31': 572, 's11__u32': 573, 's11__u33': 572, 's11__u34': 572, 's11__u35': 572, 's11__u36': 572, 's11__u37': 572, 's11__u38': 572, 's11__u39': 572, 's11__u40': 572, 's11__u41': 572, 's11__u42': 572, 's11__u43': 572, 's11__u44': 572, 's11__u45': 572, 's11__u46': 572, 's11__u47': 572, 's11__u48': 572, 's11__u49': 572, 's11__u50': 572, 's11__u51': 572, 's11__u52': 572, 's11__u53': 572, 's11__u54': 572, 's11__u55': 572, 's11__u56': 572, 's11__u57': 572, 's11__u58': 573, 's11__u59': 573, 's11__u60': 572, 's11__u61': 572, 's11__u62': 572, 's11__u63': 572, 's12__u0': 575, 's12__u1': 591, 's13__u0': 572, 's13__u1': 572, 's13__u2': 573, 's13__u3': 572, 's13__u4': 572, 's13__u5': 580, 's13__u6': 573, 's13__u7': 588, 's14__u0': 0, 's14__u1': 1, 's16__u0': 586, 's16__u1': 650, 's16__u2': 714, 's16__u3': 786}
 
 # naive mod sched
-I = 512
-L = 1174
-M = {0: 0, 2: 432, 3: 426, 4: 214, 5: 282, 6: 434, 7: 440, 8: 864, 9: 448, 10: 1164, 11: 914, 12: 1170, 13: 978, 14: 764, 16: 1046}
+I = 257
+L = 754
+M = {0: 0, 2: 358, 3: 364, 4: 246, 5: 282, 6: 370, 7: 374, 8: 588, 9: 380, 10: 748, 11: 622, 12: 752, 13: 654, 14: 408, 16: 690}
 
 # ========================================
 # 执行+发射延迟
-latencies={0: 282, 1: 1, 2: 8, 3: 8, 4: 68, 5: 152, 6: 6, 7: 8, 8: 50, 9: 530, 10: 6, 11: 132, 12: 8, 13: 68, 14: 282, 15: 1, 16: 176}
+# latencies={0: 282, 1: 1, 2: 8, 3: 8, 4: 68, 5: 152, 6: 6, 7: 8, 8: 50, 9: 530, 10: 6, 11: 132, 12: 8, 13: 68, 14: 282, 15: 1, 16: 176}
 # 发射延迟
-duration={0: 2, 1: 1, 2: 4, 3: 4, 4: 64, 5: 128, 6: 4, 7: 4, 8: 32, 9: 512, 10: 4, 11: 128, 12: 4, 13: 64, 14: 2, 15: 1, 16: 128}
+# duration={0: 2, 1: 1, 2: 4, 3: 4, 4: 64, 5: 128, 6: 4, 7: 4, 8: 32, 9: 512, 10: 4, 11: 128, 12: 4, 13: 64, 14: 2, 15: 1, 16: 128}
+
+latencies={(0, 0): 281, (0, 1): 281, (2, 0): 5, (3, 0): 5, (4, 0): 5, (4, 1): 5, (4, 2): 5, (4, 3): 5, (4, 4): 5, (4, 5): 5, (4, 6): 5, (4, 7): 5, (5, 0): 32, (5, 1): 32, (5, 2): 32, (5, 3): 32, (5, 4): 32, (5, 5): 32, (5, 6): 32, (5, 7): 32, (6, 0): 3, (6, 1): 3, (7, 0): 5, (7, 1): 5, (8, 0): 26, (8, 1): 26, (9, 0): 26, (9, 1): 26, (9, 2): 26, (9, 3): 26, (9, 4): 26, (9, 5): 26, (9, 6): 26, (9, 7): 26, (9, 8): 26, (9, 9): 26, (9, 10): 26, (9, 11): 26, (9, 12): 26, (9, 13): 26, (9, 14): 26, (9, 15): 26, (9, 16): 26, (9, 17): 26, (9, 18): 26, (9, 19): 26, (9, 20): 26, (9, 21): 26, (9, 22): 26, (9, 23): 26, (9, 24): 26, (9, 25): 26, (9, 26): 26, (9, 27): 26, (9, 28): 26, (9, 29): 26, (9, 30): 26, (9, 31): 26, (10, 0): 3, (10, 1): 3, (11, 0): 5, (11, 1): 5, (11, 2): 5, (11, 3): 5, (11, 4): 5, (11, 5): 5, (11, 6): 5, (11, 7): 5, (11, 8): 5, (11, 9): 5, (11, 10): 5, (11, 11): 5, (11, 12): 5, (11, 13): 5, (11, 14): 5, (11, 15): 5, (11, 16): 5, (11, 17): 5, (11, 18): 5, (11, 19): 5, (11, 20): 5, (11, 21): 5, (11, 22): 5, (11, 23): 5, (11, 24): 5, (11, 25): 5, (11, 26): 5, (11, 27): 5, (11, 28): 5, (11, 29): 5, (11, 30): 5, (11, 31): 5, (11, 32): 5, (11, 33): 5, (11, 34): 5, (11, 35): 5, (11, 36): 5, (11, 37): 5, (11, 38): 5, (11, 39): 5, (11, 40): 5, (11, 41): 5, (11, 42): 5, (11, 43): 5, (11, 44): 5, (11, 45): 5, (11, 46): 5, (11, 47): 5, (11, 48): 5, (11, 49): 5, (11, 50): 5, (11, 51): 5, (11, 52): 5, (11, 53): 5, (11, 54): 5, (11, 55): 5, (11, 56): 5, (11, 57): 5, (11, 58): 5, (11, 59): 5, (11, 60): 5, (11, 61): 5, (11, 62): 5, (11, 63): 5, (12, 0): 5, (12, 1): 5, (13, 0): 5, (13, 1): 5, (13, 2): 5, (13, 3): 5, (13, 4): 5, (13, 5): 5, (13, 6): 5, (13, 7): 5, (14, 0): 281, (14, 1): 281, (16, 0): 64, (16, 1): 64, (16, 2): 64, (16, 3): 64}
+duration={(0, 0): 1, (0, 1): 1, (2, 0): 1, (3, 0): 1, (4, 0): 1, (4, 1): 1, (4, 2): 1, (4, 3): 1, (4, 4): 1, (4, 5): 1, (4, 6): 1, (4, 7): 1, (5, 0): 8, (5, 1): 8, (5, 2): 8, (5, 3): 8, (5, 4): 8, (5, 5): 8, (5, 6): 8, (5, 7): 8, (6, 0): 1, (6, 1): 1, (7, 0): 1, (7, 1): 1, (8, 0): 8, (8, 1): 8, (9, 0): 8, (9, 1): 8, (9, 2): 8, (9, 3): 8, (9, 4): 8, (9, 5): 8, (9, 6): 8, (9, 7): 8, (9, 8): 8, (9, 9): 8, (9, 10): 8, (9, 11): 8, (9, 12): 8, (9, 13): 8, (9, 14): 8, (9, 15): 8, (9, 16): 8, (9, 17): 8, (9, 18): 8, (9, 19): 8, (9, 20): 8, (9, 21): 8, (9, 22): 8, (9, 23): 8, (9, 24): 8, (9, 25): 8, (9, 26): 8, (9, 27): 8, (9, 28): 8, (9, 29): 8, (9, 30): 8, (9, 31): 8, (10, 0): 1, (10, 1): 1, (11, 0): 1, (11, 1): 1, (11, 2): 1, (11, 3): 1, (11, 4): 1, (11, 5): 1, (11, 6): 1, (11, 7): 1, (11, 8): 1, (11, 9): 1, (11, 10): 1, (11, 11): 1, (11, 12): 1, (11, 13): 1, (11, 14): 1, (11, 15): 1, (11, 16): 1, (11, 17): 1, (11, 18): 1, (11, 19): 1, (11, 20): 1, (11, 21): 1, (11, 22): 1, (11, 23): 1, (11, 24): 1, (11, 25): 1, (11, 26): 1, (11, 27): 1, (11, 28): 1, (11, 29): 1, (11, 30): 1, (11, 31): 1, (11, 32): 1, (11, 33): 1, (11, 34): 1, (11, 35): 1, (11, 36): 1, (11, 37): 1, (11, 38): 1, (11, 39): 1, (11, 40): 1, (11, 41): 1, (11, 42): 1, (11, 43): 1, (11, 44): 1, (11, 45): 1, (11, 46): 1, (11, 47): 1, (11, 48): 1, (11, 49): 1, (11, 50): 1, (11, 51): 1, (11, 52): 1, (11, 53): 1, (11, 54): 1, (11, 55): 1, (11, 56): 1, (11, 57): 1, (11, 58): 1, (11, 59): 1, (11, 60): 1, (11, 61): 1, (11, 62): 1, (11, 63): 1, (12, 0): 1, (12, 1): 1, (13, 0): 1, (13, 1): 1, (13, 2): 1, (13, 3): 1, (13, 4): 1, (13, 5): 1, (13, 6): 1, (13, 7): 1, (14, 0): 1, (14, 1): 1, (16, 0): 16, (16, 1): 16, (16, 2): 16, (16, 3): 16}
+
+
 op_desc = {
     0 : "tma_copy Ks" ,
     1 : "wait Ks" ,
@@ -106,28 +116,6 @@ op_desc = {
     # acc_o = acc_o / ls
     # copy acc_o to Output
 }
-
-# op_desc = {
-#     0 : "async_copy Ks" ,
-#     1 : "wait Ks" ,
-#     2 : "smp = sm" ,
-#     3 : "clear sm" ,
-#     4 : "clear acc_s" ,
-#     5 : "acc_s = wgmmaQK" ,
-#     6 : "sm = reduce_max(acc_s)" ,
-#     7 : "sm = max(sm, smp)  // update global max" ,
-#     8 : "ss = exp2(smp - sm) // get scale" ,
-#     9 : "acc_s = exp2(acc_s - sm)  // softmax's exp" ,
-#     10 : "ssum = reduce_sum(acc_s ) // softmax's sumexp" ,
-#     11 : "acc_o =  acc_o * ss // rescale last PV" ,
-#     12 : "ls=ls * ss + ssum // accumulate sumexp" ,
-#     13 : "acc_s_c = castf32tof16(acc_s)" ,
-#     14 : "async_copy Vs" ,
-#     15 : "wait Vs" ,
-#     16 : "acc_o += wgmma(acc_s_c, V)" ,
-#     # acc_o = acc_o / ls
-#     # copy acc_o to Output
-# }
 
 unit_mapping = {
     'TMA': [0, 1, 14, 15],
@@ -170,34 +158,113 @@ LIFETIME_STORAGE_HATCHES = {
 }
 
 
+def parse_op_key(op_key):
+    """Return (op_id, unroll_id) for keys like 9, (9, 3), s9, or s9__u3."""
+    if isinstance(op_key, tuple):
+        return op_key
+    if isinstance(op_key, int):
+        return (op_key, None)
+    if isinstance(op_key, str) and op_key.startswith('s'):
+        name = op_key[1:]
+        if '__u' in name:
+            op_id, unroll_id = name.split('__u', 1)
+            return (int(op_id), int(unroll_id))
+        return (int(name), None)
+    raise ValueError(f"Unsupported op key: {op_key!r}")
+
+
+def format_op_key(op_key):
+    op, unroll = parse_op_key(op_key)
+    return f"s{op}" if unroll is None else f"s{op}__u{unroll}"
+
+
+def op_key_sort_key(op_key):
+    op, unroll = parse_op_key(op_key)
+    return (op, -1 if unroll is None else unroll)
+
+
+def build_fine_grained_schedule(schedule_m, fine_latency_table, fine_duration_table, *, allow_parent_fallback=False):
+    """Expand op-level M into fine-grained op instances when needed."""
+    fine_keys = sorted(
+        set(fine_latency_table) | set(fine_duration_table),
+        key=op_key_sort_key,
+    )
+    fine_key_count_by_op = {}
+    for fine_key in fine_keys:
+        op, _ = parse_op_key(fine_key)
+        fine_key_count_by_op[op] = fine_key_count_by_op.get(op, 0) + 1
+
+    fine_schedule = {}
+    fallback_keys = []
+    for fine_key in fine_keys:
+        op, _ = parse_op_key(fine_key)
+        exact_candidates = (fine_key, format_op_key(fine_key))
+        parent_candidates = ((op, None), op, f"s{op}")
+        can_use_parent = allow_parent_fallback or fine_key_count_by_op.get(op, 0) == 1
+        candidates = exact_candidates + (parent_candidates if can_use_parent else ())
+        for candidate in candidates:
+            if candidate in schedule_m:
+                fine_schedule[fine_key] = schedule_m[candidate]
+                if (
+                    candidate in parent_candidates
+                    and parse_op_key(fine_key)[1] is not None
+                    and fine_key_count_by_op.get(op, 0) > 1
+                ):
+                    fallback_keys.append(format_op_key(fine_key))
+                break
+        else:
+            raise KeyError(f"Missing schedule time for {format_op_key(fine_key)} / parent s{op}")
+    if fallback_keys:
+        print(
+            "Warning: using collapsed parent-level M for fine-grained rows; "
+            "copy expanded_M from the latest log into expanded_M for dependency-accurate timing. "
+            f"Fallback rows: {fallback_keys[:8]}{'...' if len(fallback_keys) > 8 else ''}"
+        )
+    return fine_schedule
+
+
 def build_warpgroup_info(warp_assignment):
-    """Return op->warpgroup and warpgroup->op descriptions."""
-    op_wgid = {int(op_name[1:]): op_warp // 4 for op_name, op_warp in warp_assignment.items()}
+    """Return fine-op->warpgroup and warpgroup->op descriptions."""
+    op_wgid = {parse_op_key(op_name): op_warp // 4 for op_name, op_warp in warp_assignment.items()}
     active_wgids = sorted(set(op_wgid.values()))
     wgid_ops = {wgid: [] for wgid in active_wgids}
-    for op, wgid in sorted(op_wgid.items()):
-        wgid_ops[wgid].append(op_desc[op])
+    for op_key, wgid in sorted(op_wgid.items(), key=lambda item: op_key_sort_key(item[0])):
+        op, _ = parse_op_key(op_key)
+        wgid_ops[wgid].append(format_op_key(op_key))
     return op_wgid, active_wgids, wgid_ops
 
 
-def build_y_layout():
-    """Build one stable y row for each op, grouped by execution unit."""
+def get_warpgroup(op_wgid, op_key):
+    op, _ = parse_op_key(op_key)
+    return op_wgid.get(op_key, op_wgid.get((op, None)))
+
+
+def build_y_layout(op_keys):
+    """Build one stable y row for each fine-grained op, grouped by execution unit."""
     y_ticks_positions = []
     y_ticks_labels = []
     op_y_pos = {}
     current_y = 0
     unit_boundaries = []
+    op_keys_by_unit = {unit: [] for unit in UNITS_ORDER}
+    for op_key in sorted(op_keys, key=op_key_sort_key):
+        op, _ = parse_op_key(op_key)
+        for unit, unit_ops in unit_mapping.items():
+            if op in unit_ops:
+                op_keys_by_unit.setdefault(unit, []).append(op_key)
+                break
 
     for unit in reversed(UNITS_ORDER):
-        unit_ops = sorted(unit_mapping.get(unit, []))
+        unit_ops = op_keys_by_unit.get(unit, [])
         if not unit_ops:
             continue
 
         start_y_for_unit = current_y
-        for op in unit_ops:
-            op_y_pos[op] = current_y
+        for op_key in unit_ops:
+            op, _ = parse_op_key(op_key)
+            op_y_pos[op_key] = current_y
             y_ticks_positions.append(current_y)
-            y_ticks_labels.append(f"{unit}: s{op}")
+            y_ticks_labels.append(f"{unit}: {format_op_key(op_key)}")
             current_y += 1
 
         end_y_for_unit = current_y - 1
@@ -222,11 +289,11 @@ def build_overlap_items(schedule_m, ii, schedule_l, iteration_configs):
     # 这里画的是 logical iteration 的绝对 M 时间线，不能用 M % II。
     # M % II 只适合画资源槽位表；用于依赖时间线会把跨 II 的操作折回前面。
     for iteration in iteration_configs:
-        for op, start_time in schedule_m.items():
+        for op_key, start_time in schedule_m.items():
             t_start = start_time + iteration['start']
-            t_end = t_start + latencies[op]
-            t_issue_end = t_start + duration[op]
-            plot_items.append((op, t_start, t_end, t_issue_end, iteration['stage']))
+            t_end = t_start + latencies[op_key]
+            t_issue_end = t_start + duration[op_key]
+            plot_items.append((op_key, t_start, t_end, t_issue_end, iteration['stage']))
             all_events.update((t_start, t_end, t_issue_end))
 
     sorted_events = sorted(all_events)
@@ -272,7 +339,7 @@ def choose_xticks(sorted_events, important_times, max_xtick_labels=34, min_tick_
     return sorted(set(xtick_positions))
 
 
-def draw_schedule_block(ax, op, cx_start, cx_end, cx_issue_end, y_pos, colors, label, hatch=None):
+def draw_schedule_block(ax, cx_start, cx_end, cx_issue_end, y_pos, colors, label, hatch=None):
     c_width = max(cx_end - cx_start, 0.25)
     issue_width = max(cx_issue_end - cx_start, 0.25)
     rect = patches.Rectangle(
@@ -304,27 +371,28 @@ def draw_schedule_block(ax, op, cx_start, cx_end, cx_issue_end, y_pos, colors, l
 
 
 def draw_overlap_schedule(schedule_m, ii, schedule_l, output_filename, op_wgid=None, active_wgids=None):
-    op_y_pos, y_ticks_positions, y_ticks_labels, unit_boundaries, total_rows = build_y_layout()
+    op_y_pos, y_ticks_positions, y_ticks_labels, unit_boundaries, total_rows = build_y_layout(schedule_m)
     iteration_configs = make_iteration_configs(ii)
     plot_items, sorted_events, time_to_coord = build_overlap_items(
         schedule_m, ii, schedule_l, iteration_configs
     )
 
-    fig, ax = plt.subplots(figsize=(24, 10), dpi=150)
+    fig, ax = plt.subplots(figsize=(26, max(10, total_rows * 0.34)), dpi=150)
     setup_dark_axis(fig, ax)
 
     draw_hatches = op_wgid is not None
-    for op, start, end, issue_end, stage in plot_items:
+    for op_key, start, end, issue_end, stage in plot_items:
+        op, _ = parse_op_key(op_key)
         colors = ITERATION_COLOR_PALETTE[stage]
-        hatch = WG_HATCHES.get(op_wgid[op], '---') if draw_hatches else None
-        label = f"{op_desc[op]} [{STAGE_LABELS[stage]}]"
+        wgid = get_warpgroup(op_wgid, op_key) if draw_hatches else None
+        hatch = WG_HATCHES.get(wgid, '---') if wgid is not None else None
+        label = f"{format_op_key(op_key)} {op_desc[op]} [{STAGE_LABELS[stage]}]"
         draw_schedule_block(
             ax,
-            op,
             time_to_coord[start],
             time_to_coord[end],
             time_to_coord[issue_end],
-            op_y_pos[op],
+            op_y_pos[op_key],
             colors,
             label,
             hatch=hatch,
@@ -367,9 +435,17 @@ def draw_overlap_schedule(schedule_m, ii, schedule_l, output_filename, op_wgid=N
         patches.Patch(facecolor=ITERATION_COLOR_PALETTE[1]['face'], edgecolor=ITERATION_COLOR_PALETTE[1]['edge'], label="Iteration I-1 [i-1] Blocks"),
         patches.Patch(facecolor=ITERATION_COLOR_PALETTE[0]['face'], edgecolor=ITERATION_COLOR_PALETTE[0]['edge'], label="Iteration I [i] Blocks"),
         patches.Patch(facecolor=ITERATION_COLOR_PALETTE[2]['face'], edgecolor=ITERATION_COLOR_PALETTE[2]['edge'], label="Iteration I+1 [i+1] Blocks"),
-        patches.Patch(facecolor='#666666', edgecolor='none', alpha=ISSUE_ALPHA, label='Dark segment = issue duration (d); light remainder = execution'),
+        patches.Patch(facecolor='#666666', edgecolor='none', alpha=ISSUE_ALPHA, label='Dark = issue; light = execution'),
     ]
-    iteration_legend = ax.legend(handles=legend_patches, loc='upper right', facecolor='#1A1A1A', edgecolor='#444444', fontsize=10)
+    iteration_legend = ax.legend(
+        handles=legend_patches,
+        loc='upper left',
+        bbox_to_anchor=(0.82, 0.98),
+        bbox_transform=fig.transFigure,
+        facecolor='#1A1A1A',
+        edgecolor='#444444',
+        fontsize=10,
+    )
     ax.add_artist(iteration_legend)
 
     if draw_hatches:
@@ -382,9 +458,17 @@ def draw_overlap_schedule(schedule_m, ii, schedule_l, output_filename, op_wgid=N
             )
             for wgid in active_wgids
         ]
-        ax.legend(handles=wg_legend_patches, loc='upper right', bbox_to_anchor=(1.0, 0.82), facecolor='#1A1A1A', edgecolor='#444444', fontsize=10)
+        ax.legend(
+            handles=wg_legend_patches,
+            loc='upper left',
+            bbox_to_anchor=(0.82, 0.74),
+            bbox_transform=fig.transFigure,
+            facecolor='#1A1A1A',
+            edgecolor='#444444',
+            fontsize=10,
+        )
 
-    plt.tight_layout()
+    fig.tight_layout(rect=[0, 0, 0.78, 1])
     plt.savefig(output_filename, dpi=300, facecolor=fig.get_facecolor(), edgecolor='none')
     plt.close(fig)
     print(f"模调度 overlap 图已成功导出: {output_filename}")
@@ -397,18 +481,18 @@ def iter_label(distance):
 
 
 def draw_single_modulo_window(schedule_m, ii, schedule_l, output_filename, op_wgid=None, active_wgids=None):
-    op_y_pos, y_ticks_positions, y_ticks_labels, unit_boundaries, total_rows = build_y_layout()
+    op_y_pos, y_ticks_positions, y_ticks_labels, unit_boundaries, total_rows = build_y_layout(schedule_m)
     single_items = []
     single_events = {0, ii, schedule_l}
-    for op, start_time in schedule_m.items():
+    for op_key, start_time in schedule_m.items():
         iter_distance = start_time // ii
         slot_start = start_time % ii
-        slot_issue_end = slot_start + duration[op]
-        slot_end = slot_start + latencies[op]
-        single_items.append((op, slot_start, slot_end, slot_issue_end, iter_distance))
+        slot_issue_end = slot_start + duration[op_key]
+        slot_end = slot_start + latencies[op_key]
+        single_items.append((op_key, slot_start, slot_end, slot_issue_end, iter_distance))
         single_events.update((slot_start, slot_issue_end, slot_end))
 
-    single_items.sort(key=lambda item: (item[1], item[4], item[0]))
+    single_items.sort(key=lambda item: (item[1], item[4], op_key_sort_key(item[0])))
     single_events = sorted(single_events)
     single_time_to_coord = {t: i for i, t in enumerate(single_events)}
 
@@ -422,24 +506,25 @@ def draw_single_modulo_window(schedule_m, ii, schedule_l, output_filename, op_wg
         {'face': '#554b2f', 'edge': '#c0a45d'},
     ]
 
-    fig_single, ax_single = plt.subplots(figsize=(24, 10), dpi=150)
+    fig_single, ax_single = plt.subplots(figsize=(26, max(10, total_rows * 0.34)), dpi=150)
     setup_dark_axis(fig_single, ax_single)
 
     draw_hatches = op_wgid is not None
-    for op, slot_start, slot_end, slot_issue_end, iter_distance in single_items:
+    for op_key, slot_start, slot_end, slot_issue_end, iter_distance in single_items:
+        op, _ = parse_op_key(op_key)
         colors = single_color_palette.get(
             iter_distance,
             fallback_colors[iter_distance % len(fallback_colors)],
         )
-        hatch = WG_HATCHES.get(op_wgid[op], '---') if draw_hatches else None
-        label = f"{op_desc[op]} [{iter_label(iter_distance)}]"
+        wgid = get_warpgroup(op_wgid, op_key) if draw_hatches else None
+        hatch = WG_HATCHES.get(wgid, '---') if wgid is not None else None
+        label = f"{format_op_key(op_key)} {op_desc[op]} [{iter_label(iter_distance)}]"
         draw_schedule_block(
             ax_single,
-            op,
             single_time_to_coord[slot_start],
             single_time_to_coord[slot_end],
             single_time_to_coord[slot_issue_end],
-            op_y_pos[op],
+            op_y_pos[op_key],
             colors,
             label,
             hatch=hatch,
@@ -486,9 +571,17 @@ def draw_single_modulo_window(schedule_m, ii, schedule_l, output_filename, op_wg
         for distance in iteration_distances
     ]
     single_iteration_legend.append(
-        patches.Patch(facecolor='#666666', edgecolor='none', alpha=ISSUE_ALPHA, label='Dark segment = issue duration (d); light remainder = execution')
+        patches.Patch(facecolor='#666666', edgecolor='none', alpha=ISSUE_ALPHA, label='Dark = issue; light = execution')
     )
-    iter_legend = ax_single.legend(handles=single_iteration_legend, loc='upper right', facecolor='#1A1A1A', edgecolor='#444444', fontsize=10)
+    iter_legend = ax_single.legend(
+        handles=single_iteration_legend,
+        loc='upper left',
+        bbox_to_anchor=(0.82, 0.98),
+        bbox_transform=fig_single.transFigure,
+        facecolor='#1A1A1A',
+        edgecolor='#444444',
+        fontsize=10,
+    )
     ax_single.add_artist(iter_legend)
 
     if draw_hatches:
@@ -501,9 +594,17 @@ def draw_single_modulo_window(schedule_m, ii, schedule_l, output_filename, op_wg
             )
             for wgid in active_wgids
         ]
-        ax_single.legend(handles=single_wg_legend, loc='upper right', bbox_to_anchor=(1.0, 0.82), facecolor='#1A1A1A', edgecolor='#444444', fontsize=10)
+        ax_single.legend(
+            handles=single_wg_legend,
+            loc='upper left',
+            bbox_to_anchor=(0.82, 0.74),
+            bbox_transform=fig_single.transFigure,
+            facecolor='#1A1A1A',
+            edgecolor='#444444',
+            fontsize=10,
+        )
 
-    plt.tight_layout()
+    fig_single.tight_layout(rect=[0, 0, 0.78, 1])
     plt.savefig(output_filename, dpi=300, facecolor=fig_single.get_facecolor(), edgecolor='none')
     plt.close(fig_single)
     print(f"单个 II 窗口内的 op 启动顺序图已成功导出: {output_filename}")
@@ -779,29 +880,34 @@ def draw_variable_lifetimes(lifetime_items, ii, schedule_l, output_filename):
 
 def main():
     plt.style.use('dark_background')
+    schedule_source = expanded_M or optimized_M
+    fine_optimized_M = build_fine_grained_schedule(
+        schedule_source,
+        latencies,
+        duration,
+        allow_parent_fallback=not bool(expanded_M),
+    )
     op_wgid, active_wgids, wgid_ops = build_warpgroup_info(warp_assign)
     print(wgid_ops)
 
     draw_overlap_schedule(
-        optimized_M,
+        fine_optimized_M,
         base_I,
         optimized_L,
-        'modulo_scheduling_same_line_with_desc.png',
+        'fine_grained_modulo_scheduling_same_line_with_desc.png',
         op_wgid=op_wgid,
         active_wgids=active_wgids,
     )
     draw_single_modulo_window(
-        optimized_M,
+        fine_optimized_M,
         base_I,
         optimized_L,
-        'single_iter_ops.png',
+        'fine_grained_single_iter_ops.png',
         op_wgid=op_wgid,
         active_wgids=active_wgids,
     )
 
-    # 基础/naive 模调度方案：复用优化版 overlap 绘图格式，但不画 warp 分配 hatch。
-    draw_overlap_schedule(M, I, L, 'naive_sched_plan.png')
-    draw_variable_lifetimes(variable_lifetimes, base_I, optimized_L, 'var_life.png')
+    # draw_variable_lifetimes(variable_lifetimes, base_I, optimized_L, 'var_life.png')
 
 
 if __name__ == '__main__':

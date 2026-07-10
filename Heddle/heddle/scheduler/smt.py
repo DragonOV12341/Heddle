@@ -175,6 +175,7 @@ class HeddleScheduler:
         same_warpgroup_pairs: Optional[List[Tuple[str, str]]] = None,
         not_all_same_warpgroup_sets: Optional[List[Tuple[str, ...]]] = None,
         same_subcore_exclusion_pairs: Optional[List[Tuple[str, str]]] = None,
+        cross_wg_rmem_penalty: int = 0,
     ):
         self.nodes = nodes
         self.fu_caps = fu_caps or {
@@ -197,6 +198,7 @@ class HeddleScheduler:
         self.same_warpgroup_pairs = list(same_warpgroup_pairs or [])
         self.not_all_same_warpgroup_sets = list(not_all_same_warpgroup_sets or [])
         self.same_subcore_exclusion_pairs = list(same_subcore_exclusion_pairs or [])
+        self.cross_wg_rmem_penalty = max(int(cross_wg_rmem_penalty), 0)
 
     # ------------------------------------------------------------------ #
     # Phase A  (unchanged API)
@@ -556,6 +558,17 @@ class HeddleScheduler:
                 )
             return op_intervals[key]
 
+        cross_wg_rmem_penalty_terms = []
+
+        def _node_in_warpgroup(v: int, wg: int):
+            group_warps = [w for w in range(wg * 4, min((wg + 1) * 4, W))]
+            if not group_warps:
+                return _false_var(f"in_wg_empty_v={v}_wg={wg}")
+            return _or_var(
+                f"in_wg_v={v}_wg={wg}",
+                [warp[(v, w)] for w in group_warps],
+            )
+
         # ---- 依赖、跨 warp spill 代价和 blocking sync ---------------------
         for v_node in self.nodes:
             vi = idx[v_node.name]
@@ -568,6 +581,23 @@ class HeddleScheduler:
                 base_delay = int(edge.delay) if edge and edge.delay is not None else int(par.latency)
                 # spill 代价
                 spill_cost = max((o.spill_cost for o in par.outputs), default=0)
+                has_rmem_spill_output = any(
+                    o.storage == StorageKind.RMEM and o.footprint_bytes > 0 and o.spill_cost > 0
+                    for o in par.outputs
+                )
+                if has_rmem_spill_output and self.cross_wg_rmem_penalty > 0 and W > 1:
+                    same_wg_terms = []
+                    for wg in range((W + 3) // 4):
+                        same_wg_terms.append(
+                            _and_var(
+                                f"same_rmem_wg_u={ui}_v={vi}_wg={wg}",
+                                [_node_in_warpgroup(ui, wg), _node_in_warpgroup(vi, wg)],
+                            )
+                        )
+                    same_wg = _or_var(f"same_rmem_wg_u={ui}_v={vi}", same_wg_terms)
+                    cross_wg_rmem_penalty_terms.append(
+                        int(self.cross_wg_rmem_penalty) * int(max(spill_cost, 1)) * same_wg.negated()
+                    )
                 # 如果 op有spill代价 && 可用W不止一个
                 if spill_cost > 0 and W > 1:
                     same_pairs = [
@@ -923,6 +953,7 @@ class HeddleScheduler:
             for tau in range(L):
                 smem_live_by_buffer: dict[str, list] = defaultdict(list)
                 smem_footprint_by_buffer: dict[str, int] = {}
+                spill_smem_terms = []
                 for xi, (pv, oval) in enumerate(all_outputs):
                     if oval.storage != StorageKind.SMEM or oval.footprint_bytes <= 0:
                         continue
@@ -967,8 +998,58 @@ class HeddleScheduler:
                 for buffer_key, live_terms in smem_live_by_buffer.items():
                     buffer_live = _or_var(f"smem_live_buf={buffer_key}_t={tau}", live_terms)
                     smem_terms.append(smem_footprint_by_buffer[buffer_key] * buffer_live)
-                if smem_terms:
-                    model.add(sum(static_smem_terms + smem_terms) <= self.smem_limit)
+                if W > 1:
+                    for xi, (pv, oval) in enumerate(all_outputs):
+                        if (
+                            oval.storage != StorageKind.RMEM
+                            or oval.footprint_bytes <= 0
+                            or oval.spill_cost <= 0
+                        ):
+                            continue
+                        sc = int(oval.spill_cost)
+                        consumers = (
+                            consumers_of[xi]
+                            if self.include_incoming_live else
+                            [(cv, d) for cv, d in consumers_of[xi] if d == 0]
+                        )
+                        for cv, d in consumers:
+                            for iter_offset in iter_offsets:
+                                consume_time = Tv[cv] + (iter_offset + int(d)) * ii
+                                spill_started = model.new_bool_var(
+                                    f"spill_smem_started_x={xi}_c={cv}_k={iter_offset}_t={tau}"
+                                )
+                                spill_not_ended = model.new_bool_var(
+                                    f"spill_smem_not_ended_x={xi}_c={cv}_k={iter_offset}_t={tau}"
+                                )
+                                model.add(consume_time - sc <= tau).only_enforce_if(spill_started)
+                                model.add(consume_time - sc > tau).only_enforce_if(spill_started.negated())
+                                model.add(consume_time > tau).only_enforce_if(spill_not_ended)
+                                model.add(consume_time <= tau).only_enforce_if(spill_not_ended.negated())
+                                spill_active = _and_var(
+                                    f"spill_smem_active_x={xi}_c={cv}_k={iter_offset}_t={tau}",
+                                    [spill_started, spill_not_ended],
+                                )
+                                same_warp_terms = [
+                                    _and_var(
+                                        f"spill_smem_same_x={xi}_c={cv}_k={iter_offset}_w={w}_t={tau}",
+                                        [warp[(pv, w)], warp[(cv, w)]],
+                                    )
+                                    for w in range(W)
+                                ]
+                                has_same_warp = _or_var(
+                                    f"spill_smem_has_same_x={xi}_c={cv}_k={iter_offset}_t={tau}",
+                                    same_warp_terms,
+                                )
+                                spill_present = _and_var(
+                                    f"spill_smem_x={xi}_c={cv}_k={iter_offset}_t={tau}",
+                                    [spill_active, has_same_warp.negated()],
+                                )
+                                spill_smem_terms.append(
+                                    int(oval.footprint_bytes) * spill_present
+                                )
+                all_smem_terms = static_smem_terms + smem_terms + spill_smem_terms
+                if all_smem_terms:
+                    model.add(sum(all_smem_terms) <= self.smem_limit)
 
         # ---- RMEM liveness 容量约束（稀疏 checkpoint） --------------------
         # 不再把每个 live range 建成 OptionalInterval + Cumulative。那种
@@ -1104,7 +1185,12 @@ class HeddleScheduler:
                 end_times.append(end_v)
             mx = model.new_int_var(0, L - 1 + max((max(len(n.reservation), 1) for n in self.nodes), default=1), "max_end_T")
             model.add_max_equality(mx, end_times)
-            model.minimize(L * N * mx + sum(Tv))  # 尽可能令 L 小，且 Tv 都更尽快地发射
+            # Keep makespan compact, then strongly discourage cross-warpgroup
+            # RMEM communication because codegen does not yet materialize a
+            # real cross-WG register spill/copy path.
+            model.minimize(
+                L * N * mx + sum(Tv) + sum(cross_wg_rmem_penalty_terms)
+            )
 
         # ---- 求解 ---------------------------------------------------------
         solver = cp_model.CpSolver()
