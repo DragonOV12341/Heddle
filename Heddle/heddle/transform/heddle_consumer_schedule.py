@@ -36,7 +36,7 @@ import os
 import sys
 import traceback
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from tvm.ir.expr import PrimExpr
 
@@ -60,8 +60,6 @@ from heddle.transform.auto_tl_pipeline_smt import (
     _estimate_buffer_footprint_bytes,
     _buf_scope_str,
     _is_shared,
-    _AccessInterval,
-    _ChildAccess,
     _StmtInfo,
     _unwrap_to_seqstmt,
 )
@@ -460,33 +458,11 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
     if not ops:
         return None
 
-    instance_count: Dict[int, int] = {
-        idx: max(1, int(getattr(infos[idx], "op_instance_count", 1)))
-        for idx in ops
-    }
-    expanded_ops: List[Tuple[int, int]] = [
-        (idx, inst)
-        for idx in ops
-        for inst in range(instance_count[idx])
-    ]
-
-    def _children(idx: int) -> List[Tuple[int, int]]:
-        return [(idx, inst) for inst in range(instance_count.get(idx, 1))]
-
-    def _first_child(idx: int) -> Tuple[int, int]:
-        return (idx, 0)
-
-    def _last_child(idx: int) -> Tuple[int, int]:
-        return (idx, instance_count.get(idx, 1) - 1)
-
-    def _single_instance_latency(info: _StmtInfo, total_latency: int, total_issue: int) -> int:
-        count = max(1, int(getattr(info, "op_instance_count", 1)))
-        unit_issue = max(1, (max(int(total_issue), 1) + count - 1) // count)
-        execute = max(int(total_latency) - max(int(total_issue), 1), 0)
-        return unit_issue + execute
+    def _stmt_latency(total_latency: int) -> int:
+        return max(int(total_latency), 1)
 
     # duration 代表发射占用时长（Issue Cycle），单发射模型下统一为 1
-    duration = { key : 1 for key in expanded_ops }
+    duration = {idx: 1 for idx in ops}
     
     # 硬件发射槽位容量模型 （TMA暂且认为无发射限制。其受带宽影响）
     # H100 一个SM有4个subcore，每个SM上有: 1TMA, 4Tensorcore(但在实际使用时，其需要4个warp协作，一般需要跨subcore), 故总体建模为1个；
@@ -501,63 +477,10 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         # 跨迭代 self hazard 在这里表达的是发射/顺序间隔。
         # 如果对这类边使用完整数据就绪 latency，会强行要求
         # I >= latency，导致后续 joint SMT refine 根本没有机会运行。
-        return max(int(duration.get(_first_child(idx), 1)), 1)
-
-    def _has_ordered_issue_slices(info: _StmtInfo) -> bool:
-        semantic = getattr(info, "op_instance_semantic", None)
-        if semantic is not None:
-            return str(semantic) == "issue_slices"
-        return bool(getattr(info, "is_true_tma", False))
-
-    def _child_accesses(idx: int, inst: int) -> Optional[List[_ChildAccess]]:
-        accesses = getattr(infos[idx], "child_accesses", None)
-        if not accesses or inst >= len(accesses):
-            return None
-        return accesses[inst]
-
-    def _intervals_may_overlap(a: _AccessInterval, b: _AccessInterval) -> bool:
-        analyzer = tvm.arith.Analyzer()
-        try:
-            if analyzer.can_prove(a.end <= b.start) or analyzer.can_prove(b.end <= a.start):
-                return False
-        except Exception:
-            pass
-        return True
-
-    def _accesses_may_overlap(a: _ChildAccess, b: _ChildAccess) -> bool:
-        if a.buffer_name != b.buffer_name:
-            return False
-        if len(a.intervals) != len(b.intervals):
-            return True
-        return all(_intervals_may_overlap(x, y) for x, y in zip(a.intervals, b.intervals))
-
-    def _child_may_conflict(a_child: Tuple[int, int], b_child: Tuple[int, int]) -> Optional[bool]:
-        a_acc = _child_accesses(*a_child)
-        b_acc = _child_accesses(*b_child)
-        if a_acc is None or b_acc is None:
-            return None
-        for a in a_acc:
-            for b in b_acc:
-                if a.kind == "read" and b.kind == "read":
-                    continue
-                if _accesses_may_overlap(a, b):
-                    return True
-        return False
-
-    def _intra_child_edges(idx: int) -> List[Tuple[Tuple[int, int], Tuple[int, int], int]]:
-        info = infos[idx]
-        out: List[Tuple[Tuple[int, int], Tuple[int, int], int]] = []
-        for prev_child, next_child in zip(_children(idx), _children(idx)[1:]):
-            conflict = _child_may_conflict(prev_child, next_child)
-            if _has_ordered_issue_slices(info):
-                out.append((prev_child, next_child, _issue_delay_for_self_edge(idx)))
-            elif conflict is True or (conflict is None and getattr(info, "is_wgmma", False)):
-                out.append((prev_child, next_child, latencies[prev_child]))
-        return out
+        return max(int(duration.get(idx, 1)), 1)
 
     for idx in ops:
         info = infos[idx]
-        children = _children(idx)
         if info.is_wait_barrier:
             # mbarrier_wait 使用一个独立同步 issue slot；它不能和任意
             # 其它 op 同槽发射，但不能伪装成占满所有 FU。
@@ -565,22 +488,27 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
             unit_latency = 1
             unit_rrt = [{"BARRIER": 1}]
         else:
-            if info.is_wgmma:
+            if getattr(info, "op_issue_cycles", None) is not None and getattr(info, "op_latency", None) is not None:
+                unit_duration = max(1, int(getattr(info, "op_issue_cycles", 1)))
+                unit_latency = max(1, int(getattr(info, "op_latency", unit_duration)))
+                resource_name = str(getattr(info, "op_resource_type", "ALU") or "ALU")
+                unit_rrt = [{resource_name: 1} for _ in range(unit_duration)]
+            elif info.is_wgmma:
                 issue_cycles = _detect_wgmma_issue_cycles(info.stmt)
-                unit_duration = max(1, (int(issue_cycles) + len(children) - 1) // len(children))
+                unit_duration = max(1, int(issue_cycles))
                 unit_rrt = [{"TC": 1} for _ in range(unit_duration)]
                 latency, _ = _detect_op_latency_and_resource(info.stmt)
+                unit_latency = _stmt_latency(int(latency))
             else:
                 latency, rty = _detect_op_latency_and_resource(info.stmt)
                 issue_cycles = _detect_op_issue_cycles(info.stmt)
-                unit_duration = max(1, (int(issue_cycles) + len(children) - 1) // len(children))
+                unit_duration = max(1, int(issue_cycles))
                 unit_rrt = [{rty.value : 1} for _ in range(unit_duration)]  # 展开 rrt为 issue 周期数对应的表
-            unit_latency = _single_instance_latency(info, int(latency), int(issue_cycles))
-        for child in children:
-            duration[child] = unit_duration  # 指令发射所占的时钟周期
-            rrt[child] = list(unit_rrt)
-            latencies[child] = unit_latency  # 单个展开实例的 issue+execute 延迟
-        estimated_total_latency += unit_latency * len(children)
+                unit_latency = _stmt_latency(int(latency))
+        duration[idx] = unit_duration  # 指令发射所占的时钟周期
+        rrt[idx] = list(unit_rrt)
+        latencies[idx] = unit_latency  # stmt 的 issue+execute 延迟
+        estimated_total_latency += unit_latency
 
 
     print(f"-------- {latencies=}")
@@ -596,31 +524,19 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         for v, deps in op_deps.items():
             if v not in ops:
                 continue
-            for prev_child, next_child, delay in _intra_child_edges(v):
-                edges.append((prev_child, next_child, delay, 0))
             for u in deps:
                 if u not in ops:
                     continue
-                u_children = _children(u)
-                v_children = _children(v)
-                if len(u_children) == len(v_children):
-                    for uc, vc in zip(u_children, v_children):
-                        edges.append((uc, vc, latencies[uc], 0))
-                else:
-                    # 展开倍数不一致时保持保守：消费者首实例等待生产者末实例。
-                    uc, vc = _last_child(u), _first_child(v)
-                    edges.append((uc, vc, latencies[uc], 0))
+                edges.append((u, v, latencies[u], 0))
 
             # 跨循环依赖关系: 如果读写同一 buffer 则自己存在跨循环依赖
-            self_conflict = _child_may_conflict(_last_child(v), _first_child(v))
-            if self_conflict is None:
-                write_buf_names = {buf.buffer.name for buf in infos[v].writes}
-                read_buf_names = {buf.buffer.name for buf in infos[v].reads}
-                self_conflict = bool(write_buf_names & read_buf_names)
+            write_buf_names = {buf.buffer.name for buf in infos[v].writes}
+            read_buf_names = {buf.buffer.name for buf in infos[v].reads}
+            self_conflict = bool(write_buf_names & read_buf_names)
             if self_conflict is True:
-                edges.append((_last_child(v), _first_child(v), _issue_delay_for_self_edge(v), 1))
+                edges.append((v, v, _issue_delay_for_self_edge(v), 1))
             if infos[v].is_sync_top and infos[v].is_sync_nested:
-                edges.append((_last_child(v), _first_child(v), _issue_delay_for_self_edge(v), 1))
+                edges.append((v, v, _issue_delay_for_self_edge(v), 1))
 
         model = cp_model.CpModel()
 
@@ -629,12 +545,12 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         # (op, absolute_time) 建 BoolVar；WGMMA issue duration 展开后会导致
         # H * duration * I 级别的资源约束爆炸。
         M = {}
-        for v in expanded_ops:
+        for v in ops:
             latest_start = max(0, H - duration[v])
             M[v] = model.NewIntVar(0, latest_start, f"M_{v}")
 
         # Symmetry breaking
-        model.Add(M[_first_child(ops[0])] == 0)
+        model.Add(M[ops[0]] == 0)
         
         # Dependency constraints:
         # M[v] - M[u] + δ*I >= d (此时 d 已经是真实的硬件 latency)
@@ -646,7 +562,7 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         # 模 I 环上不重叠”表达，避免逐时间点枚举 Bool。WGMMA 和 SFU
         # 都会连续占用多个 issue slot。
         phase = {}
-        for v in expanded_ops:
+        for v in ops:
             phase[v] = model.NewIntVar(0, I - 1, f"phase_{v}")
             model.AddModuloEquality(phase[v], M[v], I)
 
@@ -669,7 +585,7 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
             if int(cap) != 1:
                 continue
             resource_ops = [
-                v for v in expanded_ops
+                v for v in ops
                 if any(per_cycle.get(resource_name, 0) for per_cycle in rrt[v])
             ]
             for pos, u in enumerate(resource_ops):
@@ -693,32 +609,31 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
             if getattr(infos[v], "is_wait_barrier", False)
         ]
         barrier_exclusive_pairs = set()
-        for b_idx in barrier_ops:
-            for b in _children(b_idx):
-                for v in expanded_ops:
-                    if v[0] == b_idx:
-                        continue
-                    u0, v0 = (b, v) if b < v else (v, b)
-                    if (u0, v0) in barrier_exclusive_pairs:
-                        continue
-                    barrier_exclusive_pairs.add((u0, v0))
-                    if not _add_modular_no_overlap(u0, v0, "barrier_slot"):
-                        return None
+        for b in barrier_ops:
+            for v in ops:
+                if v == b:
+                    continue
+                u0, v0 = (b, v) if b < v else (v, b)
+                if (u0, v0) in barrier_exclusive_pairs:
+                    continue
+                barrier_exclusive_pairs.add((u0, v0))
+                if not _add_modular_no_overlap(u0, v0, "barrier_slot"):
+                    return None
         
         # Schedule length L = max(M[v] + duration[v]).
         # 注：如果你希望 L 代表全流水线完全排空（包含最后一条指令执行完）的长度，
         # 可以把这里的 duration[v] 替换为 latencies[v]。
         # 目前保持 duration[v] 代表“所有指令发射完毕所需的总周期数”。
         end = {}
-        for v in expanded_ops:
+        for v in ops:
             end[v] = model.NewIntVar(0, H + duration[v], f"end_{v}")
             model.Add(end[v] == M[v] + duration[v])
 
         L = model.NewIntVar(0, H + max(duration.values()), "L")
-        model.AddMaxEquality(L, [end[v] for v in expanded_ops])
+        model.AddMaxEquality(L, [end[v] for v in ops])
 
         BIG = 100
-        model.Minimize(BIG * L - sum(M[v] for v in expanded_ops))
+        model.Minimize(BIG * L - sum(M[v] for v in ops))
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = 5
@@ -727,12 +642,11 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             return None
 
-        expanded_M = {v: solver.Value(M[v]) for v in expanded_ops}
+        solved_M = {v: solver.Value(M[v]) for v in ops}
         result = {
             "I": I,
             "L": solver.Value(L),
-            "M": {v: min(expanded_M[c] for c in _children(v)) for v in ops},
-            "expanded_M": expanded_M,
+            "M": solved_M,
         }
 
         # Build modular RRT table for printing.
@@ -742,14 +656,14 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
             row = {"slot": f"{r} mod {I}"}
             for f in capacity:
                 row[f] = []
-            for v in expanded_ops:
-                t = expanded_M[v]
+            for v in ops:
+                t = solved_M[v]
                 for c in range(duration[v]):
                     slot = (t + c) % I
                     if slot == r:
                         for f in capacity:
                             if rrt[v][c].get(f, 0):
-                                row[f].append(v[0] if instance_count.get(v[0], 1) == 1 else f"{v[0]}.{v[1]}")
+                                row[f].append(v)
                                 modified = True
             if modified:
                 table.append(row)
@@ -1174,38 +1088,16 @@ def _solve_smt_joint_optimize(
     if not ops:
         return None
 
-    instance_count: Dict[int, int] = {
-        idx: max(1, int(getattr(infos[idx], "op_instance_count", 1)))
-        for idx in ops
-    }
-
-    def _children(idx: int) -> List[Tuple[int, int]]:
-        return [(idx, inst) for inst in range(instance_count.get(idx, 1))]
-
-    def _first_child(idx: int) -> Tuple[int, int]:
-        return (idx, 0)
-
-    def _last_child(idx: int) -> Tuple[int, int]:
-        return (idx, instance_count.get(idx, 1) - 1)
-
-    def _child_name(child: Tuple[int, int]) -> str:
-        idx, inst = child
-        if instance_count.get(idx, 1) == 1:
-            return f"s{idx}"
-        return f"s{idx}__u{inst}"
+    def _op_name(idx: int) -> str:
+        return f"s{idx}"
 
     def _child_stmt_idx(name: str) -> Optional[int]:
         if not isinstance(name, str) or not name.startswith("s"):
             return None
-        body = name[1:].split("__u", 1)[0]
         try:
-            return int(body)
+            return int(name[1:])
         except ValueError:
             return None
-
-    expanded_ops: List[Tuple[int, int]] = [
-        child for idx in ops for child in _children(idx)
-    ]
     
     expect_consumer_warps = int(mod_sched_plan.get('heddle_expect_consumer_warps', 4))
     print(f"heddle expected consumer_warps = {expect_consumer_warps}")
@@ -1256,6 +1148,8 @@ def _solve_smt_joint_optimize(
     }
     
     def _resource_for_info(info: _StmtInfo) -> ResourceType:
+        if getattr(info, "op_resource_type", None):
+            return _rtype_map.get(str(getattr(info, "op_resource_type")), ResourceType.ALU)
         if getattr(info, "is_wait_barrier", False):
             return ResourceType.Barrier
         if getattr(info, "is_true_tma", False):
@@ -1263,90 +1157,32 @@ def _solve_smt_joint_optimize(
         _, rty = _detect_op_latency_and_resource(info.stmt)
         return _rtype_map.get(getattr(rty, "value", str(rty)), ResourceType.ALU)
 
-    def _single_instance_latency(info: _StmtInfo) -> int:
+    def _stmt_latency(info: _StmtInfo) -> int:
+        if getattr(info, "op_latency", None) is not None:
+            return max(1, int(getattr(info, "op_latency")))
         total_latency, _ = _detect_op_latency_and_resource(info.stmt)
-        if getattr(info, "is_wgmma", False):
-            total_issue = _detect_wgmma_issue_cycles(info.stmt)
-        else:
-            total_issue = _detect_op_issue_cycles(info.stmt)
-        count = max(1, int(getattr(info, "op_instance_count", 1)))
-        unit_issue = max(1, (max(int(total_issue), 1) + count - 1) // count)
-        execute = max(int(total_latency) - max(int(total_issue), 1), 0)
-        return unit_issue + execute
+        return max(int(total_latency), 1)
 
     def _latency_for_info(info: _StmtInfo) -> int:
-        # Match _solve_naive_modulo_sched: each expanded child uses one leaf
-        # op's issue latency plus the execute latency from the table.
         if getattr(info, "is_wait_barrier", False):
             return 1
-        return _single_instance_latency(info)
+        return _stmt_latency(info)
 
     def _dependency_delay_for_info(info: _StmtInfo) -> int:
         if getattr(info, "is_wait_barrier", False):
             return 1
-        return _single_instance_latency(info)
+        return _stmt_latency(info)
 
     def _issue_delay_for_self_edge(info: _StmtInfo) -> int:
         if getattr(info, "is_wait_barrier", False):
             return 1
+        if getattr(info, "op_issue_cycles", None) is not None:
+            return max(1, int(getattr(info, "op_issue_cycles")))
         if getattr(info, "is_wgmma", False):
             total = max(int(_detect_wgmma_issue_cycles(info.stmt)), 1)
         else:
             total = max(int(_detect_op_issue_cycles(info.stmt)), 1)
-        count = max(1, int(getattr(info, "op_instance_count", 1)))
-        return max(1, (total + count - 1) // count)
-
-    def _has_ordered_issue_slices(info: _StmtInfo) -> bool:
-        semantic = getattr(info, "op_instance_semantic", None)
-        if semantic is not None:
-            return str(semantic) == "issue_slices"
-        return bool(getattr(info, "is_true_tma", False))
-
-    def _child_accesses(idx: int, inst: int) -> Optional[List[_ChildAccess]]:
-        accesses = getattr(infos[idx], "child_accesses", None)
-        if not accesses or inst >= len(accesses):
-            return None
-        return accesses[inst]
-
-    def _intervals_may_overlap(a: _AccessInterval, b: _AccessInterval) -> bool:
-        analyzer = tvm.arith.Analyzer()
-        try:
-            if analyzer.can_prove(a.end <= b.start) or analyzer.can_prove(b.end <= a.start):
-                return False
-        except Exception:
-            pass
-        return True
-
-    def _accesses_may_overlap(a: _ChildAccess, b: _ChildAccess) -> bool:
-        if a.buffer_name != b.buffer_name:
-            return False
-        if len(a.intervals) != len(b.intervals):
-            return True
-        return all(_intervals_may_overlap(x, y) for x, y in zip(a.intervals, b.intervals))
-
-    def _child_may_conflict(a_child: Tuple[int, int], b_child: Tuple[int, int]) -> Optional[bool]:
-        a_acc = _child_accesses(*a_child)
-        b_acc = _child_accesses(*b_child)
-        if a_acc is None or b_acc is None:
-            return None
-        for a in a_acc:
-            for b in b_acc:
-                if a.kind == "read" and b.kind == "read":
-                    continue
-                if _accesses_may_overlap(a, b):
-                    return True
-        return False
-
-    def _intra_child_edges(idx: int) -> List[Tuple[Tuple[int, int], Tuple[int, int], int]]:
-        info = infos[idx]
-        out: List[Tuple[Tuple[int, int], Tuple[int, int], int]] = []
-        for prev_child, next_child in zip(_children(idx), _children(idx)[1:]):
-            conflict = _child_may_conflict(prev_child, next_child)
-            if _has_ordered_issue_slices(info):
-                out.append((prev_child, next_child, _issue_delay_for_self_edge(info)))
-            elif conflict is True or (conflict is None and getattr(info, "is_wgmma", False)):
-                out.append((prev_child, next_child, _dependency_delay_for_info(info)))
-        return out
+        return total
 
     def _reservation_for_info(info: _StmtInfo, rty: ResourceType) -> List[Dict[ResourceType, int]]:
         # wait/try_wait barrier 会阻塞当前发射 warp；这里把它建模成
@@ -1488,7 +1324,7 @@ def _solve_smt_joint_optimize(
 
     wait_reader_pairs = _shared_wait_reader_pairs()
     same_warpgroup_pairs = [
-        (_child_name(_first_child(wait_idx)), _child_name(_first_child(reader_idx)))
+        (_op_name(wait_idx), _op_name(reader_idx))
         for wait_idx, reader_idx in wait_reader_pairs
         if wait_idx in all_indices and reader_idx in all_indices
     ]
@@ -1592,31 +1428,28 @@ def _solve_smt_joint_optimize(
     
     nodes: List[OpNode] = []
     node_by_idx: Dict[int, OpNode] = {}
-    node_by_child: Dict[Tuple[int, int], OpNode] = {}
-    child_by_name: Dict[str, Tuple[int, int]] = {}
-    for child in expanded_ops:
-        idx, inst = child
+    idx_by_name: Dict[str, int] = {}
+    for idx in ops:
         info = infos[idx]
         rty = _resource_for_info(info)
         latency = _latency_for_info(info)
         outputs: List[OutputValue] = []
-        if child == _last_child(idx):
-            for buffer_name in op_buffer_writes.get(idx, []):
-                buf_value = buffer_values[buffer_name]
-                outputs.append(OutputValue(
-                    name=f"{_child_name(child)}_w_{buffer_name}",
-                    storage=buf_value.storage,
-                    footprint_bytes=buf_value.footprint_bytes,
-                    spill_cost=_spill_cost_for_output(info, buf_value.storage),
-                    lifetime=LifetimeSemantic.DEAD_ON_ENTRY,
-                    buffer_name=buffer_name,
-                ))
+        for buffer_name in op_buffer_writes.get(idx, []):
+            buf_value = buffer_values[buffer_name]
+            outputs.append(OutputValue(
+                name=f"{_op_name(idx)}_w_{buffer_name}",
+                storage=buf_value.storage,
+                footprint_bytes=buf_value.footprint_bytes,
+                spill_cost=_spill_cost_for_output(info, buf_value.storage),
+                lifetime=LifetimeSemantic.DEAD_ON_ENTRY,
+                buffer_name=buffer_name,
+            ))
         
         need_warpgroup = info.is_wgmma
         single_warp_eligible = info.is_true_tma
         wc = 4 if need_warpgroup else 1  # producer consumer 都按WG安排；barrier可能需要特殊处理
         _is_variable_latency = info.is_true_tma  # 只有真正的 TMA load 按 variable latency 建模
-        name = _child_name(child)
+        name = _op_name(idx)
         node = OpNode(
             name=name,
             resource_type=rty,
@@ -1629,42 +1462,13 @@ def _solve_smt_joint_optimize(
             replicable=single_warp_eligible
         )
         nodes.append(node)
-        node_by_child[child] = node
-        child_by_name[name] = child
-        if inst == 0:
-            node_by_idx[idx] = node
-
-    def _dependency_child_pairs(
-        u_children: List[Tuple[int, int]],
-        v_children: List[Tuple[int, int]],
-    ) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
-        """Map a stmt-level dependency to expanded child dependencies."""
-        if not u_children or not v_children:
-            return []
-        if len(u_children) == len(v_children):
-            return list(zip(u_children, v_children))
-        if len(u_children) < len(v_children):
-            producer = u_children[-1]
-            return [(producer, v_child) for v_child in v_children]
-        if len(v_children) == 1:
-            consumer = v_children[0]
-            return [(u_child, consumer) for u_child in u_children]
-        pairs: List[Tuple[Tuple[int, int], Tuple[int, int]]] = []
-        for i, u_child in enumerate(u_children):
-            pairs.append((u_child, v_children[min(i, len(v_children) - 1)]))
-        return pairs
+        node_by_idx[idx] = node
+        idx_by_name[name] = idx
 
     # 同一轮迭代内的依赖边，来自 IR 分析得到的 op_deps 图。
     for v, deps in op_deps.items():
         if v not in ops:
             continue
-        v_children = _children(v)
-        for prev_child, next_child, delay in _intra_child_edges(v):
-            node_by_child[next_child].add_dependency(
-                node_by_child[prev_child],
-                distance=0,
-                delay=delay,
-            )
         for u in deps:
             if u not in ops:
                 continue
@@ -1674,14 +1478,11 @@ def _solve_smt_joint_optimize(
             # warp and a long active-window exclusion, which is stronger than
             # the issue-slot model used by the modulo scheduler and makes real
             # producer/consumer graphs presolve UNSAT.
-            u_children = _children(u)
-            v_children = _children(v)
-            for u_child, v_child in _dependency_child_pairs(u_children, v_children):
-                node_by_child[v_child].add_dependency(
-                    node_by_child[u_child],
-                    distance=0,
-                    delay=_dependency_delay_for_info(infos[u]),
-                )
+            node_by_idx[v].add_dependency(
+                node_by_idx[u],
+                distance=0,
+                delay=_latency_for_info(infos[u]),
+            )
 
     # 跨迭代 hazard 与 _solve_naive_modulo_sched 保持一致：
     # 如果一个 stmt 同时读写同一个 buffer，或者它是 sync-like 阻塞语句，
@@ -1690,18 +1491,16 @@ def _solve_smt_joint_optimize(
         info = infos[idx]
         write_bufs = set(op_buffer_writes.get(idx, []))
         read_bufs = set(op_buffer_reads.get(idx, []))
-        self_conflict = _child_may_conflict(_last_child(idx), _first_child(idx))
-        if self_conflict is None:
-            self_conflict = bool(write_bufs & read_bufs)
+        self_conflict = bool(write_bufs & read_bufs)
         if self_conflict:
-            node_by_child[_first_child(idx)].add_dependency(
-                node_by_child[_last_child(idx)],
+            node_by_idx[idx].add_dependency(
+                node_by_idx[idx],
                 distance=1,
                 delay=_issue_delay_for_self_edge(info),
             )
         if info.is_wait_barrier :
-            node_by_child[_first_child(idx)].add_dependency(
-                node_by_child[_last_child(idx)],
+            node_by_idx[idx].add_dependency(
+                node_by_idx[idx],
                 distance=1,
                 delay=_issue_delay_for_self_edge(info),
             )
@@ -1758,47 +1557,30 @@ def _solve_smt_joint_optimize(
     base_max_time = max((int(base_M.get(v, 0)) for v in ops), default=0)
     window = max(base_L, base_max_time + 1, base_I)
 
-    def _expanded_start_hints() -> Dict[str, int]:
+    def _start_hints() -> Dict[str, int]:
         hints: Dict[str, int] = {}
-        expanded_hint = mod_sched_plan.get("expanded_M", {})
-        for child in expanded_ops:
-            if child in expanded_hint:
-                hints[_child_name(child)] = int(expanded_hint[child])
-                continue
-            idx, inst = child
-            base_t = int(base_M.get(idx, 0))
-            step = _issue_delay_for_self_edge(infos[idx])
-            hints[_child_name(child)] = base_t + inst * step
+        for idx in ops:
+            hints[_op_name(idx)] = int(base_M.get(idx, 0))
         return hints
 
     def _collapse_schedule(schedule: Dict[str, int]) -> Dict[int, int]:
         collapsed: Dict[int, int] = {}
         for idx in ops:
-            vals = [
-                int(schedule[_child_name(child)])
-                for child in _children(idx)
-                if _child_name(child) in schedule
-            ]
-            if vals:
-                collapsed[idx] = min(vals)
+            name = _op_name(idx)
+            if name in schedule:
+                collapsed[idx] = int(schedule[name])
         return collapsed
 
     def _collapse_warp_assign(warp_assign: Dict[str, int]) -> Dict[int, int]:
         collapsed: Dict[int, int] = {}
         for idx in ops:
-            for child in _children(idx):
-                name = _child_name(child)
-                if name in warp_assign:
-                    collapsed[idx] = int(warp_assign[name])
-                    break
+            name = _op_name(idx)
+            if name in warp_assign:
+                collapsed[idx] = int(warp_assign[name])
         return collapsed
 
     def _collapsed_end_time(idx: int, start_time: int) -> int:
-        total_issue = sum(
-            max(len(node_by_child[child].reservation), 1)
-            for child in _children(idx)
-            if child in node_by_child
-        )
+        total_issue = max(len(node_by_idx[idx].reservation), 1)
         return int(start_time) + max(1, total_issue)
 
     def _run_joint_solver(
@@ -1817,19 +1599,22 @@ def _solve_smt_joint_optimize(
             num_warps=num_warps,
             timeout_ms=int(mod_sched_plan.get("timeout_ms", 30000)),
             enable_liveness=enable_liveness,
+            enable_rmem_liveness=enable_liveness,
+            enable_smem_liveness=False,
+            fold_rmem_liveness_by_ii=bool(mod_sched_plan.get("fold_rmem_liveness_by_ii", True)),
             use_spill_concurrency=False,
             liveness_checkpoint_step=int(mod_sched_plan.get("liveness_checkpoint_step", 8)),
             start_hints={
                 name: int(t)
-                for name, t in _expanded_start_hints().items()
-                if name in child_by_name
+                for name, t in _start_hints().items()
+                if name in idx_by_name
             },
             smem_allocations=smem_allocations_by_buffer,
             log_search_progress=log_search_progress,
             same_warpgroup_pairs=same_warpgroup_pairs,
             not_all_same_warpgroup_sets=not_all_same_warpgroup_sets,
             same_subcore_exclusion_pairs=same_subcore_exclusion_pairs,
-            cross_wg_rmem_penalty=int(mod_sched_plan.get("cross_wg_rmem_penalty", 4096)),
+            cross_wg_rmem_penalty=int(mod_sched_plan.get("cross_wg_rmem_penalty", 2)),
         )
         return solver.schedule_joint(
             min_ii=ii,
@@ -1855,18 +1640,18 @@ def _solve_smt_joint_optimize(
         check_smem_limit: int,
     ) -> Tuple[bool, Dict[str, object]]:
         fixed_M = {
-            child: int(schedule[_child_name(child)])
-            for child in expanded_ops
-            if _child_name(child) in schedule
+            idx: int(schedule[_op_name(idx)])
+            for idx in ops
+            if _op_name(idx) in schedule
         }
-        if len(fixed_M) != len(expanded_ops):
-            missing = [_child_name(child) for child in expanded_ops if child not in fixed_M]
+        if len(fixed_M) != len(ops):
+            missing = [_op_name(idx) for idx in ops if idx not in fixed_M]
             return False, {"reason": f"missing schedule for {missing}"}
 
         fixed_warps = {
-            child: _selected_warps_for_node(node_by_child[child], int(warp_assign.get(_child_name(child), 0)))
-            for child in expanded_ops
-            if child in node_by_child
+            idx: _selected_warps_for_node(node_by_idx[idx], int(warp_assign.get(_op_name(idx), 0)))
+            for idx in ops
+            if idx in node_by_idx
         }
 
         def _resource_name(rty: ResourceType) -> str:
@@ -1883,10 +1668,10 @@ def _solve_smt_joint_optimize(
             fu_users: Dict[Tuple[int, ResourceType], List[str]] = {}
             fu_subcore_usage: Dict[Tuple[int, int, ResourceType], int] = {}
             fu_subcore_users: Dict[Tuple[int, int, ResourceType], List[str]] = {}
-            for child in expanded_ops:
-                node = node_by_child[child]
-                start = fixed_M[child]
-                child_name = _child_name(child)
+            for idx in ops:
+                node = node_by_idx[idx]
+                start = fixed_M[idx]
+                op_name = _op_name(idx)
                 for off, per_cycle in enumerate(node.reservation):
                     phase = (start + off) % base_I
                     for rty, used in per_cycle.items():
@@ -1895,7 +1680,7 @@ def _solve_smt_joint_optimize(
                             continue
                         key = (phase, rty)
                         fu_usage[key] = fu_usage.get(key, 0) + used_count
-                        fu_users.setdefault(key, []).append(child_name)
+                        fu_users.setdefault(key, []).append(op_name)
                         limit = int(capacity.get(rty, 0))
                         if limit > 0 and fu_usage[key] > limit:
                             return {
@@ -1910,13 +1695,13 @@ def _solve_smt_joint_optimize(
                         subcore_limit = int(subcore_capacity.get(rty, 0))
                         if subcore_limit <= 0:
                             continue
-                        for warp_id in fixed_warps.get(child, [0]):
+                        for warp_id in fixed_warps.get(idx, [0]):
                             subcore = int(warp_id) % 4
                             subcore_key = (phase, subcore, rty)
                             fu_subcore_usage[subcore_key] = (
                                 fu_subcore_usage.get(subcore_key, 0) + used_count
                             )
-                            fu_subcore_users.setdefault(subcore_key, []).append(child_name)
+                            fu_subcore_users.setdefault(subcore_key, []).append(op_name)
                             if fu_subcore_usage[subcore_key] > subcore_limit:
                                 return {
                                     "reason": "fu_subcore_limit",
@@ -1936,39 +1721,51 @@ def _solve_smt_joint_optimize(
 
         all_outputs: List[Tuple[int, OutputValue]] = []
         output_name_to_xi: Dict[str, int] = {}
-        for child in expanded_ops:
-            node = node_by_child[child]
+        for idx in ops:
+            node = node_by_idx[idx]
             for out in node.outputs:
                 output_name_to_xi[out.name] = len(all_outputs)
-                all_outputs.append((child, out))
+                all_outputs.append((idx, out))
 
         consumers_of: Dict[int, List[Tuple[int, int]]] = {}
         for v_node in nodes:
-            v_child = child_by_name.get(v_node.name)
-            if v_child is None:
+            v_idx = idx_by_name.get(v_node.name)
+            if v_idx is None:
                 continue
             for par in v_node.parents:
                 delta = int(v_node.dependency_distance.get(par.name, 0))
                 for oval in par.outputs:
                     xi = output_name_to_xi.get(oval.name)
                     if xi is not None:
-                        consumers_of.setdefault(xi, []).append((v_child, delta))
+                        consumers_of.setdefault(xi, []).append((v_idx, delta))
 
         max_iter_overlap = (max(int(check_L), 1) - 1) // max(int(base_I), 1)
-        iter_offsets = range(-max_iter_overlap, max_iter_overlap + 1)
+        max_dependency_distance = max(
+            (
+                int(distance)
+                for consumers in consumers_of.values()
+                for _, distance in consumers
+            ),
+            default=0,
+        )
+        # Loop-carried values with distance=1 can be live at the start of an
+        # I==L window.  The window-only overlap formula gives 0 in that case,
+        # so include the dependency distance on the incoming side explicitly.
+        incoming_iter_overlap = max(max_iter_overlap, max_dependency_distance)
+        iter_offsets = range(-incoming_iter_overlap, max_iter_overlap + 1)
 
         def _copy_live(xi: int, iter_offset: int, tau: int) -> bool:
-            producer_child, oval = all_outputs[xi]
-            if fixed_M[producer_child] + iter_offset * base_I > tau:
+            producer_idx, oval = all_outputs[xi]
+            if fixed_M[producer_idx] + iter_offset * base_I > tau:
                 return False
             if oval.lifetime != LifetimeSemantic.DEAD_ON_ENTRY:
                 return True
             consumers = consumers_of.get(xi, [])
             if not consumers:
                 return False
-            producer_lat = int(node_by_child[producer_child].latency)
-            for consumer_child, distance in consumers:
-                consume_time = fixed_M[consumer_child] + (iter_offset + distance) * base_I
+            producer_lat = int(node_by_idx[producer_idx].latency)
+            for consumer_idx, distance in consumers:
+                consume_time = fixed_M[consumer_idx] + (iter_offset + distance) * base_I
                 if producer_lat == 0:
                     consume_time += 1
                 if consume_time > tau:
@@ -1988,7 +1785,7 @@ def _solve_smt_joint_optimize(
             reg_live_bytes: Dict[int, Dict[Tuple[str, int], int]] = {
                 w: {} for w in range(num_warps)
             }
-            for xi, (producer_child, oval) in enumerate(all_outputs):
+            for xi, (producer_idx, oval) in enumerate(all_outputs):
                 if oval.footprint_bytes <= 0:
                     continue
                 live_any_copy = False
@@ -2004,28 +1801,28 @@ def _solve_smt_joint_optimize(
                     if oval.storage == StorageKind.RMEM:
                         buffer_key = oval.rmem_buffer_key()
                         copy_key = (buffer_key, int(iter_offset))
-                        for w in fixed_warps.get(producer_child, [0]):
+                        for w in fixed_warps.get(producer_idx, [0]):
                             reg_live_bytes.setdefault(w, {})
                             reg_live_bytes[w][copy_key] = max(
                                 reg_live_bytes[w].get(copy_key, 0),
                                 int(oval.footprint_bytes),
                             )
                         if int(oval.spill_cost) > 0:
-                            producer_warps = set(fixed_warps.get(producer_child, [0]))
-                            for consumer_child, distance in consumers_of.get(xi, []):
+                            producer_warps = set(fixed_warps.get(producer_idx, [0]))
+                            for consumer_idx, distance in consumers_of.get(xi, []):
                                 consume_time = (
-                                    fixed_M[consumer_child]
+                                    fixed_M[consumer_idx]
                                     + (iter_offset + distance) * base_I
                                 )
                                 if not (consume_time - int(oval.spill_cost) <= tau < consume_time):
                                     continue
-                                consumer_warps = set(fixed_warps.get(consumer_child, [0]))
+                                consumer_warps = set(fixed_warps.get(consumer_idx, [0]))
                                 if producer_warps & consumer_warps:
                                     continue
                                 spill_key = (
                                     buffer_key,
                                     int(iter_offset),
-                                    int(fixed_M[consumer_child]),
+                                    int(fixed_M[consumer_idx]),
                                 )
                                 spill_smem_live_bytes[spill_key] = max(
                                     spill_smem_live_bytes.get(spill_key, 0),
@@ -2172,8 +1969,8 @@ def _solve_smt_joint_optimize(
 
         peak_producers: List[str] = []
         for buffer_name in peak_buffers:
-            for child in expanded_ops:
-                node = node_by_child.get(child)
+            for idx in ops:
+                node = node_by_idx.get(idx)
                 if node is None:
                     continue
                 if bool(getattr(node, "is_varialble_latency", False)):
@@ -2214,6 +2011,7 @@ def _solve_smt_joint_optimize(
     
     def _find_solution_and_check_liveliness() :
         subcore_feedback_pairs: List[Tuple[str, str]] = []
+        use_sparse_rmem_liveness = bool(mod_sched_plan.get("use_sparse_rmem_liveness", True))
         for solve_window in candidate_windows:
             print(f'[SMT] 遍历空间找最优解 : I= {base_I} L = {solve_window}',flush=True)
             sol = _run_joint_solver(
@@ -2222,7 +2020,7 @@ def _solve_smt_joint_optimize(
                 optimize=True,
                 solve_reg_limit=reg_limit,
                 solve_smem_limit=smem_limit,
-                enable_liveness=False,
+                enable_liveness=use_sparse_rmem_liveness,
                 log_search_progress=False,
                 same_subcore_exclusion_pairs=subcore_feedback_pairs,
             )
@@ -2248,7 +2046,7 @@ def _solve_smt_joint_optimize(
                     optimize=True,
                     solve_reg_limit=reg_limit,
                     solve_smem_limit=smem_limit,
-                    enable_liveness=False,
+                    enable_liveness=use_sparse_rmem_liveness,
                     log_search_progress=False,
                     same_subcore_exclusion_pairs=subcore_feedback_pairs,
                 )
@@ -2274,7 +2072,7 @@ def _solve_smt_joint_optimize(
                     optimize=True,
                     solve_reg_limit=reg_limit,
                     solve_smem_limit=smem_limit,
-                    enable_liveness=False,
+                    enable_liveness=use_sparse_rmem_liveness,
                     log_search_progress=False,
                     not_all_same_warpgroup_sets=feedback_sets,
                 )
@@ -2332,11 +2130,6 @@ def _solve_smt_joint_optimize(
     schedule = sol.get("schedule", {})
     warp_assign = sol.get("warp_assign", {})
     variable_lifetimes = sol.get("variable_lifetimes",[])
-    expanded_M = {
-        name: int(t)
-        for name, t in schedule.items()
-        if name in child_by_name
-    }
     optimized_M = _collapse_schedule(schedule)
     for idx in ops:
         if idx not in optimized_M and idx in base_M:
@@ -2354,7 +2147,6 @@ def _solve_smt_joint_optimize(
     print(f'---{optimized_L=}')
     print(f'---{base_I=}')
     print(f'---{optimized_M=}')
-    print(f'---{expanded_M=}')
     print(f'---{variable_lifetimes=}')
     
     table = []
@@ -2363,20 +2155,17 @@ def _solve_smt_joint_optimize(
         for f in ("TMA", "TC", "ALU", "SFU", "BARRIER"):
             row[f] = []
         modified=False
-        for child in expanded_ops:
-            name = _child_name(child)
+        for idx in ops:
+            name = _op_name(idx)
             t = schedule.get(name)
-            if t is None or child not in node_by_child:
+            if t is None or idx not in node_by_idx:
                 continue
-            for c, per_cycle in enumerate(node_by_child[child].reservation):
+            for c, per_cycle in enumerate(node_by_idx[idx].reservation):
                 if (int(t) + c) % base_I != r:
                     continue
                 for rty, used in per_cycle.items():
                     if int(used):
-                        idx = child[0]
-                        row.setdefault(rty.value, []).append(
-                            idx if instance_count.get(idx, 1) == 1 else f"{idx}.{child[1]}"
-                        )
+                        row.setdefault(rty.value, []).append(idx)
                         modified=True
         if modified:
             table.append(row)
@@ -2386,7 +2175,6 @@ def _solve_smt_joint_optimize(
         "I": base_I,
         "L": optimized_L,
         "M": optimized_M,
-        "expanded_M": expanded_M,
         "status": "SMT_OPTIMIZED" if solved_with_optimize else "SMT_FEASIBLE",
         "window": int(sol.get("window", window)),
         "warp_assign": _collapse_warp_assign(warp_assign),
@@ -2694,6 +2482,293 @@ def _extract_barrier_hints(
 # IR rewriting: reorder consumer statements in SeqStmt
 # ---------------------------------------------------------------------------
 
+def _op_fission_and_transform_ir(
+    seq: tvm.tir.SeqStmt,
+    buffer_var_map: Dict[tvm.tir.Var, tvm.tir.Buffer],
+) -> Tuple[tvm.tir.SeqStmt, List[tvm.tir.Buffer]]:
+    """Split compound scalar BufferStore expressions into top-level sub-ops.
+
+    The scheduler now sees real TIR statements after fission, so
+    ``_build_stmt_infos`` only needs to analyze the resulting SeqStmt.  This is
+    intentionally conservative: intrinsic statements, WGMMA/TMA, barriers, and
+    stores that are not a single loop-nested BufferStore are left unchanged.
+    """
+    sfu_ops = {
+        "tir.exp2",
+        "tir.rsqrt",
+        "tir.log2",
+        "tir.exp",
+        "tir.log",
+        "tir.sqrt",
+        "tir.tanh",
+        "tir.sigmoid",
+    }
+    binary_op_names = {
+        "Add",
+        "Sub",
+        "Mul",
+        "Div",
+        "FloorDiv",
+        "FloorMod",
+        "Mod",
+        "Min",
+        "Max",
+    }
+    temp_id = 0
+    temp_buffers: List[tvm.tir.Buffer] = []
+    existing_buffer_names: Set[str] = {
+        str(buf.name)
+        for buf in buffer_var_map.values()
+        if getattr(buf, "name", None) is not None
+    }
+
+    def _remember_buffer(buf: tvm.tir.Buffer) -> None:
+        try:
+            existing_buffer_names.add(str(buf.name))
+        except Exception:
+            pass
+
+    def _remember_buffers_in_stmt(stmt: tvm.tir.Stmt) -> None:
+        def _visit(node):
+            if isinstance(node, tvm.tir.BufferLoad):
+                _remember_buffer(node.buffer)
+            elif isinstance(node, tvm.tir.BufferStore):
+                _remember_buffer(node.buffer)
+            elif isinstance(node, tvm.tir.Block):
+                for buf in node.alloc_buffers:
+                    _remember_buffer(buf)
+                for match_buf in node.match_buffers:
+                    try:
+                        _remember_buffer(match_buf.buffer)
+                    except Exception:
+                        pass
+
+        tvm.tir.stmt_functor.post_order_visit(stmt, _visit)
+
+    for raw_stmt in seq.seq:
+        _remember_buffers_in_stmt(raw_stmt)
+
+    def _contains_unsafe_intrinsic(stmt: tvm.tir.Stmt) -> bool:
+        names = _call_op_names(stmt)
+        if names & {
+            "tl.tma_load",
+            "tl.tma_load_im2col",
+            "tir.tma_load",
+            "tl.ptx_wgmma_ss",
+            "tl.ptx_wgmma_rs",
+            "tir.ptx_arrive_barrier",
+            "tir.ptx_arrive_barrier_expect_tx",
+            "tl.mbarrier_expect_tx",
+            "tir.mbarrier_expect_tx",
+            "tl.mbarrier_wait_parity",
+            "tir.mbarrier_wait_parity",
+        }:
+            return True
+        return any(name.startswith("extern:") for name in names)
+
+    def _collect_loop_store(
+        stmt: tvm.tir.Stmt,
+    ) -> Optional[Tuple[List[tvm.tir.For], tvm.tir.BufferStore]]:
+        loops: List[tvm.tir.For] = []
+        node = stmt
+        while isinstance(node, tvm.tir.For):
+            loops.append(node)
+            node = node.body
+        if isinstance(node, tvm.tir.BufferStore):
+            return loops, node
+        return None
+
+    def _make_temp_buffer(dtype: str, shape: List[tvm.tir.PrimExpr]) -> tvm.tir.Buffer:
+        nonlocal temp_id
+        while True:
+            name = f"_tmp_{temp_id}"
+            temp_id += 1
+            if name not in existing_buffer_names:
+                existing_buffer_names.add(name)
+                break
+        buf = tvm.tir.decl_buffer(
+            shape,
+            dtype=dtype,
+            name=name,
+            scope="local",
+        )
+        temp_buffers.append(buf)
+        return buf
+
+    def _rebuild_binary(expr: tvm.tir.PrimExpr, lhs, rhs) -> Optional[tvm.tir.PrimExpr]:
+        name = type(expr).__name__
+        if name == "Add":
+            return lhs + rhs
+        if name == "Sub":
+            return lhs - rhs
+        if name == "Mul":
+            return lhs * rhs
+        if name == "Div":
+            return lhs / rhs
+        if name == "FloorDiv":
+            return lhs // rhs
+        if name in {"FloorMod", "Mod"}:
+            return lhs % rhs
+        if name == "Min":
+            return tvm.tir.Min(lhs, rhs)
+        if name == "Max":
+            return tvm.tir.Max(lhs, rhs)
+        return None
+
+    def _rebuild_loop_nest(loops: List[tvm.tir.For], leaf: tvm.tir.Stmt) -> tvm.tir.Stmt:
+        body = leaf
+        for loop in reversed(loops):
+            body = tvm.tir.For(
+                loop.loop_var,
+                loop.min,
+                loop.extent,
+                loop.kind,
+                body,
+                loop.thread_binding,
+                loop.annotations,
+                loop.step,
+                getattr(loop, "span", None),
+            )
+        return body
+
+    def _split_expr(
+        expr: tvm.tir.PrimExpr,
+        store_indices: List[tvm.tir.PrimExpr],
+        temp_shape: List[tvm.tir.PrimExpr],
+        emit: List[Tuple[tvm.tir.Buffer, tvm.tir.PrimExpr]],
+        *,
+        is_root: bool,
+    ) -> Tuple[tvm.tir.PrimExpr, bool]:
+        if isinstance(expr, tvm.tir.BufferLoad):
+            return expr, False
+
+        changed = False
+        new_expr: Optional[tvm.tir.PrimExpr] = None
+        split_here = False
+
+        if type(expr).__name__ in binary_op_names and hasattr(expr, "a") and hasattr(expr, "b"):
+            lhs, lhs_changed = _split_expr(
+                expr.a,
+                store_indices,
+                temp_shape,
+                emit,
+                is_root=False,
+            )
+            rhs, rhs_changed = _split_expr(
+                expr.b,
+                store_indices,
+                temp_shape,
+                emit,
+                is_root=False,
+            )
+            rebuilt = _rebuild_binary(expr, lhs, rhs)
+            if rebuilt is None:
+                return expr, lhs_changed or rhs_changed
+            new_expr = rebuilt
+            changed = lhs_changed or rhs_changed
+            split_here = True
+        elif isinstance(expr, tvm.tir.Call) and isinstance(expr.op, tvm.ir.Op):
+            new_args = []
+            for arg in expr.args:
+                if isinstance(arg, tvm.tir.PrimExpr):
+                    new_arg, arg_changed = _split_expr(
+                        arg,
+                        store_indices,
+                        temp_shape,
+                        emit,
+                        is_root=False,
+                    )
+                    changed = changed or arg_changed
+                    new_args.append(new_arg)
+                else:
+                    new_args.append(arg)
+            if expr.op.name in sfu_ops:
+                new_expr = tvm.tir.Call(
+                    expr.dtype,
+                    expr.op,
+                    new_args,
+                    expr.annotations,
+                    getattr(expr, "span", None),
+                )
+                split_here = True
+            elif changed:
+                new_expr = tvm.tir.Call(
+                    expr.dtype,
+                    expr.op,
+                    new_args,
+                    expr.annotations,
+                    getattr(expr, "span", None),
+                )
+        else:
+            return expr, False
+
+        if new_expr is None:
+            return expr, changed
+        if split_here and not is_root:
+            tmp = _make_temp_buffer(str(new_expr.dtype), list(temp_shape))
+            emit.append((tmp, new_expr))
+            return tvm.tir.BufferLoad(tmp, list(store_indices)), True
+        return new_expr, changed or split_here
+
+    def _fission_stmt(stmt: tvm.tir.Stmt) -> List[tvm.tir.Stmt]:
+        if _contains_unsafe_intrinsic(stmt):
+            return [stmt]
+        collected = _collect_loop_store(stmt)
+        if collected is None:
+            return [stmt]
+        loops, store = collected
+        emitted_values: List[Tuple[tvm.tir.Buffer, tvm.tir.PrimExpr]] = []
+        new_value, changed = _split_expr(
+            store.value,
+            list(store.indices),
+            list(store.buffer.shape),
+            emitted_values,
+            is_root=True,
+        )
+        if not changed or not emitted_values:
+            return [stmt]
+
+        out: List[tvm.tir.Stmt] = []
+        for tmp_buf, value in emitted_values:
+            out.append(
+                _rebuild_loop_nest(
+                    loops,
+                    tvm.tir.BufferStore(
+                        tmp_buf,
+                        value,
+                        list(store.indices),
+                        store.predicate,
+                        getattr(store, "span", None),
+                    ),
+                )
+            )
+        out.append(
+            _rebuild_loop_nest(
+                loops,
+                tvm.tir.BufferStore(
+                    store.buffer,
+                    new_value,
+                    list(store.indices),
+                    store.predicate,
+                    getattr(store, "span", None),
+                ),
+            )
+        )
+        return out
+
+    new_stmts: List[tvm.tir.Stmt] = []
+    for stmt in seq.seq:
+        new_stmts.extend(_fission_stmt(stmt))
+    if len(new_stmts) == len(seq.seq):
+        return seq, []
+    return tvm.tir.SeqStmt(new_stmts), temp_buffers
+
+def _parent_stmt_idx_for_op(infos: List[_StmtInfo], idx: int) -> int:
+    if 0 <= idx < len(infos):
+        return int(infos[idx].idx)
+    return int(idx)
+
+
 def _reorder_loop_body(
     seq: tvm.tir.SeqStmt,
     infos: List[_StmtInfo],
@@ -2717,18 +2792,23 @@ def _reorder_loop_body(
     with the full consumer compute window, instead of stalling behind the
     serial WGMMA chain.
     """
+    def _append_parent_stmt(
+        out: List[tvm.tir.Stmt],
+        seen: Set[int],
+        op_idx: int,
+    ) -> None:
+        parent_idx = _parent_stmt_idx_for_op(infos, op_idx)
+        if 0 <= parent_idx < len(seq.seq) and parent_idx not in seen:
+            out.append(seq.seq[parent_idx])
+            seen.add(parent_idx)
+
     if full_stmt_order is not None:
         seen: Set[int] = set()
         new_stmts: List[tvm.tir.Stmt] = []
         for idx in full_stmt_order:
-            if 0 <= idx < len(seq.seq) and idx not in seen:
-                new_stmts.append(seq.seq[idx])
-                seen.add(idx)
+            _append_parent_stmt(new_stmts, seen, idx)
         for info in infos:
-            idx = info.idx
-            if 0 <= idx < len(seq.seq) and idx not in seen:
-                new_stmts.append(seq.seq[idx])
-                seen.add(idx)
+            _append_parent_stmt(new_stmts, seen, info.idx)
         for idx, stmt in enumerate(seq.seq):
             if idx not in seen:
                 new_stmts.append(stmt)
@@ -2779,20 +2859,24 @@ def _reorder_loop_body(
                 break
 
     new_stmts: List[tvm.tir.Stmt] = []
+    emitted_parents: Set[int] = set()
     # 1. All hoistable producers first (in topo order).
     for p in hoisted_producers:
-        new_stmts.append(seq.seq[p])
+        _append_parent_stmt(new_stmts, emitted_parents, p)
     # 2. Consumers in the scheduled order, interleaved with any non-hoisted
     #    producer that must precede them.
     non_hoisted = [p for p in producer_indices if p not in hoisted_producers]
     for ci in new_consumer_order:
         to_insert = [p for p in non_hoisted if producer_before.get(p) == ci]
         for p in to_insert:
-            new_stmts.append(seq.seq[p])
+            _append_parent_stmt(new_stmts, emitted_parents, p)
             non_hoisted.remove(p)
-        new_stmts.append(seq.seq[ci])
+        _append_parent_stmt(new_stmts, emitted_parents, ci)
     for p in non_hoisted:
-        new_stmts.append(seq.seq[p])
+        _append_parent_stmt(new_stmts, emitted_parents, p)
+    for idx, raw_stmt in enumerate(seq.seq):
+        if idx not in emitted_parents:
+            new_stmts.append(raw_stmt)
 
     return tvm.tir.SeqStmt(new_stmts)
 
@@ -2803,18 +2887,19 @@ def _planned_reordered_stmt_order(
     full_stmt_order: Optional[List[int]] = None,
 ) -> List[int]:
     """Return original stmt indices in the same order `_reorder_loop_body` emits."""
+    def _append_parent(out: List[int], seen: Set[int], op_idx: int) -> None:
+        parent_idx = _parent_stmt_idx_for_op(infos, op_idx)
+        if parent_idx not in seen:
+            out.append(parent_idx)
+            seen.add(parent_idx)
+
     if full_stmt_order is not None:
         seen: Set[int] = set()
         ordered: List[int] = []
         for idx in full_stmt_order:
-            if idx not in seen:
-                ordered.append(idx)
-                seen.add(idx)
+            _append_parent(ordered, seen, idx)
         for info in infos:
-            idx = info.idx
-            if idx not in seen:
-                ordered.append(idx)
-                seen.add(idx)
+            _append_parent(ordered, seen, info.idx)
         return ordered
 
     producer_indices = [info.idx for info in infos if info.is_producer]
@@ -2851,15 +2936,20 @@ def _planned_reordered_stmt_order(
                 producer_before[pi] = ci
                 break
 
-    ordered = list(hoisted_producers)
+    ordered: List[int] = []
+    seen_parents: Set[int] = set()
+    for p in hoisted_producers:
+        _append_parent(ordered, seen_parents, p)
     non_hoisted = [p for p in producer_indices if p not in hoisted_producers]
     for ci in new_consumer_order:
         to_insert = [p for p in non_hoisted if producer_before.get(p) == ci]
-        ordered.extend(to_insert)
+        for p in to_insert:
+            _append_parent(ordered, seen_parents, p)
         for p in to_insert:
             non_hoisted.remove(p)
-        ordered.append(ci)
-    ordered.extend(non_hoisted)
+        _append_parent(ordered, seen_parents, ci)
+    for p in non_hoisted:
+        _append_parent(ordered, seen_parents, p)
     return ordered
 
 
@@ -3222,6 +3312,62 @@ def _transform_pipeline_loop(
               f"attr={attr_threads})",
               file=sys.stderr, flush=True)
     changed = [False]
+    fission_temp_alloc_buffers: List[tvm.tir.Buffer] = []
+
+    def _append_temp_alloc_buffers(
+        alloc_buffers: List[tvm.tir.Buffer],
+        temp_buffers: List[tvm.tir.Buffer],
+    ) -> List[tvm.tir.Buffer]:
+        if not temp_buffers:
+            return alloc_buffers
+        out = list(alloc_buffers)
+        existing_names = {str(getattr(buf, "name", "")) for buf in out}
+        existing_data = {
+            str(getattr(buf, "data", ""))
+            for buf in out
+            if getattr(buf, "data", None) is not None
+        }
+        for buf in temp_buffers:
+            name = str(getattr(buf, "name", ""))
+            data = str(getattr(buf, "data", ""))
+            if not name.startswith("_tmp_") or not data:
+                continue
+            if name in existing_names or data in existing_data:
+                continue
+            out.append(buf)
+            existing_names.add(name)
+            existing_data.add(data)
+        return out
+
+    def _hoist_temp_alloc_buffers_to_tilelang_root(
+        body: tvm.tir.Stmt,
+        temp_buffers: List[tvm.tir.Buffer],
+    ) -> tvm.tir.Stmt:
+        if not temp_buffers:
+            return body
+
+        def _post(node):
+            if isinstance(node, tvm.tir.BlockRealize):
+                blk = node.block
+                if str(blk.name_hint) != "tilelang_root":
+                    return node
+                alloc_buffers = _append_temp_alloc_buffers(
+                    list(blk.alloc_buffers),
+                    temp_buffers,
+                )
+                if len(alloc_buffers) == len(blk.alloc_buffers):
+                    return node
+                new_blk = tvm.tir.Block(
+                    blk.iter_vars, blk.reads, blk.writes, blk.name_hint,
+                    blk.body, blk.init, alloc_buffers, blk.match_buffers,
+                    blk.annotations,
+                )
+                return tvm.tir.BlockRealize(node.iter_values, node.predicate, new_blk)
+            return node
+
+        return tvm.tir.stmt_functor.ir_transform(
+            body, None, _post, ["tir.BlockRealize"]
+        )
 
     def _visit_for(stmt):
         """Callback for ir_transform: process For loops with num_stages."""
@@ -3286,7 +3432,20 @@ def _transform_pipeline_loop(
         # Merge buffer maps
         merged_buf_map = dict(buffer_var_map)
         merged_buf_map.update(local_buf_map)
-
+        
+        original_seq = seq
+        seq, fission_temp_buffers = _op_fission_and_transform_ir(seq, merged_buf_map)
+        print('--- after fission : \n', seq.script())
+        
+        fission_changed = bool(fission_temp_buffers)
+        for tmp_buf in fission_temp_buffers:
+            try:
+                merged_buf_map[tmp_buf.data] = tmp_buf
+            except Exception:
+                pass
+        if fission_temp_buffers:
+            fission_temp_alloc_buffers.extend(fission_temp_buffers)
+        
         # Build statement infos
         infos_list, barrier_infos = _build_stmt_infos(seq, merged_buf_map, func_alloc_vars)
 
@@ -3458,7 +3617,7 @@ def _transform_pipeline_loop(
         print(f'----{barrier_infos=} ')
         print('---- infos_list : ')
         for info in infos_list :
-            msg = f"[{info.idx}] wr:"
+            msg = f"[{info.idx}] name={info.name} wr:"
             bufinfo = ''
             for wr in info.writes :
                 shape_str = str( [int(x) for x in wr.buffer.shape] )
@@ -3563,6 +3722,7 @@ def _transform_pipeline_loop(
 
             schedulable_indices = set(all_indices)
             stmt_positions = {info.idx: pos for pos, info in enumerate(infos_list)}
+            info_by_idx = {info.idx: info for info in infos_list}
 
             def _joint_wait_reader_pairs_for_elided() -> List[Tuple[int, int]]:
                 producer_written_shared = {
@@ -3741,6 +3901,26 @@ def _transform_pipeline_loop(
                         f"s{ci}": group_remap[raw_groups[ci]]
                         for ci in consumer_indices
                     }
+                    if consumer_num_warps > 1 and len(set(joint_warps.values())) < 2:
+                        tc_consumers = [
+                            ci for ci in consumer_indices
+                            if getattr(info_by_idx.get(ci), "is_wgmma", False)
+                        ]
+                        if len(tc_consumers) >= 2:
+                            tc_order = sorted(
+                                tc_consumers,
+                                key=lambda ci: (joint_times_by_idx.get(ci, 0), stmt_positions.get(ci, ci)),
+                            )
+                            split = max(1, len(tc_order) // 2)
+                            for ci in tc_order[split:]:
+                                joint_warps[f"s{ci}"] = 1
+                            if debug:
+                                print(
+                                    "[Heddle] Joint warp assigns collapsed to one WG; "
+                                    f"routing late tensorcore stmts to WG1 for per-op dispatch: {tc_order[split:]}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
                     # Keep producer-side TMA assignments (for example K/V
                     # loads) in the annotation as well.  FineGrainedWS uses
                     # these only to route producer blocks; consumer WG ids
@@ -3773,10 +3953,26 @@ def _transform_pipeline_loop(
                 base_I = 0
 
             stmt_positions = {info.idx: pos for pos, info in enumerate(infos_list)}
-            info_by_idx = {info.idx: info for info in infos_list}
+            parent_infos: Dict[int, List[_StmtInfo]] = {}
+            for info in infos_list:
+                parent_infos.setdefault(info.idx, []).append(info)
+            parent_positions = {
+                parent_idx: min(stmt_positions.get(info.idx, 0) for info in parent_group)
+                for parent_idx, parent_group in parent_infos.items()
+            }
 
-            def _derive_elided_time(idx: int) -> int:
-                pos = stmt_positions.get(idx, idx)
+            def _parent_time(parent_idx: int) -> int:
+                direct_times = [
+                    int(opt_M[info.idx])
+                    for info in parent_infos.get(parent_idx, [])
+                    if info.idx in opt_M
+                ]
+                if direct_times:
+                    return min(direct_times)
+                return _derive_elided_time(parent_idx)
+
+            def _derive_elided_time(parent_idx: int) -> int:
+                pos = parent_positions.get(parent_idx, parent_idx)
                 prev_times = [
                     int(opt_M[info.idx])
                     for info in infos_list[:pos]
@@ -3796,15 +3992,15 @@ def _transform_pipeline_loop(
                 return 0
 
             time_by_idx = {
-                idx: int(opt_M[idx]) if idx in opt_M else _derive_elided_time(idx)
+                idx: _parent_time(idx)
                 for idx in emitted_stmt_order
             }
             non_producer_order = sorted(
                 [
                     idx for idx in emitted_stmt_order
-                    if idx in info_by_idx and not info_by_idx[idx].is_producer
+                    if not all(info.is_producer for info in parent_infos.get(idx, []))
                 ],
-                key=lambda idx: (time_by_idx.get(idx, 0), stmt_positions.get(idx, idx)),
+                key=lambda idx: (time_by_idx.get(idx, 0), parent_positions.get(idx, idx)),
             )
             order_rank = {idx: rank for rank, idx in enumerate(non_producer_order)}
 
@@ -3813,9 +4009,9 @@ def _transform_pipeline_loop(
             stage: List[int] = []
             smax = max(0, int(num_stages) - 1)
             for pos, idx in enumerate(emitted_stmt_order):
-                info = info_by_idx.get(idx)
+                parent_group = parent_infos.get(idx, [])
                 groups.append([pos])
-                if info is not None and info.is_producer:
+                if parent_group and all(info.is_producer for info in parent_group):
                     order.append(-1)
                     stage.append(-1)
                     continue
@@ -3911,7 +4107,6 @@ def _transform_pipeline_loop(
                 return
             
         get_best_mod_sched_plan()
-         
         # ── Phase B: SMT-based joint ordering ──
         # Policy: run Phase B if (a) explicitly enabled, or (b) ≥3 WGMMA
         # consumer ops detected (complex dependency → heuristic may produce
@@ -4047,11 +4242,25 @@ def _transform_pipeline_loop(
                         # full_stmt_order=phase_b_full_order,
                         full_stmt_order=None,
                     )
-                    new_body = _rewrap_body(stmt.body, seq, new_seq)
+                    new_body = _rewrap_body(
+                        stmt.body,
+                        original_seq,
+                        new_seq,
+                        fission_temp_buffers,
+                    )
                     changed[0] = True
                 else:
                     emitted_stmt_order = [info.idx for info in infos_list]
-                    new_body = stmt.body
+                    new_body = (
+                        _rewrap_body(
+                            stmt.body,
+                            original_seq,
+                            seq,
+                            fission_temp_buffers,
+                        )
+                        if fission_changed else
+                        stmt.body
+                    )
 
                 # Attach barrier hints as loop annotations for PCWS.
                 # Always attach when Phase B produced hints, even if
@@ -4150,7 +4359,7 @@ def _transform_pipeline_loop(
                         print(f"[Heddle] Injected per-op warp assigns: {warp_str}",
                               file=sys.stderr, flush=True)
 
-                if order_changed or annotations_changed:
+                if order_changed or annotations_changed or fission_changed:
                     changed[0] = True
                     return tvm.tir.For(
                         stmt.loop_var, stmt.min, stmt.extent, stmt.kind,
@@ -4243,6 +4452,19 @@ def _transform_pipeline_loop(
         if new_order == consumer_indices and not dual_consumer_will_fire:
             if debug:
                 print("[Heddle] Consumer order unchanged after scheduling", file=sys.stderr, flush=True)
+            if fission_changed:
+                changed[0] = True
+                return tvm.tir.For(
+                    stmt.loop_var, stmt.min, stmt.extent, stmt.kind,
+                    _rewrap_body(
+                        stmt.body,
+                        original_seq,
+                        seq,
+                        fission_temp_buffers,
+                    ),
+                    stmt.thread_binding,
+                    stmt.annotations,
+                )
             return None
 
         if debug and new_order != consumer_indices:
@@ -4251,9 +4473,23 @@ def _transform_pipeline_loop(
         # Reorder the SeqStmt (no-op when new_order matches original)
         if new_order != list(consumer_indices):
             new_seq = _reorder_loop_body(seq, infos_list, new_order)
-            new_body = _rewrap_body(stmt.body, seq, new_seq)
+            new_body = _rewrap_body(
+                stmt.body,
+                original_seq,
+                new_seq,
+                fission_temp_buffers,
+            )
         else:
-            new_body = stmt.body
+            new_body = (
+                _rewrap_body(
+                    stmt.body,
+                    original_seq,
+                    seq,
+                    fission_temp_buffers,
+                )
+                if fission_changed else
+                stmt.body
+            )
 
         changed[0] = True
 
@@ -4327,6 +4563,10 @@ def _transform_pipeline_loop(
     )
 
     if changed[0]:
+        new_body = _hoist_temp_alloc_buffers_to_tilelang_root(
+            new_body,
+            fission_temp_alloc_buffers,
+        )
         return func.with_body(new_body)
     return func
 
@@ -4335,8 +4575,10 @@ def _rewrap_body(
     original_body: tvm.tir.Stmt,
     old_seq: tvm.tir.SeqStmt,
     new_seq: tvm.tir.SeqStmt,
+    extra_alloc_buffers: Optional[List[tvm.tir.Buffer]] = None,
 ) -> tvm.tir.Stmt:
     """Re-wrap the new SeqStmt with the original Block/BlockRealize/Let/Attr layers."""
+    del extra_alloc_buffers
     # Walk the original body to find the old SeqStmt, then substitute
     replaced = [False]
 

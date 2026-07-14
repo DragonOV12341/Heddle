@@ -379,6 +379,23 @@ class TestSMTModuloRegMultiplicity:
         assert result is not None
         assert result["reg_peak"][0] == 180
 
+    def test_loop_carried_output_counts_previous_copy_when_ii_equals_window(self):
+        specs = [
+            ("A", "ALU", 0, [], [("oA", "RMEM", 70, 0)]),
+            ("X", "ALU", 2, [], []),
+            ("B", "ALU", 1, [("A", 1), ("X", 0)], []),
+        ]
+
+        too_tight = _make_smt_nodes(
+            specs, num_warps=1, reg_limit=100, timeout_ms=5000)
+        assert too_tight._solve_phase_b(ii=3, L=3, optimize=False) is None
+
+        just_enough = _make_smt_nodes(
+            specs, num_warps=1, reg_limit=140, timeout_ms=5000)
+        result = just_enough._solve_phase_b(ii=3, L=3, optimize=False)
+        assert result is not None
+        assert result["reg_peak"][0] == 140
+
     def test_phase_b_returns_output_lifetimes(self):
         specs = [
             ("A", "ALU", 1, [("A", 3)], [("oA", "RMEM", 60, 0)]),

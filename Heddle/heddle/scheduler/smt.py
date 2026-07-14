@@ -168,6 +168,9 @@ class HeddleScheduler:
         use_spill_concurrency: bool = True,
         include_incoming_live: bool = True,
         enable_liveness: bool = True,
+        enable_rmem_liveness: Optional[bool] = None,
+        enable_smem_liveness: Optional[bool] = None,
+        fold_rmem_liveness_by_ii: bool = True,
         liveness_checkpoint_step: int = 8,
         start_hints: Optional[Dict[str, int]] = None,
         smem_allocations: Optional[Dict[str, int]] = None,
@@ -191,6 +194,17 @@ class HeddleScheduler:
         self.use_spill_concurrency = use_spill_concurrency
         self.include_incoming_live = include_incoming_live
         self.enable_liveness = enable_liveness
+        self.enable_rmem_liveness = (
+            bool(enable_liveness)
+            if enable_rmem_liveness is None else
+            bool(enable_rmem_liveness)
+        )
+        self.enable_smem_liveness = (
+            bool(enable_liveness)
+            if enable_smem_liveness is None else
+            bool(enable_smem_liveness)
+        )
+        self.fold_rmem_liveness_by_ii = bool(fold_rmem_liveness_by_ii)
         self.liveness_checkpoint_step = max(int(liveness_checkpoint_step), 1)
         self.start_hints = start_hints or {}
         self.smem_allocations = dict(smem_allocations or {})
@@ -927,13 +941,24 @@ class HeddleScheduler:
                         if delta > 0:
                             loop_carried.add(xi)  # opvi 有跨迭代依赖
 
-        # RMEM 容量约束是可行性的一部分，feasibility 和 optimize 两个阶段
-        # 都必须建模；SMEM footprint 是 CTA 
-        # 全局容量约束，也独立建模。
-        track_liveness = bool(self.enable_liveness and all_outputs and self.reg_limit > 0)
+        # RMEM / SMEM 动态 liveness 分开控制。主 joint path 可以只打开
+        # sparse RMEM 容量约束，避免同时引入逐 tau 的 SMEM live 网格。
+        track_rmem_liveness = bool(self.enable_rmem_liveness and all_outputs and self.reg_limit > 0)
+        track_smem_liveness = bool(self.enable_smem_liveness and all_outputs)
         max_iter_overlap = (L - 1) // max(int(ii), 1)
+        max_dependency_distance = max(
+            (
+                int(distance)
+                for consumers in consumers_of.values()
+                for _, distance in consumers
+            ),
+            default=0,
+        )
+        # A loop-carried dependency with distance=1 contributes the previous
+        # iteration's value to the current window even when I == L.
+        incoming_iter_overlap = max(max_iter_overlap, max_dependency_distance)
         iter_offsets = (
-            range(-max_iter_overlap, max_iter_overlap + 1)
+            range(-incoming_iter_overlap, max_iter_overlap + 1)
             if self.include_incoming_live else
             range(0, 1)
         )
@@ -949,7 +974,7 @@ class HeddleScheduler:
 
         # ---- SMEM 容量约束（全局统计，基于区间简化） -------------------------------
         # 针对 SMEM，我们将传统的逐 tau 枚举替换为轻量的绝对时间跨度区间检查，缩减变量规模
-        if self.enable_liveness:
+        if track_smem_liveness:
             for tau in range(L):
                 smem_live_by_buffer: dict[str, list] = defaultdict(list)
                 smem_footprint_by_buffer: dict[str, int] = {}
@@ -1058,10 +1083,19 @@ class HeddleScheduler:
         # 约束 per-warp live bytes，并按 (buffer, iter_offset) 聚合，和
         # Python fixed liveness check 的“同一物理 RMEM buffer 只计一次”
         # 语义保持一致。
-        liveness_checkpoints: list[int] = []
-        if track_liveness:
-            checkpoint_set = set(range(0, L, self.liveness_checkpoint_step))
-            checkpoint_set.add(max(L - 1, 0))
+        rmem_liveness_checkpoints: list[int] = []
+        rmem_folded_offsets = (
+            range(-incoming_iter_overlap, 1)
+            if self.include_incoming_live else
+            range(0, 1)
+        )
+        if track_rmem_liveness:
+            if self.fold_rmem_liveness_by_ii:
+                checkpoint_set = set(range(0, ii, self.liveness_checkpoint_step))
+                checkpoint_set.update({0, max(ii - 1, 0)})
+            else:
+                checkpoint_set = set(range(0, L, self.liveness_checkpoint_step))
+                checkpoint_set.add(max(L - 1, 0))
             hint_times = {
                 v: int(self.start_hints.get(node.name))
                 for v, node in enumerate(self.nodes)
@@ -1069,29 +1103,45 @@ class HeddleScheduler:
             }
             for xi, (producer_v, oval) in enumerate(all_outputs):
                 rmem_iter_offsets = (
-                    iter_offsets
+                    (rmem_folded_offsets if self.fold_rmem_liveness_by_ii else iter_offsets)
                     if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY else
                     range(0, 1)
                 )
                 for iter_offset in rmem_iter_offsets:
                     producer_hint = hint_times.get(producer_v)
                     if producer_hint is not None:
-                        t = producer_hint + iter_offset * ii
+                        t = (
+                            producer_hint % ii
+                            if self.fold_rmem_liveness_by_ii else
+                            producer_hint + iter_offset * ii
+                        )
                         for dt in (-1, 0, 1):
-                            if 0 <= t + dt < L:
+                            limit = ii if self.fold_rmem_liveness_by_ii else L
+                            if 0 <= t + dt < limit:
                                 checkpoint_set.add(t + dt)
                     for cv, d in consumers_of.get(xi, []):
                         consumer_hint = hint_times.get(cv)
                         if consumer_hint is None:
                             continue
-                        t = consumer_hint + (iter_offset + int(d)) * ii
+                        t = (
+                            consumer_hint % ii
+                            if self.fold_rmem_liveness_by_ii else
+                            consumer_hint + (iter_offset + int(d)) * ii
+                        )
                         for dt in (-1, 0, 1):
-                            if 0 <= t + dt < L:
+                            limit = ii if self.fold_rmem_liveness_by_ii else L
+                            if 0 <= t + dt < limit:
                                 checkpoint_set.add(t + dt)
-            liveness_checkpoints = sorted(checkpoint_set)
+            rmem_liveness_checkpoints = sorted(checkpoint_set)
 
-        if track_liveness:
-            for tau in liveness_checkpoints:
+        def _time_le_checkpoint_var(name: str, time_expr, tau: int):
+            b = model.new_bool_var(name)
+            model.add(time_expr <= tau).only_enforce_if(b)
+            model.add(time_expr > tau).only_enforce_if(b.negated())
+            return b
+
+        if track_rmem_liveness:
+            for tau in rmem_liveness_checkpoints:
                 live_terms_by_warp_buffer: dict[tuple[int, str, int], list] = defaultdict(list)
                 footprint_by_warp_buffer: dict[tuple[int, str, int], int] = {}
                 for xi, (producer_v, oval) in enumerate(all_outputs):
@@ -1100,7 +1150,7 @@ class HeddleScheduler:
 
                     buffer_key = oval.rmem_buffer_key()
                     rmem_iter_offsets = (
-                        iter_offsets
+                        (rmem_folded_offsets if self.fold_rmem_liveness_by_ii else iter_offsets)
                         if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY else
                         range(0, 1)
                     )
@@ -1108,12 +1158,16 @@ class HeddleScheduler:
                     consumers = consumers_of[xi] if self.include_incoming_live else [(cv, d) for cv, d in consumers_of[xi] if d == 0]
 
                     for iter_offset in rmem_iter_offsets:
-                        p_start = Tv[producer_v] + iter_offset * ii
-                        is_produced = model.new_bool_var(
-                            f"rmem_p_x={xi}_k={iter_offset}_t={tau}"
+                        p_start = (
+                            phase[producer_v] + iter_offset * ii
+                            if self.fold_rmem_liveness_by_ii else
+                            Tv[producer_v] + iter_offset * ii
                         )
-                        model.add(p_start <= tau).only_enforce_if(is_produced)
-                        model.add(p_start > tau).only_enforce_if(is_produced.negated())
+                        is_produced = _time_le_checkpoint_var(
+                            f"rmem_p_x={xi}_k={iter_offset}_t={tau}",
+                            p_start,
+                            tau,
+                        )
 
                         if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY:
                             if not consumers:
@@ -1124,14 +1178,18 @@ class HeddleScheduler:
                                 c_terms = []
                                 offset = 1 if producer_lat == 0 else 0
                                 # 所有消费者都已经启动/消费后，这份 copy 才能释放。
-                                # c_started: Tv[cv] + (iter_offset+d)*ii + offset <= tau
+                                # c_started: phase/Tv[cv] + (iter_offset+d)*ii + offset <= tau
                                 for cv, d in consumers:
-                                    c_started = model.new_bool_var(
-                                        f"rmem_c_x={xi}_k={iter_offset}_cv={cv}_t={tau}"
+                                    c_time = (
+                                        phase[cv] + (iter_offset + int(d)) * ii + offset
+                                        if self.fold_rmem_liveness_by_ii else
+                                        Tv[cv] + (iter_offset + int(d)) * ii + offset
                                     )
-                                    c_time = Tv[cv] + (iter_offset + int(d)) * ii + offset
-                                    model.add(c_time <= tau).only_enforce_if(c_started)
-                                    model.add(c_time > tau).only_enforce_if(c_started.negated())
+                                    c_started = _time_le_checkpoint_var(
+                                        f"rmem_c_x={xi}_k={iter_offset}_cv={cv}_t={tau}",
+                                        c_time,
+                                        tau,
+                                    )
                                     c_terms.append(c_started)
 
                                 all_c_done = _and_var(
@@ -1189,7 +1247,7 @@ class HeddleScheduler:
             # RMEM communication because codegen does not yet materialize a
             # real cross-WG register spill/copy path.
             model.minimize(
-                L * N * mx + sum(Tv) + sum(cross_wg_rmem_penalty_terms)
+                L * N * mx + sum(Tv)
             )
 
         # ---- 求解 ---------------------------------------------------------
@@ -1324,10 +1382,10 @@ class HeddleScheduler:
                 })
 
         reg_peak: Dict[int, int] = {}  # warp 内每个线程 寄存器用量最大值
-        if track_liveness:
+        if track_rmem_liveness:
             for w in range(W):
                 peak = 0
-                for tau in liveness_checkpoints:
+                for tau in rmem_liveness_checkpoints:
                     live_bytes_by_copy: Dict[tuple[str, int], int] = {}
                     for xi, (pv, oval) in enumerate(all_outputs):
                         if oval.storage != StorageKind.RMEM:
@@ -1337,14 +1395,19 @@ class HeddleScheduler:
                             continue
                         buffer_key = oval.rmem_buffer_key()
                         rmem_iter_offsets = (
-                            iter_offsets
+                            (rmem_folded_offsets if self.fold_rmem_liveness_by_ii else iter_offsets)
                             if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY else
                             range(0, 1)
                         )
                         producer_lat = int(self.nodes[pv].latency)
                         consumers = consumers_of[xi] if self.include_incoming_live else [(cv, d) for cv, d in consumers_of[xi] if d == 0]
                         for iter_offset in rmem_iter_offsets:
-                            produced_at = solver.value(Tv[pv]) + iter_offset * ii
+                            base_produced_at = (
+                                solver.value(phase[pv])
+                                if self.fold_rmem_liveness_by_ii else
+                                solver.value(Tv[pv])
+                            )
+                            produced_at = base_produced_at + iter_offset * ii
                             if produced_at > tau:
                                 continue
                             if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY:
@@ -1352,9 +1415,13 @@ class HeddleScheduler:
                                     continue
                                 live = False
                                 for cv, d in consumers:
-                                    consume_time = (
+                                    base_consume_time = (
+                                        solver.value(phase[cv])
+                                        if self.fold_rmem_liveness_by_ii else
                                         solver.value(Tv[cv])
-                                        + (iter_offset + int(d)) * ii
+                                    )
+                                    consume_time = (
+                                        base_consume_time + (iter_offset + int(d)) * ii
                                     )
                                     if producer_lat == 0:
                                         consume_time += 1

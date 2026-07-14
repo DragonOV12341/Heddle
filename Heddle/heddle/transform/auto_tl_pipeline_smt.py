@@ -398,6 +398,17 @@ class _ChildAccess:
     buffer_name: str
     intervals: Tuple[_AccessInterval, ...]
     kind: str  # "read" or "write"
+    buffer: Optional[tvm.tir.Buffer] = None
+
+
+@dataclass
+class _ChildOpInfo:
+    name: str
+    resource_type: str
+    issue_cycles: int
+    latency: int
+    instance_count: int = 1
+    deps: Tuple[int, ...] = ()
 
 
 def _substitute_and_simplify(
@@ -454,7 +465,7 @@ def _buffer_access(
         else:
             start = _substitute_and_simplify(idx, bindings, analyzer)
             intervals.append(_AccessInterval(start, analyzer.simplify(start + 1)))
-    return _ChildAccess(buf.name, tuple(intervals), kind)
+    return _ChildAccess(buf.name, tuple(intervals), kind, buf)
 
 
 def _collect_child_accesses(
@@ -464,11 +475,11 @@ def _collect_child_accesses(
     is_wgmma: bool = False,
     is_true_tma: bool = False,
 ) -> List[List[_ChildAccess]]:
-    """Collect per-static-unroll-child buffer accesses.
+    """Collect stmt-level buffer accesses for one top-level op.
 
-    Static ``T.unroll`` loops create independent children. ``T.vectorized``
-    loops do not create children; their lanes widen the accessed interval, with
-    lane upper bound ``extent - 1``.
+    Static ``T.unroll`` loops are substituted into the access summary, but they
+    no longer create independent SMT children. ``T.vectorized`` loops still
+    widen the accessed interval with lane upper bound ``extent - 1``.
     """
     if is_true_tma:
         return []
@@ -476,10 +487,6 @@ def _collect_child_accesses(
     analyzer = tvm.arith.Analyzer()
     data_to_buffer = _collect_buffer_data_map(buffer_var_map)
     child_accesses: List[List[_ChildAccess]] = []
-    group_by_outer_unroll = (not is_wgmma) and (_last_returning_store_static_unroll_multiplier(stmt) is not None)
-
-    def _append_child_access(accesses: List[_ChildAccess]) -> None:
-        child_accesses.append(accesses)
 
     def _collect_expr_reads(
         expr: tvm.tir.PrimExpr,
@@ -576,12 +583,7 @@ def _collect_child_accesses(
                 base = _substitute_and_simplify(node.min, bindings, analyzer)
                 for i in range(extent):
                     val = analyzer.simplify(base + i)
-                    if group_by_outer_unroll and current_accesses is None:
-                        grouped: List[_ChildAccess] = []
-                        _walk(node.body, {**bindings, node.loop_var: val}, vector_bounds, grouped)
-                        _append_child_access(grouped)
-                    else:
-                        _walk(node.body, {**bindings, node.loop_var: val}, vector_bounds, current_accesses)
+                    _walk(node.body, {**bindings, node.loop_var: val}, vector_bounds, current_accesses)
                 return
             if extent is not None and node.kind == tvm.tir.ForKind.VECTORIZED:
                 base = _substitute_and_simplify(node.min, bindings, analyzer)
@@ -607,7 +609,7 @@ def _collect_child_accesses(
             if current_accesses is not None:
                 current_accesses.extend(accesses)
             else:
-                _append_child_access(accesses)
+                child_accesses.append(accesses)
             return
         if isinstance(node, tvm.tir.Evaluate):
             accesses = []
@@ -622,14 +624,222 @@ def _collect_child_accesses(
                 if current_accesses is not None:
                     current_accesses.extend(accesses)
                 else:
-                    _append_child_access(accesses)
+                    child_accesses.append(accesses)
             return
         # Generic fallback: visit nested statements exposed by TVM nodes through
         # post_order_visit only for expressions handled above. Unknown statement
         # forms remain represented by stmt-level regions.
 
-    _walk(stmt, {}, {})
+    aggregated_accesses: List[_ChildAccess] = []
+    _walk(stmt, {}, {}, aggregated_accesses)
+    if aggregated_accesses:
+        child_accesses.append(aggregated_accesses)
     return child_accesses
+
+
+def _collect_operation_child_model(
+    stmt: tvm.tir.Stmt,
+    buffer_var_map: Dict[tvm.tir.Var, tvm.tir.Buffer],
+    *,
+    is_wgmma: bool = False,
+    is_true_tma: bool = False,
+) -> Tuple[List[_ChildOpInfo], List[List[_ChildAccess]]]:
+    """Split scalar expression statements into loop-wide operation children.
+
+    ``T.unroll`` extents scale each operation's issue occupancy, but do not
+    create per-iteration children.  For example, a loop-wide
+    ``exp2(a * c - b * c)`` becomes mul, mul, sub, exp2/store children.
+    """
+    if is_wgmma or is_true_tma:
+        return [], []
+
+    try:
+        from heddle.scheduler.smt import ResourceType  # type: ignore
+    except Exception:  # pragma: no cover
+        from heddle.scheduler.smt import ResourceType  # type: ignore
+
+    analyzer = tvm.arith.Analyzer()
+    child_ops: List[_ChildOpInfo] = []
+    child_accesses: List[List[_ChildAccess]] = []
+
+    sfu_ops = {"tir.exp2", "tir.rsqrt", "tir.log2", "tir.exp", "tir.log", "tir.sqrt", "tir.tanh", "tir.sigmoid"}
+    binary_op_names = {
+        "Add",
+        "Sub",
+        "Mul",
+        "Div",
+        "FloorDiv",
+        "FloorMod",
+        "Mod",
+        "Min",
+        "Max",
+    }
+
+    def _expr_reads(
+        expr: tvm.tir.PrimExpr,
+        bindings: Dict[tvm.tir.Var, tvm.tir.PrimExpr],
+    ) -> List[_ChildAccess]:
+        accesses: List[_ChildAccess] = []
+
+        def _visit(node):
+            if isinstance(node, tvm.tir.BufferLoad):
+                accesses.append(
+                    _buffer_access(
+                        node.buffer,
+                        list(node.indices),
+                        kind="read",
+                        bindings=bindings,
+                        vector_bounds={},
+                        analyzer=analyzer,
+                    )
+                )
+
+        tvm.tir.stmt_functor.post_order_visit(expr, _visit)
+        return accesses
+
+    def _append_op(
+        name: str,
+        resource: "ResourceType",
+        issue_per_iter: int,
+        execute_cycles: int,
+        loop_multiplier: int,
+        deps: List[int],
+        accesses: List[_ChildAccess],
+    ) -> int:
+        issue_cycles = max(int(issue_per_iter) * max(int(loop_multiplier), 1), 1)
+        latency = _op_total_latency(issue_cycles, execute_cycles)
+        child_ops.append(
+            _ChildOpInfo(
+                name=name,
+                resource_type=resource.value,
+                issue_cycles=issue_cycles,
+                latency=latency,
+                instance_count=max(int(loop_multiplier), 1),
+                deps=tuple(dict.fromkeys(deps)),
+            )
+        )
+        child_accesses.append(accesses)
+        return len(child_ops) - 1
+
+    def _walk_expr(
+        expr: tvm.tir.PrimExpr,
+        loop_multiplier: int,
+        bindings: Dict[tvm.tir.Var, tvm.tir.PrimExpr],
+    ) -> Optional[int]:
+        if isinstance(expr, tvm.tir.BufferLoad):
+            return None
+        if isinstance(expr, tvm.tir.Call) and isinstance(expr.op, tvm.ir.Op):
+            dep_ids = [
+                dep for arg in expr.args
+                if isinstance(arg, tvm.tir.PrimExpr)
+                for dep in [_walk_expr(arg, loop_multiplier, bindings)]
+                if dep is not None
+            ]
+            if expr.op.name in sfu_ops:
+                issue, execute = OpIssueAndLatencyTable.get_issue_execute_cycle(ResourceType.SFU, [])
+                return _append_op(
+                    str(expr.op.name),
+                    ResourceType.SFU,
+                    issue,
+                    execute,
+                    loop_multiplier,
+                    dep_ids,
+                    [],
+                )
+            return dep_ids[-1] if dep_ids else None
+
+        if type(expr).__name__ in binary_op_names:
+            operands = []
+            for attr in ("a", "b"):
+                if hasattr(expr, attr):
+                    operands.append(getattr(expr, attr))
+            dep_ids = [
+                dep for operand in operands
+                for dep in [_walk_expr(operand, loop_multiplier, bindings)]
+                if dep is not None
+            ]
+            accesses = []
+            for operand in operands:
+                accesses.extend(_expr_reads(operand, bindings))
+            issue, execute = OpIssueAndLatencyTable.get_issue_execute_cycle(ResourceType.ALU, [])
+            return _append_op(
+                str(getattr(expr, "name", type(expr).__name__)),
+                ResourceType.ALU,
+                issue,
+                execute,
+                loop_multiplier,
+                dep_ids,
+                accesses,
+            )
+
+        child_dep_ids: List[int] = []
+        for attr in ("a", "b", "value"):
+            if hasattr(expr, attr):
+                child = getattr(expr, attr)
+                if isinstance(child, tvm.tir.PrimExpr):
+                    dep = _walk_expr(child, loop_multiplier, bindings)
+                    if dep is not None:
+                        child_dep_ids.append(dep)
+        return child_dep_ids[-1] if child_dep_ids else None
+
+    def _walk_stmt(
+        node: Any,
+        loop_multiplier: int,
+        bindings: Dict[tvm.tir.Var, tvm.tir.PrimExpr],
+    ) -> None:
+        if isinstance(node, tvm.tir.SeqStmt):
+            for s in node.seq:
+                _walk_stmt(s, loop_multiplier, bindings)
+            return
+        if isinstance(node, tvm.tir.Block):
+            _walk_stmt(node.body, loop_multiplier, bindings)
+            return
+        if isinstance(node, tvm.tir.BlockRealize):
+            _walk_stmt(node.block, loop_multiplier, bindings)
+            return
+        if isinstance(node, tvm.tir.AttrStmt):
+            _walk_stmt(node.body, loop_multiplier, bindings)
+            return
+        if isinstance(node, tvm.tir.IfThenElse):
+            _walk_stmt(node.then_case, loop_multiplier, bindings)
+            if node.else_case is not None:
+                _walk_stmt(node.else_case, loop_multiplier, bindings)
+            return
+        if isinstance(node, tvm.tir.LetStmt):
+            _walk_stmt(
+                node.body,
+                loop_multiplier,
+                {**bindings, node.var: _substitute_and_simplify(node.value, bindings, analyzer)},
+            )
+            return
+        if isinstance(node, tvm.tir.For):
+            extent = _static_positive_int(node.extent)
+            if extent is not None and _is_unrolled_for(node):
+                base = _substitute_and_simplify(node.min, bindings, analyzer)
+                _walk_stmt(
+                    node.body,
+                    loop_multiplier * extent,
+                    {**bindings, node.loop_var: base},
+                )
+                return
+            _walk_stmt(node.body, loop_multiplier, bindings)
+            return
+        if isinstance(node, tvm.tir.BufferStore):
+            dep = _walk_expr(node.value, loop_multiplier, bindings)
+            if dep is None:
+                return
+            write_access = _buffer_access(
+                node.buffer,
+                list(node.indices),
+                kind="write",
+                bindings=bindings,
+                vector_bounds={},
+                analyzer=analyzer,
+            )
+            child_accesses[dep].append(write_access)
+
+    _walk_stmt(stmt, 1, {})
+    return child_ops, child_accesses
 
 
 def _contains_returning_extern_call(expr: tvm.tir.PrimExpr) -> bool:
@@ -694,34 +904,17 @@ def _estimate_stmt_instance_count(
     is_wgmma: bool = False,
     is_true_tma: bool = False,
 ) -> int:
-    """Estimate how many independent leaf ops a static loop-wrapped stmt contains.
-
-    The scheduler still rewrites/reorders at top-level statement granularity,
-    but SMT can model a statement such as ``for i in T.unroll(8): op(i)`` as
-    eight ordered issue instances.
-
-    For ordered hardware-issue statements, count only the relevant issue call:
-    TMA statements are expanded by the static loops wrapping ``tma_load`` only,
-    and WGMMA statements are expanded by the static loops wrapping WGMMA calls
-    only.  Barrier bookkeeping in the same top-level statement must not inflate
-    the producer issue count.
-
-    For ordinary consumer statements, count BufferStore and Evaluate leaves with
-    static unroll extents folded in.  For reduction-like tree fragments whose
-    result is returned by a nested extern call, use that returning child op's
-    surrounding static-unroll multiplicity instead of every internal leaf.
-    Vectorized lanes are data lanes, not issue instances. Fall back to one
-    instance for structural statements that do not expose either leaf kind.
-    """
-    if is_true_tma:
-        return max(1, int(_count_tma_ops_with_static_loop_multiplier(stmt)))
-    if is_wgmma:
-        return max(1, int(_count_wgmma_ops_with_static_loop_multiplier(stmt)))
-    returning_store_count = _last_returning_store_static_unroll_multiplier(stmt)
-    if returning_store_count is not None:
-        return max(1, int(returning_store_count))
-    count = _count_stmt_ops_with_static_loop_multiplier(stmt, lambda _op: True)
-    return max(1, int(count))
+    """Return the static outer ``T.unroll`` multiplicity around this stmt."""
+    del is_wgmma, is_true_tma
+    multiplier = 1
+    node = stmt
+    while isinstance(node, tvm.tir.For):
+        extent = _static_positive_int(node.extent)
+        if extent is None or not _is_unrolled_for(node):
+            break
+        multiplier *= extent
+        node = node.body
+    return max(int(multiplier), 1)
 
 
 def _infer_stmt_instance_semantic(
@@ -729,6 +922,7 @@ def _infer_stmt_instance_semantic(
     *,
     is_wgmma: bool,
     is_true_tma: bool,
+    has_operation_children: bool = False,
 ) -> str:
     """Classify what ``op_instance_count`` represents for this statement.
 
@@ -736,11 +930,45 @@ def _infer_stmt_instance_semantic(
     children are ordered only by accumulator hazards, so they are not tagged as
     unconditional issue slices here.
     """
+    if has_operation_children:
+        return "operation_nodes"
     if is_true_tma:
         return "issue_slices"
     if is_wgmma:
         return "accumulator_hazard"
     return "element_lanes"
+
+
+def _regions_from_child_accesses(
+    accesses: List[_ChildAccess],
+) -> Tuple[List[tvm.tir.BufferRegion], List[tvm.tir.BufferRegion]]:
+    reads: List[tvm.tir.BufferRegion] = []
+    writes: List[tvm.tir.BufferRegion] = []
+
+    def _region(access: _ChildAccess) -> Optional[tvm.tir.BufferRegion]:
+        buf = getattr(access, "buffer", None)
+        if buf is None:
+            return None
+        region = []
+        try:
+            for interval in access.intervals:
+                region.append(tvm.ir.Range.from_min_extent(
+                    interval.start,
+                    interval.end - interval.start,
+                ))
+            return tvm.tir.BufferRegion(buf, region)
+        except Exception:
+            return None
+
+    for access in accesses:
+        region = _region(access)
+        if region is None:
+            continue
+        if access.kind == "write":
+            writes.append(region)
+        else:
+            reads.append(region)
+    return reads, writes
 
 
 def _count_wgmma_ops_with_static_loop_multiplier(stmt: tvm.tir.Stmt) -> int:
@@ -1194,7 +1422,7 @@ def _detect_op_latency_and_resource(stmt: tvm.tir.Stmt) -> tuple:
         # 单个wgmma执行周期
         [issue , execute] = OpIssueAndLatencyTable.get_issue_execute_cycle(ResourceType.TensorCore, [mnk_key,idx] )
         # 循环：不能简单xN。 正确计算方式 = interval * (N-1) + Latency, 这里 interval 简化为等于issue_time
-        return _op_total_latency(_detect_wgmma_issue_cycles(stmt), execute), ResourceType.TensorCore
+        return _op_total_latency(_detect_wgmma_issue_cycles(stmt) * wgmma_op_count , execute), ResourceType.TensorCore
 
     tma_op_count = _count_tma_ops_with_static_loop_multiplier(stmt)
     if tma_op_count > 0:
@@ -1295,6 +1523,7 @@ def _is_wgmma_like(stmt: tvm.tir.Stmt) -> bool:
 @dataclass
 class _StmtInfo:
     idx: int
+    name: str
     stmt: tvm.tir.Stmt
     reads: List[tvm.tir.BufferRegion]
     writes: List[tvm.tir.BufferRegion]
@@ -1308,7 +1537,9 @@ class _StmtInfo:
     is_wait_barrier : bool
     op_instance_count: int = 1
     op_instance_semantic: str = "element_lanes"
-    child_accesses: Optional[List[List[_ChildAccess]]] = None
+    op_resource_type: Optional[str] = None
+    op_issue_cycles: Optional[int] = None
+    op_latency: Optional[int] = None
 
 
 import tvm
@@ -1408,43 +1639,67 @@ def _build_stmt_infos(
         # 一个代表 `k % 2 + 3` (控制 V 矩阵的 TMA)
 
         is_wgmma = _is_wgmma_like(s)
-        try:
-            child_accesses = _collect_child_accesses(
+
+        def _append_info(
+            *,
+            name: str,
+            child_reads: List[tvm.tir.BufferRegion],
+            child_writes: List[tvm.tir.BufferRegion],
+            op_instance_count: int,
+            op_instance_semantic: str,
+            op_resource_type: Optional[str],
+            op_issue_cycles: Optional[int],
+            op_latency: Optional[int],
+        ) -> None:
+            infos.append(
+                _StmtInfo(
+                    idx=len(infos),
+                    name=name,
+                    stmt=s,
+                    reads=child_reads,
+                    writes=child_writes,
+                    is_producer=is_prod,
+                    is_true_tma=is_true_tma,
+                    is_sync_top=_is_sync_like(s, nested=False),
+                    is_sync_nested=_is_sync_like(s, nested=True),
+                    is_wgmma=is_wgmma,
+                    touches_local=_touches_non_shared_global(reads, writes),
+                    touches_external_local=_touches_external_non_shared_global(
+                        s, reads, writes, func_alloc_vars
+                    ),
+                    is_wait_barrier=is_wait_barrier,
+                    op_instance_count=op_instance_count,
+                    op_instance_semantic=op_instance_semantic,
+                    op_resource_type=op_resource_type,
+                    op_issue_cycles=op_issue_cycles,
+                    op_latency=op_latency,
+                )
+            )
+
+        latency, rty = _detect_op_latency_and_resource(s)
+        issue_cycles = (
+            _detect_wgmma_issue_cycles(s)
+            if is_wgmma else
+            _detect_op_issue_cycles(s)
+        )
+        _append_info(
+            name=str(getattr(rty, "value", str(rty))),
+            child_reads=reads,
+            child_writes=writes,
+            op_instance_count=_estimate_stmt_instance_count(
                 s,
-                buffer_var_map,
                 is_wgmma=is_wgmma,
                 is_true_tma=is_true_tma,
-            )
-        except Exception:
-            child_accesses = None
-        infos.append(
-            _StmtInfo(
-                idx=i,
-                stmt=s,
-                reads=reads,
-                writes=writes,
-                is_producer=is_prod,
-                is_true_tma=is_true_tma,
-                is_sync_top=_is_sync_like(s, nested=False),
-                is_sync_nested=_is_sync_like(s, nested=True),
+            ),
+            op_instance_semantic=_infer_stmt_instance_semantic(
+                s,
                 is_wgmma=is_wgmma,
-                touches_local=_touches_non_shared_global(reads, writes),
-                touches_external_local=_touches_external_non_shared_global(
-                    s, reads, writes, func_alloc_vars
-                ),
-                is_wait_barrier=is_wait_barrier,
-                op_instance_count=_estimate_stmt_instance_count(
-                    s,
-                    is_wgmma=is_wgmma,
-                    is_true_tma=is_true_tma,
-                ),
-                op_instance_semantic=_infer_stmt_instance_semantic(
-                    s,
-                    is_wgmma=is_wgmma,
-                    is_true_tma=is_true_tma,
-                ),
-                child_accesses=child_accesses,
-            )
+                is_true_tma=is_true_tma,
+                has_operation_children=False,
+            ),
+            op_resource_type=getattr(rty, "value", str(rty)),
+            op_issue_cycles=max(1, int(issue_cycles)),
+            op_latency=max(1, int(latency)),
         )
     return infos, grouped_barriers
 
