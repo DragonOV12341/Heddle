@@ -530,6 +530,7 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
                 edges.append((u, v, latencies[u], 0))
 
             # 跨循环依赖关系: 如果读写同一 buffer 则自己存在跨循环依赖
+            # TODO : 此处还需要分析 buffer 读写
             write_buf_names = {buf.buffer.name for buf in infos[v].writes}
             read_buf_names = {buf.buffer.name for buf in infos[v].reads}
             self_conflict = bool(write_buf_names & read_buf_names)
@@ -1090,14 +1091,6 @@ def _solve_smt_joint_optimize(
 
     def _op_name(idx: int) -> str:
         return f"s{idx}"
-
-    def _child_stmt_idx(name: str) -> Optional[int]:
-        if not isinstance(name, str) or not name.startswith("s"):
-            return None
-        try:
-            return int(name[1:])
-        except ValueError:
-            return None
     
     expect_consumer_warps = int(mod_sched_plan.get('heddle_expect_consumer_warps', 4))
     print(f"heddle expected consumer_warps = {expect_consumer_warps}")
@@ -1113,18 +1106,18 @@ def _solve_smt_joint_optimize(
     if base_I <= 0:
         return dict(mod_sched_plan)
     
-    expect_num_stage = (base_L + base_I - 1) // base_I  # ceil(L/I) naive window stages
+    naive_num_stage = (base_L + base_I - 1) // base_I  # ceil(L/I) naive window stages
     try:
         original_num_stages = int(mod_sched_plan.get("heddle_original_num_stages", 0))
     except (TypeError, ValueError):
         original_num_stages = 0
     smem_estimate_num_stage = (
-        min(expect_num_stage, original_num_stages)
+        min(naive_num_stage, original_num_stages)
         if original_num_stages > 0 else
-        expect_num_stage
+        naive_num_stage
     )
     print(
-        f"{expect_num_stage=} smem_estimate_num_stage={smem_estimate_num_stage}",
+        f"{naive_num_stage=} smem_estimate_num_stage={smem_estimate_num_stage}",
         flush=True,
     )
     _rtype_map = {
@@ -1456,6 +1449,7 @@ def _solve_smt_joint_optimize(
             latency=latency,
             reservation=_reservation_for_info(info, rty),
             outputs=outputs,
+            input_buffer_names=list(op_buffer_reads.get(idx, [])),
             warp_count=wc,
             warp_align=4 if need_warpgroup else 1,
             is_varialble_latency=_is_variable_latency,
@@ -1592,17 +1586,22 @@ def _solve_smt_joint_optimize(
         same_subcore_exclusion_pairs: Optional[List[Tuple[str, str]]] = None,
     ):
         solver = HeddleScheduler(
-            nodes,
+            nodes,  # 此时 outputBuffer 已乘上了版本数
             fu_caps=capacity,
             reg_limit=solve_reg_limit,
             smem_limit=solve_smem_limit,
             num_warps=num_warps,
-            timeout_ms=int(mod_sched_plan.get("timeout_ms", 30000)),
+            timeout_ms=int(mod_sched_plan.get("timeout_ms", 180*1000)),
             enable_liveness=enable_liveness,
             enable_rmem_liveness=enable_liveness,
-            enable_smem_liveness=False,
+            enable_smem_liveness=True,
             fold_rmem_liveness_by_ii=bool(mod_sched_plan.get("fold_rmem_liveness_by_ii", True)),
-            use_spill_concurrency=False,
+            # Cross-WG RMEM spill windows are currently a very strong model:
+            # they reserve the destination WG against every other op in the
+            # spill interval. On real FA graphs this can overconstrain Phase B
+            # into immediate UNSAT. Keep it opt-in; we still discourage
+            # cross-WG RMEM via the soft penalty objective in scheduler/smt.py.
+            use_spill_concurrency=bool(mod_sched_plan.get("use_spill_concurrency", False)),
             liveness_checkpoint_step=int(mod_sched_plan.get("liveness_checkpoint_step", 8)),
             start_hints={
                 name: int(t)
@@ -1614,7 +1613,8 @@ def _solve_smt_joint_optimize(
             same_warpgroup_pairs=same_warpgroup_pairs,
             not_all_same_warpgroup_sets=not_all_same_warpgroup_sets,
             same_subcore_exclusion_pairs=same_subcore_exclusion_pairs,
-            cross_wg_rmem_penalty=int(mod_sched_plan.get("cross_wg_rmem_penalty", 2)),
+            cross_wg_rmem_penalty=int(mod_sched_plan.get("cross_wg_rmem_penalty", 1)),
+            rmem_conservative=bool(mod_sched_plan.get("rmem_conservative", False)),
         )
         return solver.schedule_joint(
             min_ii=ii,
@@ -1638,6 +1638,7 @@ def _solve_smt_joint_optimize(
         check_L: int,
         check_reg_limit: int,
         check_smem_limit: int,
+        use_mem_check_conservative: bool = False,
     ) -> Tuple[bool, Dict[str, object]]:
         fixed_M = {
             idx: int(schedule[_op_name(idx)])
@@ -1732,14 +1733,20 @@ def _solve_smt_joint_optimize(
             v_idx = idx_by_name.get(v_node.name)
             if v_idx is None:
                 continue
+            v_reads = set(op_buffer_reads.get(v_idx, []))
             for par in v_node.parents:
                 delta = int(v_node.dependency_distance.get(par.name, 0))
                 for oval in par.outputs:
+                    if oval.buffer_name and oval.buffer_name not in v_reads:
+                        continue
                     xi = output_name_to_xi.get(oval.name)
                     if xi is not None:
                         consumers_of.setdefault(xi, []).append((v_idx, delta))
 
-        max_iter_overlap = (max(int(check_L), 1) - 1) // max(int(base_I), 1)
+        max_iter_overlap = (
+            (max(int(check_L), 1) - 1) // max(int(base_I), 1)
+        )
+        
         max_dependency_distance = max(
             (
                 int(distance)
@@ -1753,6 +1760,20 @@ def _solve_smt_joint_optimize(
         # so include the dependency distance on the incoming side explicitly.
         incoming_iter_overlap = max(max_iter_overlap, max_dependency_distance)
         iter_offsets = range(-incoming_iter_overlap, max_iter_overlap + 1)
+
+        conservative_rmem_buffers: Dict[str, Dict[str, object]] = {}
+        if use_mem_check_conservative:
+            for xi, (producer_idx, oval) in enumerate(all_outputs):
+                if oval.storage != StorageKind.RMEM or oval.footprint_bytes <= 0:
+                    continue
+                buffer_key = oval.rmem_buffer_key()
+                entry = conservative_rmem_buffers.setdefault(
+                    buffer_key,
+                    {
+                        "footprint": 0,
+                    },
+                )
+                entry["footprint"] = max(int(entry["footprint"]), int(oval.footprint_bytes))
 
         def _copy_live(xi: int, iter_offset: int, tau: int) -> bool:
             producer_idx, oval = all_outputs[xi]
@@ -1773,6 +1794,11 @@ def _solve_smt_joint_optimize(
             return False
 
         reg_peak: Dict[int, int] = {w: 0 for w in range(num_warps)}
+        first_reg_limit_error: Optional[Dict[str, object]] = None
+        rmem_live_iter_peak_by_warp: Dict[int, Dict[str, int]] = {
+            w: {buffer_key: 0 for buffer_key in conservative_rmem_buffers}
+            for w in range(num_warps)
+        }
         smem_peak = 0
         static_smem_total = sum(
             int(footprint)
@@ -1783,6 +1809,9 @@ def _solve_smt_joint_optimize(
             smem_live_bytes: Dict[str, int] = {}
             spill_smem_live_bytes: Dict[Tuple[str, int, int], int] = {}
             reg_live_bytes: Dict[int, Dict[Tuple[str, int], int]] = {
+                w: {} for w in range(num_warps)
+            }
+            rmem_live_iters_by_warp_buffer: Dict[int, Dict[str, Set[int]]] = {
                 w: {} for w in range(num_warps)
             }
             for xi, (producer_idx, oval) in enumerate(all_outputs):
@@ -1802,6 +1831,11 @@ def _solve_smt_joint_optimize(
                         buffer_key = oval.rmem_buffer_key()
                         copy_key = (buffer_key, int(iter_offset))
                         for w in fixed_warps.get(producer_idx, [0]):
+                            if use_mem_check_conservative:
+                                rmem_live_iters_by_warp_buffer.setdefault(w, {})
+                                rmem_live_iters_by_warp_buffer[w].setdefault(
+                                    buffer_key, set()
+                                ).add(int(iter_offset))
                             reg_live_bytes.setdefault(w, {})
                             reg_live_bytes[w][copy_key] = max(
                                 reg_live_bytes[w].get(copy_key, 0),
@@ -1836,6 +1870,18 @@ def _solve_smt_joint_optimize(
                         smem_live_bytes.get(buffer_key, 0),
                         int(oval.footprint_bytes),
                     )
+            if use_mem_check_conservative:
+                for w, by_buffer in rmem_live_iters_by_warp_buffer.items():
+                    for buffer_key, live_iters in by_buffer.items():
+                        rmem_live_iter_peak_by_warp.setdefault(w, {})
+                        rmem_live_iter_peak_by_warp[w][buffer_key] = max(
+                            int(
+                                rmem_live_iter_peak_by_warp[w].get(
+                                    buffer_key, 0
+                                )
+                            ),
+                            len(live_iters),
+                        )
 
             reg_total: Dict[int, int] = {
                 w: sum(bytes_by_buffer.values())
@@ -1844,7 +1890,11 @@ def _solve_smt_joint_optimize(
             for w, total in reg_total.items():
                 if total > reg_peak.get(w, 0):
                     reg_peak[w] = total
-                if check_reg_limit > 0 and total > check_reg_limit:  # reg_peak[w] 表示 perwarp的 寄存器用量(bytes)
+                if (
+                    first_reg_limit_error is None
+                    and check_reg_limit > 0
+                    and total > check_reg_limit
+                ):  # reg_peak[w] 表示 perwarp的 寄存器用量(bytes)
                     live_detail = sorted(
                         (
                             {
@@ -1858,7 +1908,7 @@ def _solve_smt_joint_optimize(
                         key=lambda item: int(item["bytes"]),
                         reverse=True,
                     )
-                    return False, {
+                    first_reg_limit_error = {
                         "reason": "reg_limit",
                         "warp": w,
                         "tau": tau,
@@ -1884,10 +1934,87 @@ def _solve_smt_joint_optimize(
                     "spill_smem_bytes": sum(spill_smem_live_bytes.values()),
                 }
 
-        return True, {"reg_peak": reg_peak, "smem_peak": smem_peak}
+        result = {"reg_peak": reg_peak, "smem_peak": smem_peak}
+        if use_mem_check_conservative:
+            conservative_reg_peak: Dict[int, int] = {}
+            conservative_live_detail_by_warp: Dict[int, List[Dict[str, int]]] = {}
+            for w in range(num_warps):
+                detail = sorted(
+                    (
+                        {
+                            "buffer": buffer_key,
+                            "bytes": int(entry.get("footprint", 0)) *
+                            max(
+                                int(
+                                    rmem_live_iter_peak_by_warp.get(w, {}).get(
+                                        buffer_key, 0
+                                    )
+                                ),
+                                0,
+                            ),
+                            "footprint": int(entry.get("footprint", 0)),
+                            "version_count": max(
+                                int(
+                                    rmem_live_iter_peak_by_warp.get(w, {}).get(
+                                        buffer_key, 0
+                                    )
+                                ),
+                                0,
+                            ),
+                        }
+                        for buffer_key, entry in conservative_rmem_buffers.items()
+                        if (
+                            int(entry.get("footprint", 0)) > 0
+                            and int(
+                                rmem_live_iter_peak_by_warp.get(w, {}).get(
+                                    buffer_key, 0
+                                )
+                            ) > 0
+                        )
+                    ),
+                    key=lambda item: int(item["bytes"]),
+                    reverse=True,
+                )
+                conservative_live_detail_by_warp[w] = detail
+                conservative_reg_peak[w] = sum(int(item["bytes"]) for item in detail)
+            if first_reg_limit_error is not None:
+                first_reg_limit_error["reg_peak"] = reg_peak
+                first_reg_limit_error["smem_peak"] = smem_peak
+                first_reg_limit_error["conservative_reg_peak"] = conservative_reg_peak
+                first_reg_limit_error["conservative_reg_total"] = max(
+                    conservative_reg_peak.values(), default=0
+                )
+                first_reg_limit_error["rmem_version_detail"] = conservative_live_detail_by_warp
+                return False, first_reg_limit_error
+            if check_reg_limit > 0:
+                for w in range(num_warps):
+                    usage = int(conservative_reg_peak.get(w, 0))
+                    if usage > check_reg_limit:
+                        return False, {
+                            "reason": "reg_limit_conservative",
+                            "warp": w,
+                            "tau": -1,
+                            "usage": usage,
+                            "limit": check_reg_limit,
+                            "live_detail": conservative_live_detail_by_warp.get(w, [])[:12],
+                            "reg_peak": reg_peak,
+                            "smem_peak": smem_peak,
+                            "conservative_reg_peak": conservative_reg_peak,
+                            "rmem_version_detail": conservative_live_detail_by_warp,
+                        }
+            result["conservative_reg_peak"] = conservative_reg_peak
+            result["conservative_reg_total"] = max(
+                conservative_reg_peak.values(), default=0
+            )
+            result["rmem_version_detail"] = conservative_live_detail_by_warp
+        elif first_reg_limit_error is not None:
+            first_reg_limit_error["reg_peak"] = reg_peak
+            first_reg_limit_error["smem_peak"] = smem_peak
+            return False, first_reg_limit_error
+        return True, result
 
     candidate_windows = []  # L 候选者
-    for candidate in (window, window + base_I, window + 2 * base_I, window + 3 * base_I):
+    for candidate in [window, window + 4 * base_I] :
         if candidate not in candidate_windows:
             candidate_windows.append(candidate)
 
@@ -1922,6 +2049,7 @@ def _solve_smt_joint_optimize(
                 check_L=opt_L,
                 check_reg_limit=reg_limit,
                 check_smem_limit=used_smem_limit,
+                use_mem_check_conservative=bool(mod_sched_plan.get("rmem_conservative", True)),
             )
             if live_ok:
                 print(f"--- SMT liveness check success: {live_info}", flush=True)
@@ -2115,6 +2243,7 @@ def _solve_smt_joint_optimize(
             check_L=sol_L,
             check_reg_limit=reg_limit,
             check_smem_limit=used_smem_limit,
+            use_mem_check_conservative=bool(mod_sched_plan.get("rmem_conservative", True)),
         )
         if live_ok:
             print(f"--- SMT liveness check success: {live_info}", flush=True)
@@ -4045,6 +4174,7 @@ def _transform_pipeline_loop(
                 print('----start  _solve_smt_joint_optimize', flush=True)
                 plan['heddle_expect_consumer_warps'] = consumer_num_warps  # 传入用户期望的 consumer_warps 数目
                 plan['heddle_original_num_stages'] = num_stages
+                plan['rmem_conservative'] = True  # 采用rmem保守估计, 直接将多版本的rmem 乘以 version数目(因为编程时,一般直接分配 version 数目的 buffer,实现pipeline, 很少做全部rmem merge + 动态复用逻辑. 基于liveliness 的分析对codegen而言过于激进,且实现起来很难)
                 optimized =  _solve_smt_joint_optimize( deps_all,infos_list,all_indices,plan, kernel_num_threads=func_num_threads,)
                 if optimized is None :
                     last_unfeasible_ii = plan['I']

@@ -440,6 +440,51 @@ class TestSMTModuloRegMultiplicity:
         assert result is not None
         assert result["reg_peak"][0] == 60
 
+    def test_rmem_conservative_uses_peak_live_versions(self):
+        specs = [
+            ("A", "ALU", 1, [], [("A_buf", "RMEM", 60, 0, "frag", "DEAD_ON_ENTRY")]),
+            ("C", "ALU", 1, [("A", 0)], []),
+            ("P", "ALU", 5, [], []),
+            ("B", "ALU", 1, [("A", 1), ("C", 0), ("P", 0)], []),
+        ]
+
+        sched = _make_smt_nodes(
+            specs, num_warps=1, reg_limit=60, timeout_ms=5000)
+        sched.rmem_conservative = True
+        result = sched._solve_phase_b(ii=4, L=8, optimize=True)
+        assert result is None
+
+    def test_rmem_conservative_does_not_fill_gaps_between_redefinitions(self):
+        specs = [
+            ("A", "ALU", 1, [], [("frag0", "RMEM", 60, 0, "frag", "DEAD_ON_ENTRY")]),
+            ("B", "ALU", 1, [("A", 0)], [], {"input_buffer_names": ["frag"]}),
+            ("P", "ALU", 6, [], []),
+            ("C", "ALU", 1, [("B", 0), ("P", 0)], [("frag1", "RMEM", 60, 0, "frag", "DEAD_ON_ENTRY")], {"input_buffer_names": ["frag"]}),
+            ("D", "ALU", 1, [("C", 0)], [], {"input_buffer_names": ["frag"]}),
+        ]
+
+        sched = _make_smt_nodes(
+            specs, num_warps=1, reg_limit=100, timeout_ms=5000)
+        sched.rmem_conservative = True
+        result = sched._solve_phase_b(ii=16, L=16, optimize=True)
+        assert result is not None
+
+    def test_rmem_conservative_is_checked_per_warp(self):
+        specs = [
+            ("P", "TMA", 1, [], [("p_buf", "RMEM", 800, 0, "p_buf", "DEAD_ON_EXIT")], {
+                "is_varialble_latency": True,
+                "replicable": True,
+            }),
+            ("C", "ALU", 1, [], [("c_buf", "RMEM", 800, 0, "c_buf", "DEAD_ON_EXIT")]),
+        ]
+
+        sched = _make_smt_nodes(
+            specs, num_warps=8, reg_limit=960, timeout_ms=5000)
+        sched.rmem_conservative = True
+        result = sched._solve_phase_b(ii=4, L=4, optimize=True)
+        assert result is not None
+        assert max(result["reg_peak"].values()) <= 800
+
     def test_smem_allocation_is_not_multiplied_by_iteration_copies(self):
         specs = [
             ("S", "ALU", 1, [("S", 3)], [("buf", "SMEM", 32768, 0)]),
@@ -605,6 +650,19 @@ class TestSMTBlockingSync:
             x_end = sched["X"] + 3
             overlap = x_start < barrier_end and x_end > barrier_start
             assert not overlap
+
+    def test_spill_constraints_ignore_unread_parent_buffers(self):
+        smt = _make_smt_nodes([
+            ("P", "TMA", 2, [], [("oP", "RMEM", 64, 32)], {
+                "warp_count": 4,
+                "warp_align": 4,
+                "is_varialble_latency": True,
+            }),
+            ("C", "ALU", 2, [("P", 0)], []),
+        ], num_warps=8)
+        smt.disallow_spills = True
+        result = smt._solve_phase_b(ii=8, L=16)
+        assert result is not None
 
 
 @pytest.mark.skipif(not _has_z3(), reason="z3-solver not installed")

@@ -81,6 +81,7 @@ class OpNode:
     edge_info: Dict[str, EdgeInfo] = field(default_factory=dict)
 
     outputs: List[OutputValue] = field(default_factory=list)
+    input_buffer_names: List[str] = field(default_factory=list)
 
     warp_count: int = 1
     warp_align: int = 1
@@ -178,7 +179,8 @@ class HeddleScheduler:
         same_warpgroup_pairs: Optional[List[Tuple[str, str]]] = None,
         not_all_same_warpgroup_sets: Optional[List[Tuple[str, ...]]] = None,
         same_subcore_exclusion_pairs: Optional[List[Tuple[str, str]]] = None,
-        cross_wg_rmem_penalty: int = 0,
+        cross_wg_rmem_penalty: int = 4,
+        rmem_conservative: bool = False,
     ):
         self.nodes = nodes
         self.fu_caps = fu_caps or {
@@ -213,6 +215,7 @@ class HeddleScheduler:
         self.not_all_same_warpgroup_sets = list(not_all_same_warpgroup_sets or [])
         self.same_subcore_exclusion_pairs = list(same_subcore_exclusion_pairs or [])
         self.cross_wg_rmem_penalty = max(int(cross_wg_rmem_penalty), 0)
+        self.rmem_conservative = bool(rmem_conservative)
 
     # ------------------------------------------------------------------ #
     # Phase A  (unchanged API)
@@ -583,6 +586,22 @@ class HeddleScheduler:
                 [warp[(v, w)] for w in group_warps],
             )
 
+        def _matching_rmem_spill_outputs(parent: OpNode, child: OpNode):
+            child_reads = set(getattr(child, "input_buffer_names", []) or [])
+            if not child_reads:
+                return []
+            return [
+                out
+                for out in parent.outputs
+                if (
+                    out.storage == StorageKind.RMEM
+                    and out.footprint_bytes > 0
+                    and out.spill_cost > 0
+                    and out.buffer_name
+                    and out.buffer_name in child_reads
+                )
+            ]
+
         # ---- 依赖、跨 warp spill 代价和 blocking sync ---------------------
         for v_node in self.nodes:
             vi = idx[v_node.name]
@@ -593,12 +612,9 @@ class HeddleScheduler:
                 edge = v_node.edge_info.get(par.name)
                 # uv延迟
                 base_delay = int(edge.delay) if edge and edge.delay is not None else int(par.latency)
-                # spill 代价
-                spill_cost = max((o.spill_cost for o in par.outputs), default=0)
-                has_rmem_spill_output = any(
-                    o.storage == StorageKind.RMEM and o.footprint_bytes > 0 and o.spill_cost > 0
-                    for o in par.outputs
-                )
+                matching_spill_outputs = _matching_rmem_spill_outputs(par, v_node)
+                spill_cost = max((o.spill_cost for o in matching_spill_outputs), default=0)
+                has_rmem_spill_output = bool(matching_spill_outputs)
                 if has_rmem_spill_output and self.cross_wg_rmem_penalty > 0 and W > 1:
                     same_wg_terms = []
                     for wg in range((W + 3) // 4):
@@ -612,24 +628,29 @@ class HeddleScheduler:
                     cross_wg_rmem_penalty_terms.append(
                         int(self.cross_wg_rmem_penalty) * int(max(spill_cost, 1)) * same_wg.negated()
                     )
-                # 如果 op有spill代价 && 可用W不止一个
+                # 如果 op 有 spill 代价且可用 warpgroup 不止一个，则只有跨
+                # warpgroup 传递才需要额外 spill 延迟。同一 warpgroup 内的
+                # WGMMA/ALU 关系不能按“不同单 warp”误判成跨组 spill。
                 if spill_cost > 0 and W > 1:
-                    same_pairs = [
-                        _and_var(f"same_pair_u={ui}_v={vi}_w={w}", [warp[(ui, w)], warp[(vi, w)]])
-                        for w in range(W)
-                    ]
-                    same_w = _or_var(f"same_w_u={ui}_v={vi}", same_pairs)
+                    same_wg_terms = []
+                    for wg in range((W + 3) // 4):
+                        same_wg_terms.append(
+                            _and_var(
+                                f"same_pair_u={ui}_v={vi}_wg={wg}",
+                                [_node_in_warpgroup(ui, wg), _node_in_warpgroup(vi, wg)],
+                            )
+                        )
+                    same_wg = _or_var(f"same_wg_u={ui}_v={vi}", same_wg_terms)
                     if self.disallow_spills:
-                        # 禁用spill时， uv只能在同warp内
-                        model.add(same_w == 1)
+                        # 禁用 spill 时，uv 只能在同一个 warpgroup 内。
+                        model.add(same_wg == 1)
                         model.add(Tv[vi] - Tv[ui] >= base_delay - delta * ii)
                     else:
-                        # 若 uv在同warp，正常计算 Tv[vi] - Tv[ui] 启动间隔
-                        model.add(Tv[vi] - Tv[ui] >= base_delay - delta * ii).only_enforce_if(same_w)
-                        # 否则 启动间隔需要考虑 spill代价
+                        # 若 uv 在同 warpgroup，正常计算启动间隔；跨 WG 才加 spill。
+                        model.add(Tv[vi] - Tv[ui] >= base_delay - delta * ii).only_enforce_if(same_wg)
                         model.add(
                             Tv[vi] - Tv[ui] >= base_delay + spill_cost - delta * ii
-                        ).only_enforce_if(same_w.negated())
+                        ).only_enforce_if(same_wg.negated())
                 else:
                     model.add(Tv[vi] - Tv[ui] >= base_delay - delta * ii)
 
@@ -682,12 +703,13 @@ class HeddleScheduler:
                 vi = idx[v_node.name]
                 for par in v_node.parents:
                     ui = idx[par.name]
-                    sc = max((o.spill_cost for o in par.outputs), default=0)
+                    matching_spill_outputs = _matching_rmem_spill_outputs(par, v_node)
+                    sc = max((o.spill_cost for o in matching_spill_outputs), default=0)
                     if sc <= 0:
                         continue
                     for w_src in range(W):
                         for w_dst in range(W):
-                            if w_src == w_dst:
+                            if w_src // 4 == w_dst // 4:
                                 continue
                             spill_present = _and_var(
                                 f"spill_present_u={ui}_v={vi}_ws={w_src}_wd={w_dst}",
@@ -931,10 +953,13 @@ class HeddleScheduler:
 
         for v_node in self.nodes:
             vi = idx[v_node.name]
+            v_reads = set(getattr(v_node, "input_buffer_names", []) or [])
             for par in v_node.parents:  # 遍历每个parentOp (自己读写同一buffer这种自依赖 已经在 
                 # solve_joint 的准备阶段加入了)
                 delta = int(v_node.dependency_distance.get(par.name, 0))
                 for oval in par.outputs:
+                    if v_reads and oval.buffer_name and oval.buffer_name not in v_reads:
+                        continue
                     xi = output_name_to_xi.get(oval.name)
                     if xi is not None:
                         consumers_of[xi].append((vi, delta))  # {vi : (ui,delta)}
@@ -945,7 +970,7 @@ class HeddleScheduler:
         # sparse RMEM 容量约束，避免同时引入逐 tau 的 SMEM live 网格。
         track_rmem_liveness = bool(self.enable_rmem_liveness and all_outputs and self.reg_limit > 0)
         track_smem_liveness = bool(self.enable_smem_liveness and all_outputs)
-        max_iter_overlap = (L - 1) // max(int(ii), 1)
+        max_iter_overlap = (max(int(L), 1) - 1) // max(int(ii), 1)
         max_dependency_distance = max(
             (
                 int(distance)
@@ -969,112 +994,122 @@ class HeddleScheduler:
             for footprint in self.smem_allocations.values()
             if int(footprint) > 0
         ]
-        if static_smem_terms:
-            model.add(sum(static_smem_terms) <= self.smem_limit)
 
-        # ---- SMEM 容量约束（全局统计，基于区间简化） -------------------------------
-        # 针对 SMEM，我们将传统的逐 tau 枚举替换为轻量的绝对时间跨度区间检查，缩减变量规模
-        if track_smem_liveness:
-            for tau in range(L):
-                smem_live_by_buffer: dict[str, list] = defaultdict(list)
-                smem_footprint_by_buffer: dict[str, int] = {}
-                spill_smem_terms = []
-                for xi, (pv, oval) in enumerate(all_outputs):
-                    if oval.storage != StorageKind.SMEM or oval.footprint_bytes <= 0:
-                        continue
-                    buffer_key = oval.smem_buffer_key()
-                    if buffer_key in self.smem_allocations:
-                        continue
+        # ---- SMEM 容量约束（全局静态下界） --------------------------------------
+        # The caller already expands smem_allocations for the estimated physical
+        # pipeline versions.  Do not multiply by ceil(L / II) again here: L is the
+        # solve horizon, not an extra ring-buffer replication factor.
+        single_stage_smem = sum(static_smem_terms)
+        if single_stage_smem > 0:
+            if single_stage_smem > self.smem_limit:
+                print(
+                    f"----- HeddleScheduler early return: reason=smem_static_gt_limit "
+                    f"static_smem={single_stage_smem} smem_limit={self.smem_limit}",
+                    flush=True,
+                )
+                return None
+
+        # if track_smem_liveness:
+        #     for tau in range(L):
+        #         smem_live_by_buffer: dict[str, list] = defaultdict(list)
+        #         smem_footprint_by_buffer: dict[str, int] = {}
+        #         spill_smem_terms = []
+        #         for xi, (pv, oval) in enumerate(all_outputs):
+        #             if oval.storage != StorageKind.SMEM or oval.footprint_bytes <= 0:
+        #                 continue
+        #             buffer_key = oval.smem_buffer_key()
+        #             if buffer_key in self.smem_allocations:
+        #                 continue
                     
-                    producer_lat = int(self.nodes[pv].latency)
-                    consumers = consumers_of[xi] if self.include_incoming_live else [(cv, d) for cv, d in consumers_of[xi] if d == 0]
+        #             producer_lat = int(self.nodes[pv].latency)
+        #             consumers = consumers_of[xi] if self.include_incoming_live else [(cv, d) for cv, d in consumers_of[xi] if d == 0]
                     
-                    any_copy_live_terms = []
-                    for iter_offset in iter_offsets:
-                        p_start = Tv[pv] + iter_offset * ii
-                        is_produced = model.new_bool_var(f"smem_p_x={xi}_k={iter_offset}_t={tau}")
-                        model.add(p_start <= tau).only_enforce_if(is_produced)
-                        model.add(p_start > tau).only_enforce_if(is_produced.negated())
+        #             any_copy_live_terms = []
+        #             for iter_offset in iter_offsets:
+        #                 p_start = Tv[pv] + iter_offset * ii
+        #                 is_produced = model.new_bool_var(f"smem_p_x={xi}_k={iter_offset}_t={tau}")
+        #                 model.add(p_start <= tau).only_enforce_if(is_produced)
+        #                 model.add(p_start > tau).only_enforce_if(is_produced.negated())
                         
-                        if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY and consumers:
-                            all_c_done = model.new_bool_var(f"smem_c_x={xi}_k={iter_offset}_t={tau}")
-                            c_terms = []
-                            for cv, d in consumers:
-                                c_bound = tau - d * ii - (1 if producer_lat == 0 else 0)
-                                c_started = model.new_bool_var(f"smem_cv={cv}_t={tau}")
-                                model.add(Tv[cv] + iter_offset * ii <= c_bound).only_enforce_if(c_started)
-                                model.add(Tv[cv] + iter_offset * ii > c_bound).only_enforce_if(c_started.negated())
-                                c_terms.append(c_started)
-                            model.add_bool_and(c_terms).only_enforce_if(all_c_done)
-                            model.add_bool_or([t.negated() for t in c_terms]).only_enforce_if(all_c_done.negated())
+        #                 if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY and consumers:
+        #                     all_c_done = model.new_bool_var(f"smem_c_x={xi}_k={iter_offset}_t={tau}")
+        #                     c_terms = []
+        #                     for cv, d in consumers:
+        #                         c_bound = tau - d * ii - (1 if producer_lat == 0 else 0)
+        #                         c_started = model.new_bool_var(f"smem_cv={cv}_t={tau}")
+        #                         model.add(Tv[cv] + iter_offset * ii <= c_bound).only_enforce_if(c_started)
+        #                         model.add(Tv[cv] + iter_offset * ii > c_bound).only_enforce_if(c_started.negated())
+        #                         c_terms.append(c_started)
+        #                     model.add_bool_and(c_terms).only_enforce_if(all_c_done)
+        #                     model.add_bool_or([t.negated() for t in c_terms]).only_enforce_if(all_c_done.negated())
                             
-                            live_var = model.new_bool_var(f"smem_l_x={xi}_k={iter_offset}_t={tau}")
-                            model.add_bool_and([is_produced, all_c_done.negated()]).only_enforce_if(live_var)
-                            model.add_bool_or([is_produced.negated(), all_c_done]).only_enforce_if(live_var.negated())
-                            any_copy_live_terms.append(live_var)
-                        else:
-                            any_copy_live_terms.append(is_produced)
+        #                     live_var = model.new_bool_var(f"smem_l_x={xi}_k={iter_offset}_t={tau}")
+        #                     model.add_bool_and([is_produced, all_c_done.negated()]).only_enforce_if(live_var)
+        #                     model.add_bool_or([is_produced.negated(), all_c_done]).only_enforce_if(live_var.negated())
+        #                     any_copy_live_terms.append(live_var)
+        #                 else:
+        #                     any_copy_live_terms.append(is_produced)
                             
-                    any_copy_live = _or_var(f"smem_live_x={xi}_t={tau}", any_copy_live_terms)
-                    smem_live_by_buffer[buffer_key].append(any_copy_live)
-                    smem_footprint_by_buffer[buffer_key] = max(smem_footprint_by_buffer.get(buffer_key, 0), int(oval.footprint_bytes))
+        #             any_copy_live = _or_var(f"smem_live_x={xi}_t={tau}", any_copy_live_terms)
+        #             smem_live_by_buffer[buffer_key].append(any_copy_live)
+        #             smem_footprint_by_buffer[buffer_key] = max(smem_footprint_by_buffer.get(buffer_key, 0), int(oval.footprint_bytes))
                     
-                smem_terms = []
-                for buffer_key, live_terms in smem_live_by_buffer.items():
-                    buffer_live = _or_var(f"smem_live_buf={buffer_key}_t={tau}", live_terms)
-                    smem_terms.append(smem_footprint_by_buffer[buffer_key] * buffer_live)
-                if W > 1:
-                    for xi, (pv, oval) in enumerate(all_outputs):
-                        if (
-                            oval.storage != StorageKind.RMEM
-                            or oval.footprint_bytes <= 0
-                            or oval.spill_cost <= 0
-                        ):
-                            continue
-                        sc = int(oval.spill_cost)
-                        consumers = (
-                            consumers_of[xi]
-                            if self.include_incoming_live else
-                            [(cv, d) for cv, d in consumers_of[xi] if d == 0]
-                        )
-                        for cv, d in consumers:
-                            for iter_offset in iter_offsets:
-                                consume_time = Tv[cv] + (iter_offset + int(d)) * ii
-                                spill_started = model.new_bool_var(
-                                    f"spill_smem_started_x={xi}_c={cv}_k={iter_offset}_t={tau}"
-                                )
-                                spill_not_ended = model.new_bool_var(
-                                    f"spill_smem_not_ended_x={xi}_c={cv}_k={iter_offset}_t={tau}"
-                                )
-                                model.add(consume_time - sc <= tau).only_enforce_if(spill_started)
-                                model.add(consume_time - sc > tau).only_enforce_if(spill_started.negated())
-                                model.add(consume_time > tau).only_enforce_if(spill_not_ended)
-                                model.add(consume_time <= tau).only_enforce_if(spill_not_ended.negated())
-                                spill_active = _and_var(
-                                    f"spill_smem_active_x={xi}_c={cv}_k={iter_offset}_t={tau}",
-                                    [spill_started, spill_not_ended],
-                                )
-                                same_warp_terms = [
-                                    _and_var(
-                                        f"spill_smem_same_x={xi}_c={cv}_k={iter_offset}_w={w}_t={tau}",
-                                        [warp[(pv, w)], warp[(cv, w)]],
-                                    )
-                                    for w in range(W)
-                                ]
-                                has_same_warp = _or_var(
-                                    f"spill_smem_has_same_x={xi}_c={cv}_k={iter_offset}_t={tau}",
-                                    same_warp_terms,
-                                )
-                                spill_present = _and_var(
-                                    f"spill_smem_x={xi}_c={cv}_k={iter_offset}_t={tau}",
-                                    [spill_active, has_same_warp.negated()],
-                                )
-                                spill_smem_terms.append(
-                                    int(oval.footprint_bytes) * spill_present
-                                )
-                all_smem_terms = static_smem_terms + smem_terms + spill_smem_terms
-                if all_smem_terms:
-                    model.add(sum(all_smem_terms) <= self.smem_limit)
+        #         smem_terms = []
+        #         for buffer_key, live_terms in smem_live_by_buffer.items():
+        #             buffer_live = _or_var(f"smem_live_buf={buffer_key}_t={tau}", live_terms)
+        #             smem_terms.append(smem_footprint_by_buffer[buffer_key] * buffer_live)
+        #         if W > 1:
+        #             for xi, (pv, oval) in enumerate(all_outputs):
+        #                 if (
+        #                     oval.storage != StorageKind.RMEM
+        #                     or oval.footprint_bytes <= 0
+        #                     or oval.spill_cost <= 0
+        #                 ):
+        #                     continue
+        #                 sc = int(oval.spill_cost)
+        #                 consumers = (
+        #                     consumers_of[xi]
+        #                     if self.include_incoming_live else
+        #                     [(cv, d) for cv, d in consumers_of[xi] if d == 0]
+        #                 )
+        #                 for cv, d in consumers:
+        #                     for iter_offset in iter_offsets:
+        #                         consume_time = Tv[cv] + (iter_offset + int(d)) * ii
+        #                         spill_started = model.new_bool_var(
+        #                             f"spill_smem_started_x={xi}_c={cv}_k={iter_offset}_t={tau}"
+        #                         )
+        #                         spill_not_ended = model.new_bool_var(
+        #                             f"spill_smem_not_ended_x={xi}_c={cv}_k={iter_offset}_t={tau}"
+        #                         )
+        #                         model.add(consume_time - sc <= tau).only_enforce_if(spill_started)
+        #                         model.add(consume_time - sc > tau).only_enforce_if(spill_started.negated())
+        #                         model.add(consume_time > tau).only_enforce_if(spill_not_ended)
+        #                         model.add(consume_time <= tau).only_enforce_if(spill_not_ended.negated())
+        #                         spill_active = _and_var(
+        #                             f"spill_smem_active_x={xi}_c={cv}_k={iter_offset}_t={tau}",
+        #                             [spill_started, spill_not_ended],
+        #                         )
+        #                         same_warp_terms = [
+        #                             _and_var(
+        #                                 f"spill_smem_same_x={xi}_c={cv}_k={iter_offset}_w={w}_t={tau}",
+        #                                 [warp[(pv, w)], warp[(cv, w)]],
+        #                             )
+        #                             for w in range(W)
+        #                         ]
+        #                         has_same_warp = _or_var(
+        #                             f"spill_smem_has_same_x={xi}_c={cv}_k={iter_offset}_t={tau}",
+        #                             same_warp_terms,
+        #                         )
+        #                         spill_present = _and_var(
+        #                             f"spill_smem_x={xi}_c={cv}_k={iter_offset}_t={tau}",
+        #                             [spill_active, has_same_warp.negated()],
+        #                         )
+        #                         spill_smem_terms.append(
+        #                             int(oval.footprint_bytes) * spill_present
+        #                         )
+        #         all_smem_terms = static_smem_terms + smem_terms + spill_smem_terms
+        #         if all_smem_terms:
+        #             model.add(sum(all_smem_terms) <= self.smem_limit)
 
         # ---- RMEM liveness 容量约束（稀疏 checkpoint） --------------------
         # 不再把每个 live range 建成 OptionalInterval + Cumulative。那种
@@ -1084,55 +1119,61 @@ class HeddleScheduler:
         # Python fixed liveness check 的“同一物理 RMEM buffer 只计一次”
         # 语义保持一致。
         rmem_liveness_checkpoints: list[int] = []
+        use_folded_rmem_liveness = bool(
+            self.fold_rmem_liveness_by_ii and not self.rmem_conservative
+        )
         rmem_folded_offsets = (
             range(-incoming_iter_overlap, 1)
             if self.include_incoming_live else
             range(0, 1)
         )
         if track_rmem_liveness:
-            if self.fold_rmem_liveness_by_ii:
-                checkpoint_set = set(range(0, ii, self.liveness_checkpoint_step))
-                checkpoint_set.update({0, max(ii - 1, 0)})
+            if self.rmem_conservative:
+                rmem_liveness_checkpoints = []
             else:
-                checkpoint_set = set(range(0, L, self.liveness_checkpoint_step))
-                checkpoint_set.add(max(L - 1, 0))
-            hint_times = {
-                v: int(self.start_hints.get(node.name))
-                for v, node in enumerate(self.nodes)
-                if self.start_hints.get(node.name) is not None
-            }
-            for xi, (producer_v, oval) in enumerate(all_outputs):
-                rmem_iter_offsets = (
-                    (rmem_folded_offsets if self.fold_rmem_liveness_by_ii else iter_offsets)
-                    if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY else
-                    range(0, 1)
-                )
-                for iter_offset in rmem_iter_offsets:
-                    producer_hint = hint_times.get(producer_v)
-                    if producer_hint is not None:
-                        t = (
-                            producer_hint % ii
-                            if self.fold_rmem_liveness_by_ii else
-                            producer_hint + iter_offset * ii
-                        )
-                        for dt in (-1, 0, 1):
-                            limit = ii if self.fold_rmem_liveness_by_ii else L
-                            if 0 <= t + dt < limit:
-                                checkpoint_set.add(t + dt)
-                    for cv, d in consumers_of.get(xi, []):
-                        consumer_hint = hint_times.get(cv)
-                        if consumer_hint is None:
-                            continue
-                        t = (
-                            consumer_hint % ii
-                            if self.fold_rmem_liveness_by_ii else
-                            consumer_hint + (iter_offset + int(d)) * ii
-                        )
-                        for dt in (-1, 0, 1):
-                            limit = ii if self.fold_rmem_liveness_by_ii else L
-                            if 0 <= t + dt < limit:
-                                checkpoint_set.add(t + dt)
-            rmem_liveness_checkpoints = sorted(checkpoint_set)
+                if use_folded_rmem_liveness:
+                    checkpoint_set = set(range(0, ii + 1, self.liveness_checkpoint_step))
+                    checkpoint_set.update({0, max(ii - 1, 0)})
+                else:
+                    checkpoint_set = set(range(0, L + 1, self.liveness_checkpoint_step))
+                    checkpoint_set.add(max(L - 1, 0))
+                hint_times = {
+                    v: int(self.start_hints.get(node.name))
+                    for v, node in enumerate(self.nodes)
+                    if self.start_hints.get(node.name) is not None
+                }
+                for xi, (producer_v, oval) in enumerate(all_outputs):
+                    rmem_iter_offsets = (
+                        (rmem_folded_offsets if use_folded_rmem_liveness else iter_offsets)
+                        if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY else
+                        range(0, 1)
+                    )
+                    for iter_offset in rmem_iter_offsets:
+                        producer_hint = hint_times.get(producer_v)
+                        if producer_hint is not None:
+                            t = (
+                                producer_hint % ii
+                                if use_folded_rmem_liveness else
+                                producer_hint + iter_offset * ii
+                            )
+                            for dt in (-1, 0, 1):
+                                limit = ii if use_folded_rmem_liveness else L
+                                if 0 <= t + dt < limit:
+                                    checkpoint_set.add(t + dt)
+                        for cv, d in consumers_of.get(xi, []):
+                            consumer_hint = hint_times.get(cv)
+                            if consumer_hint is None:
+                                continue
+                            t = (
+                                consumer_hint % ii
+                                if use_folded_rmem_liveness else
+                                consumer_hint + (iter_offset + int(d)) * ii
+                            )
+                            for dt in (-1, 0, 1):
+                                limit = ii if use_folded_rmem_liveness else L
+                                if 0 <= t + dt < limit:
+                                    checkpoint_set.add(t + dt)
+                rmem_liveness_checkpoints = sorted(checkpoint_set)
 
         def _time_le_checkpoint_var(name: str, time_expr, tau: int):
             b = model.new_bool_var(name)
@@ -1140,7 +1181,215 @@ class HeddleScheduler:
             model.add(time_expr > tau).only_enforce_if(b.negated())
             return b
 
-        if track_rmem_liveness:
+        rmem_live_var_cache: dict[tuple[int, int, int], object] = {}
+
+        def _rmem_copy_live_var(
+            xi: int,
+            producer_v: int,
+            oval: OutputValue,
+            iter_offset: int,
+            tau: int,
+        ):
+            key = (xi, int(iter_offset), int(tau))
+            if key in rmem_live_var_cache:
+                return rmem_live_var_cache[key]
+
+            p_start = (
+                phase[producer_v] + int(iter_offset) * ii
+                if use_folded_rmem_liveness else
+                Tv[producer_v] + int(iter_offset) * ii
+            )
+            is_produced = _time_le_checkpoint_var(
+                f"rmem_p_x={xi}_k={iter_offset}_t={tau}",
+                p_start,
+                tau,
+            )
+
+            if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY:
+                consumers = (
+                    consumers_of[xi]
+                    if self.include_incoming_live else
+                    [(cv, d) for cv, d in consumers_of[xi] if d == 0]
+                )
+                if not consumers:
+                    live_var = _false_var(
+                        f"rmem_l_false_x={xi}_k={iter_offset}_t={tau}"
+                    )
+                else:
+                    c_terms = []
+                    offset = 1 if int(self.nodes[producer_v].latency) == 0 else 0
+                    for cv, d in consumers:
+                        c_time = (
+                            phase[cv] + (int(iter_offset) + int(d)) * ii + offset
+                            if use_folded_rmem_liveness else
+                            Tv[cv] + (int(iter_offset) + int(d)) * ii + offset
+                        )
+                        c_started = _time_le_checkpoint_var(
+                            f"rmem_c_x={xi}_k={iter_offset}_cv={cv}_t={tau}",
+                            c_time,
+                            tau,
+                        )
+                        c_terms.append(c_started)
+
+                    all_c_done = _and_var(
+                        f"rmem_done_x={xi}_k={iter_offset}_t={tau}",
+                        c_terms,
+                    )
+                    live_var = model.new_bool_var(
+                        f"rmem_l_x={xi}_k={iter_offset}_t={tau}"
+                    )
+                    model.add_bool_and(
+                        [is_produced, all_c_done.negated()]
+                    ).only_enforce_if(live_var)
+                    model.add_bool_or(
+                        [is_produced.negated(), all_c_done]
+                    ).only_enforce_if(live_var.negated())
+            else:
+                live_var = is_produced
+
+            rmem_live_var_cache[key] = live_var
+            return live_var
+        
+        if track_rmem_liveness and self.rmem_conservative:
+            # 保守估计 RMEM 使用：按每个 output copy 建 live 区间，再按
+            # (warp, buffer) 做 overlap 统计。reg_limit 是 per-warp 上限，
+            # 不能把不同 warp 上的 buffer 版本数直接全局求和，否则会把
+            # 本来分散在不同 warp 的寄存器占用错误压到一起。
+            #
+            # 同时不要把同一 buffer 在同一 iter_offset 上的多个重定义压成
+            # 一条 min(start)..max(end) 大区间，否则会把中间已经 dead 的
+            # 空档错误算成 live，强于 fixed check。
+            rmem_buffers: dict[str, dict[str, object]] = {}
+            for xi, (producer_v, oval) in enumerate(all_outputs):
+                if oval.storage != StorageKind.RMEM or oval.footprint_bytes <= 0:
+                    continue
+                buffer_key = oval.rmem_buffer_key()
+                rmem_iter_offsets = tuple(
+                    iter_offsets
+                    if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY else
+                    range(0, 1)
+                )
+                entry = rmem_buffers.setdefault(buffer_key, {
+                    "footprint": 0,
+                    "outputs": [],
+                    "iter_offsets": set(),
+                })
+                entry["footprint"] = max(
+                    int(entry["footprint"]),
+                    int(oval.footprint_bytes),
+                )
+                entry["outputs"].append((xi, producer_v, oval, rmem_iter_offsets))
+                entry["iter_offsets"].update(int(offset) for offset in rmem_iter_offsets)
+
+            if rmem_buffers:
+                for buffer_key in sorted(rmem_buffers):
+                    entry = rmem_buffers[buffer_key]
+                    if int(entry["footprint"]) > self.reg_limit:
+                        print(
+                            f"----- HeddleScheduler early return: "
+                            f"reason=rmem_conservative_buffer_gt_limit "
+                            f"buffer={buffer_key} footprint={int(entry['footprint'])} "
+                            f"reg_limit={self.reg_limit}",
+                            flush=True,
+                        )
+                        return None
+
+            copy_time_vars: dict[tuple[int, int], tuple[int, object, object, object]] = {}
+            for buffer_key in sorted(rmem_buffers):
+                entry = rmem_buffers[buffer_key]
+                for xi, producer_v, oval, allowed_offsets in entry["outputs"]:
+                    for iter_offset in sorted(int(offset) for offset in allowed_offsets):
+                        key = (xi, int(iter_offset))
+                        if key in copy_time_vars:
+                            continue
+
+                        release_times = []
+                        if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY:
+                            consumers = (
+                                consumers_of[xi]
+                                if self.include_incoming_live else
+                                [(cv, d) for cv, d in consumers_of[xi] if d == 0]
+                            )
+                            if not consumers:
+                                continue
+                            offset = 1 if int(self.nodes[producer_v].latency) == 0 else 0
+                            for cv, d in consumers:
+                                release_times.append(
+                                    Tv[cv] + (int(iter_offset) + int(d)) * ii + offset
+                                )
+                        else:
+                            release_times.append(L)
+                        if not release_times:
+                            continue
+
+                        copy_start = model.new_int_var(
+                            -incoming_iter_overlap * ii,
+                            max(L - 1, 0) + max_iter_overlap * ii,
+                            f"rmem_cons_start_x={xi}_k={iter_offset}",
+                        )
+                        model.add(copy_start == Tv[producer_v] + int(iter_offset) * ii)
+
+                        copy_end = model.new_int_var(
+                            0,
+                            max(L, 1) + max_iter_overlap * ii + max_dependency_distance * ii,
+                            f"rmem_cons_end_x={xi}_k={iter_offset}",
+                        )
+                        if len(release_times) == 1:
+                            model.add(copy_end == release_times[0])
+                        else:
+                            model.add_max_equality(copy_end, release_times)
+
+                        copy_size = model.new_int_var(
+                            0,
+                            max(
+                                int(L)
+                                + (incoming_iter_overlap + max_iter_overlap + max_dependency_distance + 1) * ii,
+                                1,
+                            ),
+                            f"rmem_cons_size_x={xi}_k={iter_offset}",
+                        )
+                        model.add(copy_size == copy_end - copy_start)
+                        copy_time_vars[key] = (producer_v, copy_start, copy_size, copy_end)
+
+            for w in range(W):
+                conservative_terms = []
+                for buffer_key in sorted(rmem_buffers):
+                    entry = rmem_buffers[buffer_key]
+                    copy_intervals = []
+                    for xi, _producer_v, _oval, allowed_offsets in entry["outputs"]:
+                        for iter_offset in sorted(int(offset) for offset in allowed_offsets):
+                            key = (xi, int(iter_offset))
+                            if key not in copy_time_vars:
+                                continue
+                            producer_v, copy_start, copy_size, copy_end = copy_time_vars[key]
+                            copy_intervals.append(
+                                model.new_optional_interval_var(
+                                    copy_start,
+                                    copy_size,
+                                    copy_end,
+                                    warp[(producer_v, w)],
+                                    f"rmem_cons_iv_b={buffer_key}_x={xi}_k={iter_offset}_w={w}",
+                                )
+                            )
+
+                    peak_versions = model.new_int_var(
+                        0,
+                        max(len(copy_intervals), 0),
+                        f"rmem_cons_peak_versions_b={buffer_key}_w={w}",
+                    )
+                    if copy_intervals:
+                        model.add_cumulative(
+                            copy_intervals,
+                            [1] * len(copy_intervals),
+                            peak_versions,
+                        )
+                    else:
+                        model.add(peak_versions == 0)
+                    conservative_terms.append(int(entry["footprint"]) * peak_versions)
+
+                if conservative_terms:
+                    model.add(sum(conservative_terms) <= self.reg_limit)
+        elif track_rmem_liveness:
             for tau in rmem_liveness_checkpoints:
                 live_terms_by_warp_buffer: dict[tuple[int, str, int], list] = defaultdict(list)
                 footprint_by_warp_buffer: dict[tuple[int, str, int], int] = {}
@@ -1150,63 +1399,19 @@ class HeddleScheduler:
 
                     buffer_key = oval.rmem_buffer_key()
                     rmem_iter_offsets = (
-                        (rmem_folded_offsets if self.fold_rmem_liveness_by_ii else iter_offsets)
+                        (rmem_folded_offsets if use_folded_rmem_liveness else iter_offsets)
                         if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY else
                         range(0, 1)
                     )
-                    producer_lat = int(self.nodes[producer_v].latency)
-                    consumers = consumers_of[xi] if self.include_incoming_live else [(cv, d) for cv, d in consumers_of[xi] if d == 0]
 
                     for iter_offset in rmem_iter_offsets:
-                        p_start = (
-                            phase[producer_v] + iter_offset * ii
-                            if self.fold_rmem_liveness_by_ii else
-                            Tv[producer_v] + iter_offset * ii
-                        )
-                        is_produced = _time_le_checkpoint_var(
-                            f"rmem_p_x={xi}_k={iter_offset}_t={tau}",
-                            p_start,
+                        live_var = _rmem_copy_live_var(
+                            xi,
+                            producer_v,
+                            oval,
+                            iter_offset,
                             tau,
                         )
-
-                        if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY:
-                            if not consumers:
-                                live_var = _false_var(
-                                    f"rmem_l_false_x={xi}_k={iter_offset}_t={tau}"
-                                )
-                            else:
-                                c_terms = []
-                                offset = 1 if producer_lat == 0 else 0
-                                # 所有消费者都已经启动/消费后，这份 copy 才能释放。
-                                # c_started: phase/Tv[cv] + (iter_offset+d)*ii + offset <= tau
-                                for cv, d in consumers:
-                                    c_time = (
-                                        phase[cv] + (iter_offset + int(d)) * ii + offset
-                                        if self.fold_rmem_liveness_by_ii else
-                                        Tv[cv] + (iter_offset + int(d)) * ii + offset
-                                    )
-                                    c_started = _time_le_checkpoint_var(
-                                        f"rmem_c_x={xi}_k={iter_offset}_cv={cv}_t={tau}",
-                                        c_time,
-                                        tau,
-                                    )
-                                    c_terms.append(c_started)
-
-                                all_c_done = _and_var(
-                                    f"rmem_done_x={xi}_k={iter_offset}_t={tau}",
-                                    c_terms,
-                                )
-                                live_var = model.new_bool_var(
-                                    f"rmem_l_x={xi}_k={iter_offset}_t={tau}"
-                                )
-                                model.add_bool_and(
-                                    [is_produced, all_c_done.negated()]
-                                ).only_enforce_if(live_var)
-                                model.add_bool_or(
-                                    [is_produced.negated(), all_c_done]
-                                ).only_enforce_if(live_var.negated())
-                        else:
-                            live_var = is_produced
 
                         for w in range(W):
                             live_on_warp = _and_var(
@@ -1247,7 +1452,7 @@ class HeddleScheduler:
             # RMEM communication because codegen does not yet materialize a
             # real cross-WG register spill/copy path.
             model.minimize(
-                L * N * mx + sum(Tv)
+                L * N * mx + sum(Tv) + sum(cross_wg_rmem_penalty_terms)
             )
 
         # ---- 求解 ---------------------------------------------------------
@@ -1395,7 +1600,7 @@ class HeddleScheduler:
                             continue
                         buffer_key = oval.rmem_buffer_key()
                         rmem_iter_offsets = (
-                            (rmem_folded_offsets if self.fold_rmem_liveness_by_ii else iter_offsets)
+                            (rmem_folded_offsets if use_folded_rmem_liveness else iter_offsets)
                             if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY else
                             range(0, 1)
                         )
@@ -1404,7 +1609,7 @@ class HeddleScheduler:
                         for iter_offset in rmem_iter_offsets:
                             base_produced_at = (
                                 solver.value(phase[pv])
-                                if self.fold_rmem_liveness_by_ii else
+                                if use_folded_rmem_liveness else
                                 solver.value(Tv[pv])
                             )
                             produced_at = base_produced_at + iter_offset * ii
@@ -1417,7 +1622,7 @@ class HeddleScheduler:
                                 for cv, d in consumers:
                                     base_consume_time = (
                                         solver.value(phase[cv])
-                                        if self.fold_rmem_liveness_by_ii else
+                                        if use_folded_rmem_liveness else
                                         solver.value(Tv[cv])
                                     )
                                     consume_time = (
