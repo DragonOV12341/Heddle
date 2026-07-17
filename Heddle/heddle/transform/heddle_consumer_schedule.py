@@ -4229,7 +4229,7 @@ def _transform_pipeline_loop(
                     else:
                         ii_lb = (ii_ub + ii_lb) // 2
                 
-                for ii in range(ii_lb+1, ii_ub+1, 1):
+                for ii in range(ii_lb, ii_ub+1, 1):
                     ret = _try_ii(ii)
                     if ret is not None :
                         candidate_phase_b_result = _joint_result_to_phase_b_result(ret)
