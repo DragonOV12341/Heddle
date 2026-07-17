@@ -1601,7 +1601,7 @@ def _solve_smt_joint_optimize(
             # spill interval. On real FA graphs this can overconstrain Phase B
             # into immediate UNSAT. Keep it opt-in; we still discourage
             # cross-WG RMEM via the soft penalty objective in scheduler/smt.py.
-            use_spill_concurrency=bool(mod_sched_plan.get("use_spill_concurrency", False)),
+            use_spill_concurrency=bool(mod_sched_plan.get("use_spill_concurrency", True)),
             liveness_checkpoint_step=int(mod_sched_plan.get("liveness_checkpoint_step", 8)),
             start_hints={
                 name: int(t)
@@ -4216,7 +4216,7 @@ def _transform_pipeline_loop(
                 
                 while True:
                     print(f"--- finding minimal II : [{ii_lb}, {ii_ub}]")
-                    if ii_ub - ii_lb <= 5:
+                    if ii_ub - ii_lb <= 2:
                         break
                     mid_ans = _try_ii((ii_ub + ii_lb) // 2)
                     if mid_ans is not None :
@@ -4479,6 +4479,7 @@ def _transform_pipeline_loop(
                         )
 
                 if phase_b_warps:
+                    #TODO: 检查下 phase_b_warps 中的WG = warp // 4 是否 >0 . 若不满足，将其+4
                     warp_str = ",".join(
                         f"{k}:{v}"
                         for k, v in sorted(phase_b_warps.items())

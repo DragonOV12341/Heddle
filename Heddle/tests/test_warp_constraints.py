@@ -630,8 +630,8 @@ class TestSMTBlockingSync:
         wa = result["warp_assign"]
         assert wa["P"] == wa["C"]
 
-    def test_barrier_exclusion(self):
-        """Third op on same warp must not overlap the blocking window."""
+    def test_barrier_blocks_issue(self):
+        """Third op on same warp must not issue inside the blocking window."""
         smt = _make_smt_nodes([
             ("P", "TMA", 5, [], [("oP", "RMEM", 128, 0)]),
             ("C", "ALU", 2, [("P", 0, True)]),
@@ -646,10 +646,34 @@ class TestSMTBlockingSync:
         if wa["X"] == wa["P"]:
             barrier_start = sched["C"] - 5
             barrier_end = sched["C"]
-            x_start = sched["X"]
-            x_end = sched["X"] + 3
-            overlap = x_start < barrier_end and x_end > barrier_start
+            x_issue_start = sched["X"]
+            x_issue_end = x_issue_start + 3
+            overlap = x_issue_start < barrier_end and x_issue_end > barrier_start
             assert not overlap
+
+    def test_barrier_allows_inflight_execution(self):
+        smt = _make_smt_nodes([
+            ("P", "TMA", 5, [], [("oP", "RMEM", 128, 0)]),
+            ("C", "ALU", 2, [("P", 0, True)]),
+            ("X", "ALU", 10, [], [("oX", "RMEM", 64, 0)], {
+                "reservation": [{ResourceType.ALU: 1}],
+            }),
+        ], num_warps=2)
+        result = smt._solve_phase_b(ii=12, L=20)
+        assert result is not None
+        sched = result["schedule"]
+        wa = result["warp_assign"]
+        assert wa["P"] == wa["C"] == wa["X"]
+
+        barrier_start = sched["C"] - 5
+        barrier_end = sched["C"]
+        x_issue_start = sched["X"]
+        x_issue_end = x_issue_start + 1
+        x_exec_end = x_issue_start + 10
+
+        assert x_issue_end <= barrier_start
+        assert x_exec_end > barrier_start
+        assert x_issue_start < barrier_end
 
     def test_spill_constraints_ignore_unread_parent_buffers(self):
         smt = _make_smt_nodes([
@@ -668,22 +692,62 @@ class TestSMTBlockingSync:
 @pytest.mark.skipif(not _has_z3(), reason="z3-solver not installed")
 class TestSMTSpillCost:
 
-    def test_cross_warp_adds_delay(self):
+    def test_cross_warpgroup_adds_delay(self):
         spill = 8
         base_lat = 2
         smt = _make_smt_nodes([
-            ("A", "TMA", base_lat, [], [("oA", "RMEM", 128, spill)]),
-            ("B", "ALU", 3, [("A", 0)]),
-        ], num_warps=2)
+            ("A", "TMA", base_lat, [], [("oA", "RMEM", 128, spill, "buf")], {
+                "warp_count": 4,
+                "warp_align": 4,
+                "is_varialble_latency": True,
+            }),
+            ("B", "ALU", 3, [("A", 0)], [], {
+                "input_buffer_names": ["buf"],
+            }),
+        ], num_warps=5)
         result = smt._solve_phase_b(ii=15, L=20)
         assert result is not None
         sched = result["schedule"]
         wa = result["warp_assign"]
         gap = sched["B"] - sched["A"]
-        if wa["A"] != wa["B"]:
-            assert gap >= base_lat + spill
-        else:
-            assert gap >= base_lat
+        assert wa["A"] // 4 != wa["B"] // 4
+        assert gap >= base_lat + spill
+
+    def test_spill_blocks_issue_but_not_inflight_execution(self):
+        spill = 4
+        base_lat = 2
+        smt = _make_smt_nodes([
+            ("P", "TMA", base_lat, [], [("oP", "RMEM", 128, spill, "buf")], {
+                "warp_count": 4,
+                "warp_align": 4,
+                "is_varialble_latency": True,
+            }),
+            ("C", "ALU", 1, [("P", 0)], [], {
+                "input_buffer_names": ["buf"],
+            }),
+            ("X", "ALU", 10, [], [("oX", "RMEM", 32, 0)], {
+                "reservation": [{ResourceType.ALU: 1}],
+            }),
+        ], num_warps=5)
+        smt.use_spill_concurrency = True
+        result = smt._solve_phase_b(ii=12, L=20)
+        assert result is not None
+        sched = result["schedule"]
+        wa = result["warp_assign"]
+
+        assert wa["P"] // 4 == 0
+        assert wa["C"] == 4
+        assert wa["X"] == 4
+
+        spill_start = sched["C"] - spill
+        spill_end = sched["C"]
+        x_issue_start = sched["X"]
+        x_issue_end = x_issue_start + 1
+        x_exec_end = x_issue_start + 10
+
+        assert x_issue_end <= spill_start
+        assert x_exec_end > spill_start
+        assert x_issue_start < spill_end
 
 
 @pytest.mark.skipif(not _has_z3(), reason="z3-solver not installed")

@@ -559,10 +559,14 @@ class HeddleScheduler:
 
         # CP-SAT 的 interval/no_overlap 比手工枚举所有 (time, other-op)
         # 冲突子句紧凑得多。这里按需缓存“op v 在 warp w 上执行”的可选区间，
-        # 后续 blocking_sync / spill 并发约束都复用它们。
+        # 以及“op v 在 warp w 上 issue”的可选区间；当前 blocking_sync /
+        # spill 并发约束都复用后者，只阻塞 issue，不阻塞已在飞行中的执行。
         max_latency = max((max(int(n.latency), 1) for n in self.nodes), default=1)
         interval_end_max = L - 1 + max_latency
         op_intervals: dict[tuple[int, int], object] = {}
+        max_issue = max((max(len(n.reservation), 1) for n in self.nodes), default=1)
+        issue_interval_end_max = L - 1 + max_issue
+        issue_intervals: dict[tuple[int, int], object] = {}
 
         def _op_interval(v: int, w: int):
             key = (v, w)
@@ -574,6 +578,19 @@ class HeddleScheduler:
                     Tv[v], size, end, warp[(v, w)], f"op_iv_v={v}_w={w}"
                 )
             return op_intervals[key]
+
+        def _issue_interval(v: int, w: int):
+            key = (v, w)
+            if key not in issue_intervals:
+                size = max(len(self.nodes[v].reservation), 1)
+                end = model.new_int_var(
+                    0, issue_interval_end_max, f"issue_end_v={v}_w={w}"
+                )
+                model.add(end == Tv[v] + size)
+                issue_intervals[key] = model.new_optional_interval_var(
+                    Tv[v], size, end, issue_warp[(v, w)], f"issue_iv_v={v}_w={w}"
+                )
+            return issue_intervals[key]
 
         cross_wg_rmem_penalty_terms = []
 
@@ -656,7 +673,8 @@ class HeddleScheduler:
 
                 # P2：blocking sync 的完整并发约束。
                 # 这种边不仅要求时间顺序，还会约束相关 warp 的覆盖关系；
-                # 在同步阻塞窗口内，同一个 warp 上不能安排其他重叠 op。
+                # 在同步阻塞窗口内，同一个 warp 上不能 issue 其他 op，但
+                # 允许已经 issue 完毕的长执行 op 继续飞行。
                 if edge and edge.blocking_sync:
                     if W > 1:
                         for w in range(W):
@@ -664,8 +682,8 @@ class HeddleScheduler:
 
                     # v 在 t 启动时，u 的阻塞同步窗口近似为
                     # [t - base_delay, t)。用 NoOverlap 表达“同一 warp
-                    # 上其他 op 不能与该窗口重叠”，避免按每个 t/to 展开
-                    # 成海量 BoolOr。
+                    # 上其他 op 的 issue 区间不能与该窗口重叠”，避免按
+                    # 每个 t/to 展开成海量 BoolOr。
                     block_size = max(base_delay, 1)
                     block_start_min = -block_size
                     block_end_min = 0
@@ -686,18 +704,21 @@ class HeddleScheduler:
                             f"block_iv_u={ui}_v={vi}_w={w}",
                         )
                         # 注意：NoOverlap 会约束列表中任意两个 interval
-                        # 都不重叠。这里需要的是“阻塞窗口 vs 其他 op”的
-                        # 星形排斥，而不是把所有 other op 
+                        # 都不重叠。这里需要的是“阻塞窗口 vs 其他 op 的
+                        # issue 区间”的星形排斥，而不是把所有 other op
                         # 彼此串行化。
                         for other in range(N):
                             if other == ui or other == vi:
                                 continue
-                            model.add_no_overlap([block_interval, _op_interval(other, w)])
+                            model.add_no_overlap(
+                                [block_interval, _issue_interval(other, w)]
+                            )
 
         # P2：spill 并发约束。
-        # 当 producer/consumer 分配到不同 warp，且 producer 输出带 spill_cost
-        # 时，把 spill 看成占用接收方 warp 的一段时间；这段时间内接收方
-        # warp 不能再执行其他 op。
+        # 当 producer/consumer 分配到不同 warpgroup，且 producer 输出带
+        # spill_cost 时，把 spill 看成占用接收方 warp 的一段 issue 窗口；
+        # 这段时间内接收方 warp 不能再 issue 其他 op，但允许已 issue 的
+        # 长执行 op 继续运行。
         if self.use_spill_concurrency and W > 1:
             for v_node in self.nodes:
                 vi = idx[v_node.name]
@@ -730,12 +751,14 @@ class HeddleScheduler:
                                 spill_present,
                                 f"spill_iv_u={ui}_v={vi}_ws={w_src}_wd={w_dst}",
                             )
-                            # 同理只禁止 spill 窗口 and 接收方 warp 上的其他 op
-                            # 重叠，不约束这些 other op 之间的相互重叠。
+                            # 只禁止 spill 窗口与接收方 warp 上其他 op 的 issue
+                            # 区间重叠，不约束这些 op 的完整执行区间。
                             for other in range(N):
                                 if other == vi:
                                     continue
-                                model.add_no_overlap([spill_interval, _op_interval(other, w_dst)])
+                                model.add_no_overlap(
+                                    [spill_interval, _issue_interval(other, w_dst)]
+                                )
 
         # ---- FU 容量约束 ---------------------------------------------------
         # 对 cap=1 且 reservation 为连续区间的资源，用相位区间不重叠表达。

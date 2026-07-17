@@ -293,11 +293,13 @@ class UnifiedScheduler:
                                 op_warp[key] == op_warp[dep_key]
                             ).only_enforce_if(pres)
 
-                            # Exclusive execution: create a barrier interval covering
+                            # Exclusive issue: create a barrier interval covering
                             # [consumer_start - producer_latency, consumer_start).
-                            # Other ops on the same warp must not overlap this window.
-                            # 这里把 “consumer 开始前必须保留的一段同步窗口”
-                            # 建成一个 interval，稍后放进该 warp 的 no_overlap。
+                            # Other ops on the same warp must not issue inside this
+                            # window, but already-issued long-latency ops may keep
+                            # executing through it. 这个 solver 没有显式 per-op
+                            # issue reservation，因此这里用 1-cycle issue interval
+                            # 近似其它 op 的发射占用。
                             if base_lat > 0:
                                 b_start = model.new_int_var(
                                     0, H,
@@ -325,7 +327,7 @@ class UnifiedScheduler:
                         barriers = barrier_intervals.get(bk, [])
                         if not barriers:
                             continue
-                        # Collect all op intervals on this warp (conditional)
+                        # Collect all op issue intervals on this warp (conditional)
                         # plus barrier intervals (also conditional on same warp)
                         warp_no_overlap = []
                         for op in k.ops:
@@ -345,8 +347,13 @@ class UnifiedScheduler:
                             model.add_bool_or(
                                 [op_present[okey].negated(), on_w.negated()]
                             ).only_enforce_if(both.negated())
+                            issue_end = model.new_int_var(
+                                0, H + 1, f"noiv_end_{p.name}_{k.name}_{op.name}_w{w}"
+                            )
+                            model.add(issue_end == op_start[okey] + 1).only_enforce_if(both)
+                            model.add(issue_end == 0).only_enforce_if(both.negated())
                             warp_iv = model.new_optional_interval_var(
-                                op_start[okey], op.latency, op_end[okey], both,
+                                op_start[okey], 1, issue_end, both,
                                 f"noiv_{p.name}_{k.name}_{op.name}_w{w}")
                             warp_no_overlap.append(warp_iv)
 
@@ -376,8 +383,8 @@ class UnifiedScheduler:
                             warp_no_overlap.append(cond_biv)
 
                         if len(warp_no_overlap) > 1:
-                            # 同一个 warp 上，真实 op interval 和 blocking sync
-                            # 的保护窗口不能互相重叠。
+                            # 同一个 warp 上，op 的 issue interval 和 blocking
+                            # sync 的保护窗口不能互相重叠。
                             model.add_no_overlap(warp_no_overlap)
 
         # ============================================================

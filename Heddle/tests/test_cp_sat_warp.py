@@ -126,9 +126,9 @@ class TestSolveBlockingSync:
             f"blocking_sync should force same warp, got A={warps['A']}, B={warps['B']}"
 
     def test_blocking_sync_with_bystander(self):
-        """A third op cannot overlap the barrier window on the barrier warp."""
+        """A third op cannot issue inside the barrier window on the barrier warp."""
         ops = [
-            OpSpec("prod", ResourceType.TMA, latency=5,
+            OpSpec("prod", ResourceType.TMA, latency=5, fixed_warp=0,
                    outputs=[OutputSpec("oP", StorageKind.RMEM, 128)]),
             OpSpec("cons", ResourceType.ALU, latency=2,
                    deps=[("prod", 0, True)]),  # blocking_sync
@@ -147,11 +147,38 @@ class TestSolveBlockingSync:
         if warps["other"] == warps["prod"]:
             barrier_start = sched["cons"] - 5
             barrier_end = sched["cons"]
-            other_start = sched["other"]
-            other_end = sched["other"] + 3
-            overlap = other_start < barrier_end and other_end > barrier_start
+            other_issue_start = sched["other"]
+            other_issue_end = other_issue_start + 1
+            overlap = other_issue_start < barrier_end and other_issue_end > barrier_start
             assert not overlap, \
                 f"other op overlaps barrier window [{barrier_start},{barrier_end})"
+
+    def test_blocking_sync_allows_inflight_execution(self):
+        ops = [
+            OpSpec("prod", ResourceType.TMA, latency=5,
+                   outputs=[OutputSpec("oP", StorageKind.RMEM, 128)]),
+            OpSpec("cons", ResourceType.ALU, latency=2,
+                   deps=[("prod", 0, True)]),  # blocking_sync
+            OpSpec("other", ResourceType.ALU, latency=10, fixed_warp=0,
+                   outputs=[OutputSpec("oO", StorageKind.RMEM, 64)]),
+        ]
+        solver = _make_scheduler(ops, num_warps=2)
+        result = solver.solve()
+
+        assert result is not None
+        sched = result.kernel_schedules["k0"]
+        warps = result.kernel_warp_assigns["k0"]
+        assert warps["prod"] == warps["cons"] == warps["other"] == 0
+
+        barrier_start = sched["cons"] - 5
+        barrier_end = sched["cons"]
+        other_issue_start = sched["other"]
+        other_issue_end = other_issue_start + 1
+        other_exec_end = sched["other"] + 10
+
+        assert other_issue_end <= barrier_start
+        assert other_exec_end > barrier_start
+        assert other_issue_start < barrier_end
 
 
 class TestSolveSpillCost:
