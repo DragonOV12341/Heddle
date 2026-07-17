@@ -496,7 +496,6 @@ class HeddleScheduler:
                             ])
 
         # variable latency op（如 TMA）需要和其他op分配到不同 warpgroup。
-
         for u in variable_latency_ops:
             for v in non_variable_latency_ops:
                 for wu in range(W):

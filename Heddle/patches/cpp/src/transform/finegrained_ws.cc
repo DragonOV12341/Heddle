@@ -837,23 +837,52 @@ public:
   std::vector<int> compute_stmt_indices;
 
   void Extract(const Array<Stmt> &flat_stmts) {
+    std::vector<bool> consumed(flat_stmts.size(), false);
     size_t i = 0;
     // 遍历扁平化的语句序列，按识别到的模式将语句分类为 producer 或 compute。
     while (i < flat_stmts.size()) {
-      if (i + 1 < flat_stmts.size() &&
-          IsMbarrierWaitParity(flat_stmts[i + 1])) {
-        Optional<Var> write_buffer_data =
-            ExtractTmaCopyWriteBufferData(flat_stmts[i]);
-        // 匹配模式 1/2：TMA producer + wait 配对，可能被简单的 guard/Block/Let/Attr
-        // 包装。若 tl.tma_copy_write_buffer 注解在这些包装内仍然存在，则恢复
-        // 写入的共享缓冲变量信息。
-        if (write_buffer_data.defined() || ContainsTmaLoad(flat_stmts[i])) {
+      if (consumed[i]) {
+        ++i;
+        continue;
+      }
+
+      Optional<Var> write_buffer_data =
+          ExtractTmaCopyWriteBufferData(flat_stmts[i]);
+      // A Phase-B/SMT schedule may legally move another producer between a
+      // TMA producer and its wait. Pair by mbarrier id instead of relying on
+      // adjacency; otherwise K/V producers can be matched to the wrong wait.
+      if (write_buffer_data.defined() || ContainsTmaLoad(flat_stmts[i])) {
+        Optional<PrimExpr> producer_barrier =
+            ExtractSingleMbarrierId(flat_stmts[i]);
+        int wait_index = -1;
+        if (producer_barrier.defined()) {
+          StructuralEqual equal;
+          for (size_t j = i + 1; j < flat_stmts.size(); ++j) {
+            if (consumed[j] || !IsMbarrierWaitParity(flat_stmts[j])) {
+              continue;
+            }
+            Optional<PrimExpr> wait_barrier =
+                ExtractSingleMbarrierId(flat_stmts[j]);
+            if (wait_barrier.defined() &&
+                equal(producer_barrier.value(), wait_barrier.value())) {
+              wait_index = static_cast<int>(j);
+              break;
+            }
+          }
+        }
+        if (wait_index < 0 && i + 1 < flat_stmts.size() &&
+            !consumed[i + 1] && IsMbarrierWaitParity(flat_stmts[i + 1])) {
+          wait_index = static_cast<int>(i + 1);
+        }
+        if (wait_index >= 0) {
           blocks.push_back({AsyncProducerKind::kTma,
                             StripTmaCopyWriteBufferAttr(flat_stmts[i]),
-                            Optional<Stmt>(flat_stmts[i + 1]),
+                            Optional<Stmt>(flat_stmts[wait_index]),
                             write_buffer_data, static_cast<int>(i),
-                            static_cast<int>(i + 1)});
-          i += 2;
+                            wait_index});
+          consumed[i] = true;
+          consumed[wait_index] = true;
+          ++i;
           continue;
         }
       }
@@ -959,6 +988,28 @@ private:
       return Optional<Var>();
     }
     return Optional<Var>();
+  }
+
+  static Optional<PrimExpr> ExtractSingleMbarrierId(const Stmt &stmt) {
+    Optional<PrimExpr> found = std::nullopt;
+    bool multiple = false;
+    StructuralEqual equal;
+    PostOrderVisit(stmt, [&](const ObjectRef &node) {
+      if (multiple) {
+        return;
+      }
+      const auto *call = node.as<CallNode>();
+      if (!call || !call->op.same_as(get_mbarrier()) ||
+          call->args.size() != 1) {
+        return;
+      }
+      if (!found.defined()) {
+        found = call->args[0];
+      } else if (!equal(found.value(), call->args[0])) {
+        multiple = true;
+      }
+    });
+    return multiple ? Optional<PrimExpr>() : found;
   }
 
   static bool IsMbarrierWaitParity(const Stmt &stmt) {

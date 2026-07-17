@@ -49,7 +49,7 @@ def bench(fn, warmup=10, repeat=50):
 #             PassConfigKey.TL_ENABLE_AUTO_TL_PIPELINE_SMT: True,
 #             PassConfigKey.TL_ENABLE_HEDDLE_CONSUMER_SCHEDULE: True,
 #             PassConfigKey.TL_HEDDLE_USE_PRECISE_LATENCY: True,
-#             PassConfigKey.TL_HEDDLE_CONSUMER_NUM_WARPS: 2,
+#             PassConfigKey.TL_HEDDLE_PC_TOTAL_NUM_WARPS: 2,
 #         }),
 #     ]:
 #         @tilelang.jit(out_idx=[2], pass_configs=pc)
@@ -110,7 +110,7 @@ def test_fa_fwd():
     
     rets = []
     for mode_name, pc in [
-        ("Baseline", {}),
+        ("Baseline", { PassConfigKey.TL_ENABLE_FAST_MATH: True, }),
         ("Heddle", {
             PassConfigKey.TL_ENABLE_FAST_MATH: True,
             PassConfigKey.TL_ENABLE_AUTO_TL_PIPELINE_SMT: True,
@@ -118,7 +118,7 @@ def test_fa_fwd():
             PassConfigKey.TL_HEDDLE_USE_PHASE_B: True,
             PassConfigKey.TL_HEDDLE_USE_PRECISE_LATENCY: True,
             PassConfigKey.TL_HEDDLE_USE_ALAP_PRIORITY: True,
-            PassConfigKey.TL_HEDDLE_CONSUMER_NUM_WARPS: 8,
+            PassConfigKey.TL_HEDDLE_PC_TOTAL_NUM_WARPS: 12,  # producer+consumer 上限最多12 warps
         }),
     ]:
         try:

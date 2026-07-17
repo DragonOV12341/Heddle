@@ -1092,8 +1092,8 @@ def _solve_smt_joint_optimize(
     def _op_name(idx: int) -> str:
         return f"s{idx}"
     
-    expect_consumer_warps = int(mod_sched_plan.get('heddle_expect_consumer_warps', 4))
-    print(f"heddle expected consumer_warps = {expect_consumer_warps}")
+    expect_total_warps = int(mod_sched_plan.get('heddle_expect_consumer_warps', 4))
+    print(f"heddle expected total_warps = {expect_total_warps}")
     base_M = dict(mod_sched_plan.get("M", {}))
     try:
         base_I = int(mod_sched_plan.get("I", 0))
@@ -1511,16 +1511,32 @@ def _solve_smt_joint_optimize(
     except (TypeError, ValueError):
         kernel_num_threads = 128
 
-    # threadIdx.x extent here is the user-specified consumer thread count.
-    # Keep the solver's assignable warp space to consumer warps only; the
-    # TMA-only producer WG is added later by FineGrainedWS/PCWS lowering.
-    # Otherwise per-op warp ids can spill into a third 128-thread consumer
-    # group, causing TileLang to expand 256 consumer threads to 384.
-    
+    # The joint SMT graph contains both producer and consumer nodes, so the
+    # warp domain must be the final producer+consumer domain. FineGrainedWS
+    # will later add a physical producer branch, but it must not add another
+    # logical WG beyond the solver's domain.
+    min_required_warps = max(
+        [1] + [max(int(getattr(node, "warp_count", 1)), 1) for node in nodes]
+    )
+    has_variable_latency_role = any(
+        bool(getattr(node, "is_varialble_latency", False))
+        for node in nodes
+    )
+    has_non_variable_warpgroup_role = any(
+        (not bool(getattr(node, "is_varialble_latency", False)))
+        and max(int(getattr(node, "warp_count", 1)), 1) >= 4
+        for node in nodes
+    )
+    if has_variable_latency_role and has_non_variable_warpgroup_role:
+        # One TMA producer WG plus one consumer WGMMA WG.
+        min_required_warps = max(min_required_warps, 8)
 
-    mod_sched_plan['num_warps'] = expect_consumer_warps
-    print(f'---- num_warps (consumer only) = {mod_sched_plan['num_warps']} (IR: threadIdx.x extent {kernel_num_threads})')
-    num_warps = max(1, int(mod_sched_plan.get("num_warps", 1))) + 4  # SMT需要的 num_warps 为 producer+consumer 总数目
+    mod_sched_plan['num_warps'] = max(1, expect_total_warps, min_required_warps)
+    print(
+        f"---- num_warps (producer+consumer total) = {mod_sched_plan['num_warps']} "
+        f"(config={expect_total_warps}, IR: threadIdx.x extent {kernel_num_threads})"
+    )
+    num_warps = max(1, int(mod_sched_plan.get("num_warps", 1)))
     
     # NVIDIA-H100 gpu上，单个SM 寄存器总量= 64K * 32bit reg = 64*1024 * 4bytes . 单个thread寄存器容量上限 255 * 32bit reg
     # TMA producer 的WG一般设为 set_maxnreg(24)
@@ -2145,7 +2161,7 @@ def _solve_smt_joint_optimize(
             sol = _run_joint_solver(
                 ii=base_I,
                 solve_window=solve_window,
-                optimize=True,
+                optimize=False,
                 solve_reg_limit=reg_limit,
                 solve_smem_limit=smem_limit,
                 enable_liveness=use_sparse_rmem_liveness,
@@ -2171,7 +2187,7 @@ def _solve_smt_joint_optimize(
                 sol_subcore = _run_joint_solver(
                     ii=base_I,
                     solve_window=solve_window,
-                    optimize=True,
+                    optimize=False,
                     solve_reg_limit=reg_limit,
                     solve_smem_limit=smem_limit,
                     enable_liveness=use_sparse_rmem_liveness,
@@ -2197,7 +2213,7 @@ def _solve_smt_joint_optimize(
                 sol2 = _run_joint_solver(
                     ii=base_I,
                     solve_window=solve_window,
-                    optimize=True,
+                    optimize=False,
                     solve_reg_limit=reg_limit,
                     solve_smem_limit=smem_limit,
                     enable_liveness=use_sparse_rmem_liveness,
@@ -3393,7 +3409,7 @@ def _transform_pipeline_loop(
     buffer_span_aware: bool = True,
     relax_producer_boundary: bool = True,
     use_phase_b: bool = False,
-    consumer_num_warps: int = 1,
+    pc_total_num_warps: int = 1,
     debug: bool = False,
 ) -> tvm.tir.PrimFunc:
     """Find pipeline loops and reorder consumer statements using Heddle."""
@@ -3564,7 +3580,7 @@ def _transform_pipeline_loop(
         
         original_seq = seq
         seq, fission_temp_buffers = _op_fission_and_transform_ir(seq, merged_buf_map)
-        print('--- after fission : \n', seq.script())
+        # print('--- after fission : \n', seq.script())
         
         fission_changed = bool(fission_temp_buffers)
         for tmp_buf in fission_temp_buffers:
@@ -3584,6 +3600,10 @@ def _transform_pipeline_loop(
         if not has_producer or not has_consumer:
             print(f"[Heddle] Skip: has_producer={has_producer}, has_consumer={has_consumer}", flush=True)
             return None
+
+        configured_total_warps = max(1, int(pc_total_num_warps))
+        producer_reserved_warps = 4 if has_producer else 0
+        phase_b_consumer_warps = max(1, configured_total_warps - producer_reserved_warps)
 
         consumer_count = sum(1 for info in infos_list if not info.is_producer)
         if debug:
@@ -4030,33 +4050,15 @@ def _transform_pipeline_loop(
                         f"s{ci}": group_remap[raw_groups[ci]]
                         for ci in consumer_indices
                     }
-                    if consumer_num_warps > 1 and len(set(joint_warps.values())) < 2:
-                        tc_consumers = [
-                            ci for ci in consumer_indices
-                            if getattr(info_by_idx.get(ci), "is_wgmma", False)
-                        ]
-                        if len(tc_consumers) >= 2:
-                            tc_order = sorted(
-                                tc_consumers,
-                                key=lambda ci: (joint_times_by_idx.get(ci, 0), stmt_positions.get(ci, ci)),
-                            )
-                            split = max(1, len(tc_order) // 2)
-                            for ci in tc_order[split:]:
-                                joint_warps[f"s{ci}"] = 1
-                            if debug:
-                                print(
-                                    "[Heddle] Joint warp assigns collapsed to one WG; "
-                                    f"routing late tensorcore stmts to WG1 for per-op dispatch: {tc_order[split:]}",
-                                    file=sys.stderr,
-                                    flush=True,
-                                )
-                    # Keep producer-side TMA assignments (for example K/V
-                    # loads) in the annotation as well.  FineGrainedWS uses
-                    # these only to route producer blocks; consumer WG ids
-                    # above remain compacted independently.
-                    for ci, warp in opt_warps.items():
-                        if ci not in raw_groups:
-                            joint_warps[f"s{ci}"] = max(0, int(warp) // 4)
+                    # Do not synthesize extra consumer WGs here. If the SMT
+                    # solution places all consumer work in one WG while TMA
+                    # producers occupy the other WG, FineGrainedWS should
+                    # lower it as the standard two-role 256-thread split.
+                    #
+                    # Also keep this annotation consumer-only. FineGrainedWS
+                    # does look up producer stmt ids in the same map; a
+                    # producer entry would route that producer statement into a
+                    # consumer WG instead of the producer branch.
 
             return (
                 joint_order,
@@ -4172,7 +4174,10 @@ def _transform_pipeline_loop(
             # ---- TWill : step 2 求解联合优化问题： 基础模调度M + warp_spec
             for plan in mod_sched_plans :
                 print('----start  _solve_smt_joint_optimize', flush=True)
-                plan['heddle_expect_consumer_warps'] = consumer_num_warps  # 传入用户期望的 consumer_warps 数目
+                # Historical config name says "consumer", but the joint SMT
+                # graph contains producer nodes too. Treat this as the total
+                # producer+consumer warp budget.
+                plan['heddle_expect_consumer_warps'] = configured_total_warps
                 plan['heddle_original_num_stages'] = num_stages
                 plan['rmem_conservative'] = True  # 采用rmem保守估计, 直接将多版本的rmem 乘以 version数目(因为编程时,一般直接分配 version 数目的 buffer,实现pipeline, 很少做全部rmem merge + 动态复用逻辑. 基于liveliness 的分析对codegen而言过于激进,且实现起来很难)
                 optimized =  _solve_smt_joint_optimize( deps_all,infos_list,all_indices,plan, kernel_num_threads=func_num_threads,)
@@ -4204,7 +4209,7 @@ def _transform_pipeline_loop(
                     naive_plans = _solve_naive_modulo_sched(
                         deps_all, infos_list, all_indices, start_ii=ii)
                     for naive_p in naive_plans:
-                        naive_p['heddle_expect_consumer_warps'] = consumer_num_warps
+                        naive_p['heddle_expect_consumer_warps'] = configured_total_warps
                         naive_p['heddle_original_num_stages'] = num_stages
                         optimized_p = _solve_smt_joint_optimize(
                             deps_all, infos_list, all_indices, naive_p,
@@ -4224,7 +4229,7 @@ def _transform_pipeline_loop(
                     else:
                         ii_lb = (ii_ub + ii_lb) // 2
                 
-                for ii in range(ii_lb, ii_ub+1, 1):
+                for ii in range(ii_lb+1, ii_ub+1, 1):
                     ret = _try_ii(ii)
                     if ret is not None :
                         candidate_phase_b_result = _joint_result_to_phase_b_result(ret)
@@ -4244,7 +4249,7 @@ def _transform_pipeline_loop(
         print("---- [原始路径] start smt solving -----")
         n_tc_ops = len(consumer_wgmma_indices)
         auto_phase_b = (n_tc_ops >= 3) and (len(consumer_indices) >= 6)
-        run_phase_b = use_phase_b or auto_phase_b or consumer_num_warps > 1
+        run_phase_b = use_phase_b or auto_phase_b or phase_b_consumer_warps > 4
         if joint_phase_b_result is not None:
             run_phase_b = True
 
@@ -4271,7 +4276,7 @@ def _transform_pipeline_loop(
                 phase_b_result = _phase_b_consumer_ordering(
                     infos_list, consumer_indices, deps,
                     use_precise_latency=use_precise_latency,
-                    num_warps=consumer_num_warps,
+                    num_warps=phase_b_consumer_warps,
                     timeout_ms=adaptive_timeout,
                     debug=debug,
                 )
@@ -4279,6 +4284,7 @@ def _transform_pipeline_loop(
             phase_b_stage_offsets: Dict[int, int] = {}
             phase_b_full_order: Optional[List[int]] = None
             phase_b_num_stages: int = 0
+            phase_b_warps_are_compact_wgids = False
             if phase_b_result is not None:
                 if len(phase_b_result) == 6:
                     (
@@ -4289,6 +4295,7 @@ def _transform_pipeline_loop(
                         phase_b_full_order,
                         phase_b_num_stages,
                     ) = phase_b_result
+                    phase_b_warps_are_compact_wgids = True
                 elif len(phase_b_result) == 4:
                     phase_b_order, phase_b_times, phase_b_warps, phase_b_stage_offsets = phase_b_result
                 else:
@@ -4296,7 +4303,7 @@ def _transform_pipeline_loop(
             else:
                 phase_b_order, phase_b_times, phase_b_warps = None, {}, {}
 
-            if consumer_num_warps > 1 and phase_b_order is None:
+            if phase_b_consumer_warps > 4 and phase_b_order is None:
                 phase_b_order = list(consumer_indices)
                 phase_b_times = {}
                 phase_b_warps = {}
@@ -4306,7 +4313,7 @@ def _transform_pipeline_loop(
                           f"choose a structured consumer split",
                           file=sys.stderr, flush=True)
 
-            if consumer_num_warps > 1 and phase_b_order is not None:
+            if phase_b_order is not None:
                 consumer_set = set(consumer_indices)
                 filtered_warps = {
                     name: warp
@@ -4479,16 +4486,54 @@ def _transform_pipeline_loop(
                         )
 
                 if phase_b_warps:
-                    #TODO: 检查下 phase_b_warps 中的WG = warp // 4 是否 >0 . 若不满足，将其+4
-                    warp_str = ",".join(
-                        f"{k}:{v}"
-                        for k, v in sorted(phase_b_warps.items())
+                    if not phase_b_warps_are_compact_wgids:
+                        raw_groups = {
+                            name: max(0, int(warp) // 4)
+                            for name, warp in phase_b_warps.items()
+                        }
+                        group_remap = {
+                            group: pos
+                            for pos, group in enumerate(sorted(set(raw_groups.values())))
+                        }
+                        phase_b_warps = {
+                            name: group_remap[raw_groups[name]]
+                            for name in sorted(raw_groups)
+                        }
+                        phase_b_warps_are_compact_wgids = True
+                        if debug:
+                            print(
+                                "[Heddle] Compacted Phase B raw warp ids to warp-group ids: "
+                                f"{phase_b_warps}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                    if len(set(int(v) for v in phase_b_warps.values())) >= 2:
+                        warp_str = ",".join(
+                            f"{k}:{v}"
+                            for k, v in sorted(phase_b_warps.items())
+                        )
+                        _set_ws_annotation(new_annotations, "tl_pcws_warp_assigns", warp_str)
+                        annotations_changed = True
+                        if debug:
+                            print(f"[Heddle] Injected per-op warp assigns: {warp_str}",
+                                  file=sys.stderr, flush=True)
+                    else:
+                        annotations_changed = (
+                            _clear_ws_annotation(new_annotations, "tl_pcws_warp_assigns")
+                            or annotations_changed
+                        )
+                        if debug:
+                            print(
+                                "[Heddle] Skipping per-op warp assigns: "
+                                "all consumer statements are in one WG",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                else:
+                    annotations_changed = (
+                        _clear_ws_annotation(new_annotations, "tl_pcws_warp_assigns")
+                        or annotations_changed
                     )
-                    _set_ws_annotation(new_annotations, "tl_pcws_warp_assigns", warp_str)
-                    annotations_changed = True
-                    if debug:
-                        print(f"[Heddle] Injected per-op warp assigns: {warp_str}",
-                              file=sys.stderr, flush=True)
 
                 if order_changed or annotations_changed or fission_changed:
                     changed[0] = True
@@ -4802,13 +4847,13 @@ def HeddleConsumerSchedule():
         buffer_span_aware = _get_bool_config(ctx, "tl.heddle_buffer_span_aware", True)
         relax_producer_boundary = _get_bool_config(ctx, "tl.heddle_relax_producer_boundary", True)
         use_phase_b = _get_bool_config(ctx, "tl.heddle_use_phase_b", False)
-        consumer_num_warps = max(1, _get_int_config(ctx, "tl.heddle_consumer_num_warps", 1))
+        pc_total_num_warps = max(1, _get_int_config(ctx, "tl.heddle_pc_total_num_warps", 1))
 
         if debug:
             print(f"[Heddle] HeddleConsumerSchedule pass running "
                   f"(alap={use_alap_priority}, buf_span={buffer_span_aware}, "
                   f"relax_pb={relax_producer_boundary}, phase_b={use_phase_b}, "
-                  f"consumer_warps={consumer_num_warps})",
+                  f"total_warps={pc_total_num_warps})",
                   file=sys.stderr, flush=True)
 
         try:
@@ -4819,7 +4864,7 @@ def HeddleConsumerSchedule():
                 buffer_span_aware=buffer_span_aware,
                 relax_producer_boundary=relax_producer_boundary,
                 use_phase_b=use_phase_b,
-                consumer_num_warps=consumer_num_warps,
+                pc_total_num_warps=pc_total_num_warps,
                 debug=debug,
             )
             print("--after smt ----\n " ,result.script())

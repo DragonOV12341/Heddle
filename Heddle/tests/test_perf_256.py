@@ -49,7 +49,7 @@ def test_gemm():
             PassConfigKey.TL_ENABLE_AUTO_TL_PIPELINE_SMT: True,
             PassConfigKey.TL_ENABLE_HEDDLE_CONSUMER_SCHEDULE: True,
             PassConfigKey.TL_HEDDLE_USE_PRECISE_LATENCY: True,
-            PassConfigKey.TL_HEDDLE_CONSUMER_NUM_WARPS: 2,
+            PassConfigKey.TL_HEDDLE_PC_TOTAL_NUM_WARPS: 2,
         }),
     ]:
         @tilelang.jit(out_idx=[2], pass_configs=pc)
@@ -118,7 +118,7 @@ def test_fa_fwd():
             PassConfigKey.TL_HEDDLE_USE_PHASE_B: True,
             PassConfigKey.TL_HEDDLE_USE_PRECISE_LATENCY: True,
             PassConfigKey.TL_HEDDLE_USE_ALAP_PRIORITY: True,
-            PassConfigKey.TL_HEDDLE_CONSUMER_NUM_WARPS: 2,
+            PassConfigKey.TL_HEDDLE_PC_TOTAL_NUM_WARPS: 2,
         }),
     ]:
         try:

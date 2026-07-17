@@ -23,7 +23,7 @@ HEDDLE_CONFIG_KEYS: dict[str, str] = {
     "TL_HEDDLE_USE_ALAP_PRIORITY": "tl.heddle_use_alap_priority",
     "TL_HEDDLE_BUFFER_SPAN_AWARE": "tl.heddle_buffer_span_aware",
     "TL_HEDDLE_USE_PHASE_B": "tl.heddle_use_phase_b",
-    "TL_HEDDLE_CONSUMER_NUM_WARPS": "tl.heddle_consumer_num_warps",
+    "TL_HEDDLE_PC_TOTAL_NUM_WARPS": "tl.heddle_pc_total_num_warps",
     "TL_HEDDLE_RELAX_PRODUCER_BOUNDARY": "tl.heddle_relax_producer_boundary",
     "TL_PCWS_ENABLE_THREE_ROLE": "tl.pcws_enable_three_role",
     "TL_PCWS_PRODUCER_THREAD_EXTENT": "tl.pcws_producer_thread_extent",
