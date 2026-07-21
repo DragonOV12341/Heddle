@@ -465,7 +465,6 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
     duration = {idx: 1 for idx in ops}
     
     # 硬件发射槽位容量模型 （TMA暂且认为无发射限制。其受带宽影响）
-    # H100 一个SM有4个subcore，每个SM上有: 1TMA, 4Tensorcore(但在实际使用时，其需要4个warp协作，一般需要跨subcore), 故总体建模为1个；
     capacity = { "TMA": 255, "TC": 1, "ALU": 64, "SFU": 16, "BARRIER": 1 }
     
     # latencies - 指令执行耗时
@@ -692,7 +691,7 @@ def _solve_naive_modulo_sched(op_deps: Dict[int, List[int]], infos: List['_StmtI
         while True :
             print(f"\r[Modulo Sched] 二分法缩小搜索区间: {lb=},{ub=} ...", end="", flush=True)
             # 区间过短时，直接遍历
-            if ub-lb <= 5 :
+            if ub-lb <= 2 :
                 break
             if ans_ub is None:
                 ans_ub = cached_solve_for_I(ub)
@@ -1127,17 +1126,12 @@ def _solve_smt_joint_optimize(
         "SFU": ResourceType.SFU,
         "BARRIER": ResourceType.Barrier,
     }
-    # TC指令为跨subcore协作指令，无法多发射；其他指令，如果 subcoreId = warpId % 4 相同，则不能多发射，否则可以同时发射
     capacity = {
         ResourceType.TMA: 255,
         ResourceType.TensorCore: 1,
         ResourceType.ALU: 64,
         ResourceType.SFU: 16,
         ResourceType.Barrier: 1,
-    }
-    subcore_capacity = {
-        ResourceType.ALU: int(capacity[ResourceType.ALU]),
-        ResourceType.SFU: int(capacity[ResourceType.SFU]),
     }
     
     def _resource_for_info(info: _StmtInfo) -> ResourceType:
@@ -1599,7 +1593,6 @@ def _solve_smt_joint_optimize(
         enable_liveness: bool = True,
         log_search_progress:bool = False,
         not_all_same_warpgroup_sets: Optional[List[Tuple[str, ...]]] = None,
-        same_subcore_exclusion_pairs: Optional[List[Tuple[str, str]]] = None,
     ):
         solver = HeddleScheduler(
             nodes,  # 此时 outputBuffer 已乘上了版本数
@@ -1608,10 +1601,10 @@ def _solve_smt_joint_optimize(
             smem_limit=solve_smem_limit,
             num_warps=num_warps,
             timeout_ms=int(mod_sched_plan.get("timeout_ms", 180*1000)),
-            enable_liveness=enable_liveness,
-            enable_rmem_liveness=enable_liveness,
+            enable_liveness=True,
+            enable_rmem_liveness=True,
             enable_smem_liveness=True,
-            fold_rmem_liveness_by_ii=bool(mod_sched_plan.get("fold_rmem_liveness_by_ii", True)),
+            fold_rmem_liveness_by_ii=bool(mod_sched_plan.get("fold_rmem_liveness_by_ii", False)),  # 默认liveliness建模不折叠 checkpoint 窗口
             # Cross-WG RMEM spill windows are currently a very strong model:
             # they reserve the destination WG against every other op in the
             # spill interval. On real FA graphs this can overconstrain Phase B
@@ -1628,7 +1621,6 @@ def _solve_smt_joint_optimize(
             log_search_progress=log_search_progress,
             same_warpgroup_pairs=same_warpgroup_pairs,
             not_all_same_warpgroup_sets=not_all_same_warpgroup_sets,
-            same_subcore_exclusion_pairs=same_subcore_exclusion_pairs,
             cross_wg_rmem_penalty=int(mod_sched_plan.get("cross_wg_rmem_penalty", 1)),
             rmem_conservative=bool(mod_sched_plan.get("rmem_conservative", False)),
         )
@@ -1656,6 +1648,7 @@ def _solve_smt_joint_optimize(
         check_smem_limit: int,
         use_mem_check_conservative: bool = False,
     ) -> Tuple[bool, Dict[str, object]]:
+        print(f'[_check_fixed_liveness] {use_mem_check_conservative=}')
         fixed_M = {
             idx: int(schedule[_op_name(idx)])
             for idx in ops
@@ -1683,8 +1676,6 @@ def _solve_smt_joint_optimize(
         def _check_fixed_issue_resources() -> Optional[Dict[str, object]]:
             fu_usage: Dict[Tuple[int, ResourceType], int] = {}
             fu_users: Dict[Tuple[int, ResourceType], List[str]] = {}
-            fu_subcore_usage: Dict[Tuple[int, int, ResourceType], int] = {}
-            fu_subcore_users: Dict[Tuple[int, int, ResourceType], List[str]] = {}
             for idx in ops:
                 node = node_by_idx[idx]
                 start = fixed_M[idx]
@@ -1708,27 +1699,6 @@ def _solve_smt_joint_optimize(
                                 "limit": limit,
                                 "users": fu_users.get(key, [])[:12],
                             }
-
-                        subcore_limit = int(subcore_capacity.get(rty, 0))
-                        if subcore_limit <= 0:
-                            continue
-                        for warp_id in fixed_warps.get(idx, [0]):
-                            subcore = int(warp_id) % 4
-                            subcore_key = (phase, subcore, rty)
-                            fu_subcore_usage[subcore_key] = (
-                                fu_subcore_usage.get(subcore_key, 0) + used_count
-                            )
-                            fu_subcore_users.setdefault(subcore_key, []).append(op_name)
-                            if fu_subcore_usage[subcore_key] > subcore_limit:
-                                return {
-                                    "reason": "fu_subcore_limit",
-                                    "phase": phase,
-                                    "subcore": subcore,
-                                    "resource": _resource_name(rty),
-                                    "usage": fu_subcore_usage[subcore_key],
-                                    "limit": subcore_limit,
-                                    "users": fu_subcore_users.get(subcore_key, [])[:12],
-                                }
             return None
 
         resource_error = _check_fixed_issue_resources()
@@ -2134,39 +2104,18 @@ def _solve_smt_joint_optimize(
         )
         return [feedback_set]
 
-    def _subcore_feedback_from_live_info(live_info: Dict[str, object]) -> List[Tuple[str, str]]:
-        if live_info.get("reason") != "fu_subcore_limit":
-            return []
-        users = [
-            str(user)
-            for user in (live_info.get("users") or [])
-            if isinstance(user, str)
-        ]
-        if len(users) < 2:
-            return []
-        pair = tuple(sorted((users[0], users[1])))
-        print(
-            f"---- Round2 subcore feedback: conflict_pair={pair}, "
-            f"constraint=same_subcore_no_overlap",
-            flush=True,
-        )
-        return [pair]
-
-    
     def _find_solution_and_check_liveliness() :
-        subcore_feedback_pairs: List[Tuple[str, str]] = []
         use_sparse_rmem_liveness = bool(mod_sched_plan.get("use_sparse_rmem_liveness", True))
         for solve_window in candidate_windows:
             print(f'[SMT] 遍历空间找最优解 : I= {base_I} L = {solve_window}',flush=True)
             sol = _run_joint_solver(
                 ii=base_I,
                 solve_window=solve_window,
-                optimize=False,
+                optimize=True,
                 solve_reg_limit=reg_limit,
                 solve_smem_limit=smem_limit,
                 enable_liveness=use_sparse_rmem_liveness,
                 log_search_progress=False,
-                same_subcore_exclusion_pairs=subcore_feedback_pairs,
             )
             live_ok, live_info = _post_check_liveliness(sol)
             if live_ok:
@@ -2178,42 +2127,13 @@ def _solve_smt_joint_optimize(
                 print(f"最优解求解成功 I={base_I}, L={solve_window}")
                 return (sol, liveness_info)
 
-            new_subcore_pairs = _subcore_feedback_from_live_info(live_info)
-            if new_subcore_pairs:
-                for pair in new_subcore_pairs:
-                    if pair not in subcore_feedback_pairs:
-                        subcore_feedback_pairs.append(pair)
-                print(f'[SMT] Round2: 添加subcore冲突pair约束后重试 L = {solve_window}', flush=True)
-                sol_subcore = _run_joint_solver(
-                    ii=base_I,
-                    solve_window=solve_window,
-                    optimize=False,
-                    solve_reg_limit=reg_limit,
-                    solve_smem_limit=smem_limit,
-                    enable_liveness=use_sparse_rmem_liveness,
-                    log_search_progress=False,
-                    same_subcore_exclusion_pairs=subcore_feedback_pairs,
-                )
-                live_ok_subcore, live_info_subcore = _post_check_liveliness(sol_subcore)
-                if live_ok_subcore:
-                    liveness_info = {
-                        "reg_peak": sol_subcore.get("reg_peak", {}),
-                        "smem_peak": sol_subcore.get("smem_peak"),
-                        "source": "round2_subcore_feedback",
-                        "subcore_feedback_pairs": subcore_feedback_pairs,
-                    }
-                    print(f"Round2 subcore feedback 求解成功 I={base_I}, L={solve_window}")
-                    return (sol_subcore, liveness_info)
-                print(f"Round2 subcore feedback 后仍失败: {live_info_subcore}", flush=True)
-                live_info = live_info_subcore
-
             feedback_sets = _reg_feedback_from_live_info(live_info)
             if feedback_sets:
                 print(f'[SMT] Round2: 添加top3 reg peak producer分散约束后重试 L = {solve_window}', flush=True)
                 sol2 = _run_joint_solver(
                     ii=base_I,
                     solve_window=solve_window,
-                    optimize=False,
+                    optimize=True,
                     solve_reg_limit=reg_limit,
                     solve_smem_limit=smem_limit,
                     enable_liveness=use_sparse_rmem_liveness,
@@ -4172,6 +4092,7 @@ def _transform_pipeline_loop(
             # ---- TWill : step 1 求解基础模调度M
             mod_sched_plans = _solve_naive_modulo_sched(deps_all, infos_list, all_indices, start_ii=1)  # start_ii=1292
             # ---- TWill : step 2 求解联合优化问题： 基础模调度M + warp_spec
+            use_rmem_conservative = False  # False : 采用普通liveliness约束（Twill实现） / True：采用保守策略，检查静态最大版本数尺寸是否超限
             for plan in mod_sched_plans :
                 print('----start  _solve_smt_joint_optimize', flush=True)
                 # Historical config name says "consumer", but the joint SMT
@@ -4179,7 +4100,7 @@ def _transform_pipeline_loop(
                 # producer+consumer warp budget.
                 plan['heddle_expect_consumer_warps'] = configured_total_warps
                 plan['heddle_original_num_stages'] = num_stages
-                plan['rmem_conservative'] = True  # 采用rmem保守估计, 直接将多版本的rmem 乘以 version数目(因为编程时,一般直接分配 version 数目的 buffer,实现pipeline, 很少做全部rmem merge + 动态复用逻辑. 基于liveliness 的分析对codegen而言过于激进,且实现起来很难)
+                plan['rmem_conservative'] = use_rmem_conservative  # 采用rmem保守估计, 直接将多版本的rmem 乘以 version数目(因为编程时,一般直接分配 version 数目的 buffer,实现pipeline, 很少做全部rmem merge + 动态复用逻辑. 基于liveliness 的分析对codegen而言过于激进,且实现起来很难)
                 optimized =  _solve_smt_joint_optimize( deps_all,infos_list,all_indices,plan, kernel_num_threads=func_num_threads,)
                 if optimized is None :
                     last_unfeasible_ii = plan['I']
@@ -4211,6 +4132,7 @@ def _transform_pipeline_loop(
                     for naive_p in naive_plans:
                         naive_p['heddle_expect_consumer_warps'] = configured_total_warps
                         naive_p['heddle_original_num_stages'] = num_stages
+                        naive_p['rmem_conservative'] = use_rmem_conservative
                         optimized_p = _solve_smt_joint_optimize(
                             deps_all, infos_list, all_indices, naive_p,
                             kernel_num_threads=func_num_threads,

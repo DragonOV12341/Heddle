@@ -109,7 +109,7 @@ def test_fa_fwd():
         return torch.matmul(probs, v).permute(0, 2, 1, 3).to(Q.dtype)
     
     rets = []
-    for mode_name, pc in [
+    configs = [        
         ("Baseline", { PassConfigKey.TL_ENABLE_FAST_MATH: True, }),
         ("Heddle", {
             PassConfigKey.TL_ENABLE_FAST_MATH: True,
@@ -120,7 +120,8 @@ def test_fa_fwd():
             PassConfigKey.TL_HEDDLE_USE_ALAP_PRIORITY: True,
             PassConfigKey.TL_HEDDLE_PC_TOTAL_NUM_WARPS: 12,  # producer+consumer 上限最多12 warps
         }),
-    ]:
+    ]
+    for mode_name, pc in configs :
         try:
             @tilelang.jit(out_idx=[3], pass_configs=pc)
             def kern(B, H, Tseq, D, bM, bN, stages, threads, scale):
@@ -183,12 +184,12 @@ def test_fa_fwd():
             rets.append( compiled(Q,K,V) )
         except Exception as e:
             print(f"  {mode_name:<12}: FAIL — {str(e)[:]}")
-    assert len(rets) == 2
+    assert len(rets) == len(configs)
     baseline = inner_baseline(Q,K,V)
-    isEqual0 = torch.allclose(rets[0], baseline, atol=1e-2, rtol=1e-2)
-    isEqual1 = torch.allclose(rets[0], baseline, atol=1e-2, rtol=1e-2)
-    print(f"{isEqual0=}")
-    print(f"{isEqual1=}")
+    correct_0 = torch.allclose(rets[0], baseline, atol=1e-2, rtol=1e-2)
+    correct_1 = torch.allclose(rets[1], baseline, atol=1e-2, rtol=1e-2)
+    print(f"{correct_0=}")
+    print(f"{correct_1=}")
     
 if __name__ == "__main__":
     # test_gemm()

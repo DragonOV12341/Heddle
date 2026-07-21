@@ -171,14 +171,13 @@ class HeddleScheduler:
         enable_liveness: bool = True,
         enable_rmem_liveness: Optional[bool] = None,
         enable_smem_liveness: Optional[bool] = None,
-        fold_rmem_liveness_by_ii: bool = True,
+        fold_rmem_liveness_by_ii: bool = True,  # 是否折叠liveliness 检查窗到 [0,ii]
         liveness_checkpoint_step: int = 8,
         start_hints: Optional[Dict[str, int]] = None,
         smem_allocations: Optional[Dict[str, int]] = None,
         log_search_progress : bool = False,
         same_warpgroup_pairs: Optional[List[Tuple[str, str]]] = None,
         not_all_same_warpgroup_sets: Optional[List[Tuple[str, ...]]] = None,
-        same_subcore_exclusion_pairs: Optional[List[Tuple[str, str]]] = None,
         cross_wg_rmem_penalty: int = 4,
         rmem_conservative: bool = False,
     ):
@@ -213,7 +212,6 @@ class HeddleScheduler:
         self.log_search_progress = log_search_progress
         self.same_warpgroup_pairs = list(same_warpgroup_pairs or [])
         self.not_all_same_warpgroup_sets = list(not_all_same_warpgroup_sets or [])
-        self.same_subcore_exclusion_pairs = list(same_subcore_exclusion_pairs or [])
         self.cross_wg_rmem_penalty = max(int(cross_wg_rmem_penalty), 0)
         self.rmem_conservative = bool(rmem_conservative)
 
@@ -411,7 +409,7 @@ class HeddleScheduler:
         for v in range(N):
             for w in range(W):
                 warp[(v, w)] = model.new_bool_var(f"warp_v={v}_w={w}")
-        
+
         # 特殊标记：是否是 variable latency 操作（如 TMA）。
         is_varialble_latency_op = [
             bool(self.nodes[v].is_varialble_latency)
@@ -780,48 +778,6 @@ class HeddleScheduler:
             phase_eq_cache[key] = b
             return b
 
-        # Hopper 每个 warpgroup 内的同号 warp 共享一个 subcore issue 槽。
-        # 不在首次求解里对所有 op pair 全局展开；log4 这类 expanded op
-        # 数量较大时，这会在进入 CP-SAT 前制造百万级 Python 侧建模开销。
-        # 只对 post-check 反馈回来的少量冲突 pair 加同 subcore 排斥。
-        seen_subcore_pairs: set[tuple[int, int]] = set()
-        for left_name, right_name in self.same_subcore_exclusion_pairs:
-            if left_name not in idx or right_name not in idx:
-                continue
-            u = idx[left_name]
-            v = idx[right_name]
-            if u == v:
-                continue
-            if u > v:
-                u, v = v, u
-            if (u, v) in seen_subcore_pairs:
-                continue
-            seen_subcore_pairs.add((u, v))
-            dur_u = max(len(self.nodes[u].reservation), 1)
-            dur_v = max(len(self.nodes[v].reservation), 1)
-            for wu in range(W):
-                for wv in range(W):
-                    if wu % 4 != wv % 4:
-                        continue
-                    same_subcore = _and_var(
-                        f"same_subcore_feedback_u={u}_v={v}_wu={wu}_wv={wv}",
-                        [issue_warp[(u, wu)], issue_warp[(v, wv)]],
-                    )
-                    if dur_u + dur_v > ii:
-                        model.add(same_subcore == 0)
-                        continue
-                    delta_uv = model.new_int_var(
-                        0, ii - 1,
-                        f"subcore_feedback_delta_u={u}_v={v}_wu={wu}_wv={wv}",
-                    )
-                    model.add_modulo_equality(
-                        delta_uv,
-                        phase[v] - phase[u] + ii,
-                        ii,
-                    )
-                    model.add(delta_uv >= dur_u).only_enforce_if(same_subcore)
-                    model.add(delta_uv <= ii - dur_v).only_enforce_if(same_subcore)
-
         interval_mode_resources: set[ResourceType] = set()
         resource_spans: dict[ResourceType, list[tuple[int, int, int]]] = {}
         for r, cap in self.fu_caps.items():
@@ -992,7 +948,7 @@ class HeddleScheduler:
         # sparse RMEM 容量约束，避免同时引入逐 tau 的 SMEM live 网格。
         track_rmem_liveness = bool(self.enable_rmem_liveness and all_outputs and self.reg_limit > 0)
         track_smem_liveness = bool(self.enable_smem_liveness and all_outputs)
-        max_iter_overlap = (max(int(L), 1) - 1) // max(int(ii), 1)
+        max_iter_overlap = (max(int(L), 1) - 1) // max(int(ii), 1)  # (L-1) / ii
         max_dependency_distance = max(
             (
                 int(distance)
@@ -1003,7 +959,7 @@ class HeddleScheduler:
         )
         # A loop-carried dependency with distance=1 contributes the previous
         # iteration's value to the current window even when I == L.
-        incoming_iter_overlap = max(max_iter_overlap, max_dependency_distance)
+        incoming_iter_overlap = max(max_iter_overlap, max_dependency_distance)  # 区间[-delta, (L-1) / ii]
         iter_offsets = (
             range(-incoming_iter_overlap, max_iter_overlap + 1)
             if self.include_incoming_live else
@@ -1154,25 +1110,27 @@ class HeddleScheduler:
                 rmem_liveness_checkpoints = []
             else:
                 if use_folded_rmem_liveness:
-                    checkpoint_set = set(range(0, ii + 1, self.liveness_checkpoint_step))
+                    # checkpoint_set = set(range(0, ii + 1, self.liveness_checkpoint_step))
+                    checkpoint_set = set([0,ii])
                     checkpoint_set.update({0, max(ii - 1, 0)})
                 else:
-                    checkpoint_set = set(range(0, L + 1, self.liveness_checkpoint_step))
+                    # checkpoint_set = set(range(0, L + 1, self.liveness_checkpoint_step))
+                    checkpoint_set = set([0,L])
                     checkpoint_set.add(max(L - 1, 0))
                 hint_times = {
                     v: int(self.start_hints.get(node.name))
                     for v, node in enumerate(self.nodes)
                     if self.start_hints.get(node.name) is not None
                 }
-                for xi, (producer_v, oval) in enumerate(all_outputs):
+                for xi, (producer_v, oval) in enumerate(all_outputs):  # 对所有 out buffer
                     rmem_iter_offsets = (
                         (rmem_folded_offsets if use_folded_rmem_liveness else iter_offsets)
                         if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY else
                         range(0, 1)
                     )
-                    for iter_offset in rmem_iter_offsets:
+                    for iter_offset in rmem_iter_offsets:  # 所有 iter_offset (跨迭代)
                         producer_hint = hint_times.get(producer_v)
-                        if producer_hint is not None:
+                        if producer_hint is not None:  # buffer的生产时间
                             t = (
                                 producer_hint % ii
                                 if use_folded_rmem_liveness else
@@ -1182,8 +1140,8 @@ class HeddleScheduler:
                                 limit = ii if use_folded_rmem_liveness else L
                                 if 0 <= t + dt < limit:
                                     checkpoint_set.add(t + dt)
-                        for cv, d in consumers_of.get(xi, []):
-                            consumer_hint = hint_times.get(cv)
+                        for cv, d in consumers_of.get(xi, []):  # 对 某个op 的所有 consumer
+                            consumer_hint = hint_times.get(cv)  # buffer的消费时刻
                             if consumer_hint is None:
                                 continue
                             t = (
@@ -1193,9 +1151,17 @@ class HeddleScheduler:
                             )
                             for dt in (-1, 0, 1):
                                 limit = ii if use_folded_rmem_liveness else L
-                                if 0 <= t + dt < limit:
+                                if 0 <= t + dt < limit:  # t+dt 落在 L（检查窗口）范围内
                                     checkpoint_set.add(t + dt)
-                rmem_liveness_checkpoints = sorted(checkpoint_set)
+                added_checkpoints = []
+                for pt in checkpoint_set :
+                    added_checkpoints.append(pt-1 if pt-1 > 0 else 0)
+                    added_checkpoints.append(pt+1 if pt+1 < L else L)
+                print(f'--len(added_checkpoints) = {len(added_checkpoints)}')
+                print(f'--len(checkpoint_set) = {len(checkpoint_set)}')
+                # checkpoint_set.update(added_checkpoints)
+                rmem_liveness_checkpoints = sorted(checkpoint_set)  # buffer的所有消费+生产时刻（包含了跨迭代）
+
 
         def _time_le_checkpoint_var(name: str, time_expr, tau: int):
             b = model.new_bool_var(name)
@@ -1203,6 +1169,7 @@ class HeddleScheduler:
             model.add(time_expr > tau).only_enforce_if(b.negated())
             return b
 
+        # 记录 buffer的 (opid , iteroffset, tau) : live_var
         rmem_live_var_cache: dict[tuple[int, int, int], object] = {}
 
         def _rmem_copy_live_var(
@@ -1212,6 +1179,9 @@ class HeddleScheduler:
             iter_offset: int,
             tau: int,
         ):
+            # 建立约束变量：p_start live_var is_produced all_c_done，
+            # 加约束： 若 buffer live，则 is_produced && !all_c_done (生产完，且没消费完)
+            # 若 buffer dead，则 !is_produced || all_c_done (消费完了 或者还没生产)
             key = (xi, int(iter_offset), int(tau))
             if key in rmem_live_var_cache:
                 return rmem_live_var_cache[key]
@@ -1281,8 +1251,9 @@ class HeddleScheduler:
             # 同时不要把同一 buffer 在同一 iter_offset 上的多个重定义压成
             # 一条 min(start)..max(end) 大区间，否则会把中间已经 dead 的
             # 空档错误算成 live，强于 fixed check。
+            print("--- smt modeling with convservative reg limit")
             rmem_buffers: dict[str, dict[str, object]] = {}
-            for xi, (producer_v, oval) in enumerate(all_outputs):
+            for xi, (producer_v, oval) in enumerate(all_outputs):  # 对每个buffer
                 if oval.storage != StorageKind.RMEM or oval.footprint_bytes <= 0:
                     continue
                 buffer_key = oval.rmem_buffer_key()
@@ -1320,12 +1291,12 @@ class HeddleScheduler:
             for buffer_key in sorted(rmem_buffers):
                 entry = rmem_buffers[buffer_key]
                 for xi, producer_v, oval, allowed_offsets in entry["outputs"]:
-                    for iter_offset in sorted(int(offset) for offset in allowed_offsets):
-                        key = (xi, int(iter_offset))
-                        if key in copy_time_vars:
+                    for iter_offset in sorted(int(offset) for offset in allowed_offsets):  # 跨迭代 delta
+                        key = (xi, int(iter_offset))  # opid, 迭代iter
+                        if key in copy_time_vars:  # 保持唯一
                             continue
 
-                        release_times = []
+                        release_times = []  # 消费完成的时刻
                         if oval.lifetime == LifetimeSemantic.DEAD_ON_ENTRY:
                             consumers = (
                                 consumers_of[xi]
@@ -1343,14 +1314,14 @@ class HeddleScheduler:
                             release_times.append(L)
                         if not release_times:
                             continue
-
+                        # live起点
                         copy_start = model.new_int_var(
                             -incoming_iter_overlap * ii,
                             max(L - 1, 0) + max_iter_overlap * ii,
                             f"rmem_cons_start_x={xi}_k={iter_offset}",
                         )
                         model.add(copy_start == Tv[producer_v] + int(iter_offset) * ii)
-
+                        # live终点
                         copy_end = model.new_int_var(
                             0,
                             max(L, 1) + max_iter_overlap * ii + max_dependency_distance * ii,
@@ -1412,7 +1383,8 @@ class HeddleScheduler:
                 if conservative_terms:
                     model.add(sum(conservative_terms) <= self.reg_limit)
         elif track_rmem_liveness:
-            for tau in rmem_liveness_checkpoints:
+            print("--- smt modeling with Twill classic reg limit")
+            for tau in rmem_liveness_checkpoints:  # buffer的所有生产+消费时刻。考虑跨迭代version （离散的关键点，和op duration长短已经无关）。duration归一化不能减少关键点数目
                 live_terms_by_warp_buffer: dict[tuple[int, str, int], list] = defaultdict(list)
                 footprint_by_warp_buffer: dict[tuple[int, str, int], int] = {}
                 for xi, (producer_v, oval) in enumerate(all_outputs):
@@ -1426,16 +1398,16 @@ class HeddleScheduler:
                         range(0, 1)
                     )
 
-                    for iter_offset in rmem_iter_offsets:
+                    for iter_offset in rmem_iter_offsets: # 跨迭代检查窗
                         live_var = _rmem_copy_live_var(
                             xi,
                             producer_v,
                             oval,
                             iter_offset,
                             tau,
-                        )
+                        )  # 建立live_var 变量/ 约束
 
-                        for w in range(W):
+                        for w in range(W):  # 每个warp
                             live_on_warp = _and_var(
                                 f"rmem_live_w={w}_x={xi}_k={iter_offset}_t={tau}",
                                 [live_var, warp[(producer_v, w)]],
@@ -1445,7 +1417,7 @@ class HeddleScheduler:
                             footprint_by_warp_buffer[copy_key] = max(
                                 footprint_by_warp_buffer.get(copy_key, 0),
                                 int(oval.footprint_bytes),
-                            )
+                            )  # buffer在W上，迭代为iter_offset 时的 footprint_bytes
 
                 terms_by_warp: dict[int, list] = defaultdict(list)
                 for copy_key, live_terms in live_terms_by_warp_buffer.items():
@@ -1459,7 +1431,7 @@ class HeddleScheduler:
                     )
                 for w, terms in terms_by_warp.items():
                     if terms:
-                        model.add(sum(terms) <= self.reg_limit)
+                        model.add(sum(terms) <= self.reg_limit)  # 总量： live检查点 * Warp数 * buffer数 * iter_offset数
 
         # ---- 优化目标：偏好更紧凑的调度 -------------------------------
         if optimize:

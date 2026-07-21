@@ -528,49 +528,6 @@ class TestSMTModuloRegMultiplicity:
         assert too_tight._solve_phase_b(ii=1, L=3, optimize=False) is None
 
 
-class TestSMTSubcoreIssueExclusion:
-    """验证 Phase B 的 subcore issue 槽互斥约束。"""
-
-    def test_different_subcores_can_issue_same_phase(self):
-        smt = _make_smt_nodes([
-            ("A", "ALU", 1, []),
-            ("B", "ALU", 1, []),
-        ], num_warps=2, fu_caps={
-            ResourceType.TMA: 1, ResourceType.TensorCore: 1,
-            ResourceType.ALU: 2, ResourceType.SFU: 1,
-        })
-
-        result = smt._solve_phase_b(ii=1, L=1, optimize=False)
-        assert result is not None
-        assert result["schedule"]["A"] == result["schedule"]["B"] == 0
-        assert result["warp_assign"]["A"] % 4 != result["warp_assign"]["B"] % 4
-
-    def test_same_subcore_cannot_issue_same_phase(self):
-        smt = _make_smt_nodes([
-            ("A", "ALU", 1, [], [], {"warp_count": 5}),
-            ("B", "ALU", 1, [], [], {"warp_count": 5}),
-        ], num_warps=5, fu_caps={
-            ResourceType.TMA: 1, ResourceType.TensorCore: 1,
-            ResourceType.ALU: 2, ResourceType.SFU: 1,
-        })
-
-        assert smt._solve_phase_b(ii=1, L=1, optimize=False) is None
-
-    def test_multi_warp_op_uses_leader_subcore_for_issue(self):
-        smt = _make_smt_nodes([
-            ("WGMMA", "TC", 1, [], [], {"warp_count": 4, "warp_align": 1}),
-            ("ALU", "ALU", 1, []),
-        ], num_warps=5, fu_caps={
-            ResourceType.TMA: 1, ResourceType.TensorCore: 1,
-            ResourceType.ALU: 1, ResourceType.SFU: 1,
-        })
-
-        result = smt._solve_phase_b(ii=1, L=1, optimize=False)
-        assert result is not None
-        wa = result["warp_assign"]
-        assert wa["WGMMA"] % 4 != wa["ALU"] % 4
-
-
 @pytest.mark.skipif(not _has_z3(), reason="z3-solver not installed")
 class TestSMTWarpAssignment:
 
